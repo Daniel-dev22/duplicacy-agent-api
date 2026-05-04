@@ -22,7 +22,7 @@ func main() {
 		Str("node", cfg.NodeName).
 		Str("site", cfg.SiteID).
 		Strs("backup_roots", cfg.BackupRoots).
-		Msg("duplicacy-api starting")
+		Msg("duplicacy-agent-api starting")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

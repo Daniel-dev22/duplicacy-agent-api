@@ -1,4 +1,4 @@
-duplicacy-api
+duplicacy-agent-api
 *.log
 *.tmp
 .DS_Store

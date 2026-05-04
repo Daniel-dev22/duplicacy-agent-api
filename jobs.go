@@ -421,7 +421,7 @@ func (a *app) handleJobLogsWS(c *gin.Context) {
 				_ = send()
 				// send a terminal sentinel so the UI can show "completed"/"failed"
 				ss := j.snapshot()
-				_ = ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("[duplicacy-api] job %s state=%s exit=%d\n", ss.ID, ss.State, ss.ExitCode)))
+				_ = ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("[duplicacy-agent-api] job %s state=%s exit=%d\n", ss.ID, ss.State, ss.ExitCode)))
 				return
 			}
 			buf = append(buf, line)

@@ -7,7 +7,7 @@ CYAN='\033[0;36m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-IMAGE_NAME="duplicacy-api"
+IMAGE_NAME="duplicacy-agent-api"
 
 setup_buildx() {
   echo -e "${YELLOW}Setting up Docker buildx with host network...${NC}"

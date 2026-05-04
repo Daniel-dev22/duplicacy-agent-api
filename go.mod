@@ -1,4 +1,4 @@
-module duplicacy-api
+module duplicacy-agent-api
 
 go 1.25.0
 

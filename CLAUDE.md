@@ -1,4 +1,4 @@
-# duplicacy-api — Claude Project Instructions
+# duplicacy-agent-api — Claude Project Instructions
 
 ## Goal
 
