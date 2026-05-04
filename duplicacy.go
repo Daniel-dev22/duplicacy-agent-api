@@ -1,0 +1,248 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+// cliInvocation describes one CLI run we want to spawn.
+// Constructed by handlers, fed to the jobs subsystem (task #3) which
+// actually starts the process and tails output.
+type cliInvocation struct {
+	RepoRoot string
+	Args     []string // duplicacy args (e.g. ["backup", "-stats", "-storage", "default"])
+	EnvAdds  []string // additional env vars (e.g. DUPLICACY_S3_SECRET=...)
+}
+
+// command builds an *exec.Cmd ready to run. Caller is responsible for stdout/stderr piping
+// and Start/Wait — we don't run it here so the jobs registry can wire up streaming first.
+func (i cliInvocation) command(ctx context.Context, binary string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, binary, i.Args...)
+	cmd.Dir = i.RepoRoot
+	if len(i.EnvAdds) > 0 {
+		cmd.Env = append(os.Environ(), i.EnvAdds...)
+	}
+	return cmd
+}
+
+// runSync runs a CLI invocation to completion and returns the combined stdout+stderr.
+// Used for short queries like `list -id <snapshotid>`. Long-running commands go through
+// the jobs subsystem instead.
+func runSync(ctx context.Context, binary string, inv cliInvocation, timeout time.Duration) ([]byte, error) {
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	cmd := inv.command(ctx, binary)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return out, fmt.Errorf("duplicacy %s: %w (output: %s)", strings.Join(inv.Args, " "), err, truncate(string(out), 400))
+	}
+	return out, nil
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+// streamLines reads from r line-by-line, sending each line to lines until r is exhausted
+// or ctx is cancelled. Closes lines on exit.
+func streamLines(ctx context.Context, r io.Reader, lines chan<- string) {
+	defer close(lines)
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 1024*1024), 8*1024*1024) // tolerate long backup-progress lines
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return
+		case lines <- scanner.Text():
+		}
+	}
+}
+
+// --- output parsing helpers ---
+
+// snapshotLine matches the per-revision rows from `duplicacy list`.
+//
+//	Snapshot home revision 17 created at 2026-04-30 02:00:11 -hash
+var snapshotLineRe = regexp.MustCompile(
+	`^Snapshot\s+(\S+)\s+revision\s+(\d+)\s+created at\s+(\S+\s+\S+\s+\S+)`)
+
+type Snapshot struct {
+	SnapshotID string    `json:"snapshot_id"`
+	Revision   int       `json:"revision"`
+	CreatedAt  time.Time `json:"created_at"`
+	Raw        string    `json:"raw"`
+}
+
+func parseListOutput(out string) []Snapshot {
+	var snaps []Snapshot
+	for _, line := range strings.Split(out, "\n") {
+		m := snapshotLineRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		rev, _ := strconv.Atoi(m[2])
+		t, _ := time.Parse("2006-01-02 15:04:05 -0700", m[3])
+		snaps = append(snaps, Snapshot{
+			SnapshotID: m[1],
+			Revision:   rev,
+			CreatedAt:  t,
+			Raw:        strings.TrimSpace(line),
+		})
+	}
+	return snaps
+}
+
+// --- HTTP handlers (override placeholders) ---
+
+// GET /repos/:id/snapshots — runs `duplicacy list` and parses revisions.
+func (a *app) handleListSnapshots(c *gin.Context) {
+	repo, ok := a.repos.get(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "repo not found"})
+		return
+	}
+	storage := c.Query("storage")
+	args := []string{"list"}
+	if storage != "" {
+		args = append(args, "-storage", storage)
+	}
+	out, err := runSync(c.Request.Context(), a.cfg.DuplicacyBinary, cliInvocation{
+		RepoRoot: repo.Path,
+		Args:     args,
+	}, 60*time.Second)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":  err.Error(),
+			"output": string(out),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"repo":      repo.ID,
+		"snapshots": parseListOutput(string(out)),
+	})
+}
+
+// GET /repos/:id/snapshots/:rev/files — `duplicacy list -files -r <rev>`
+func (a *app) handleSnapshotFiles(c *gin.Context) {
+	repo, ok := a.repos.get(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "repo not found"})
+		return
+	}
+	rev, err := strconv.Atoi(c.Param("rev"))
+	if err != nil || rev <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "revision must be a positive integer"})
+		return
+	}
+	args := []string{"list", "-files", "-r", strconv.Itoa(rev)}
+	if s := c.Query("storage"); s != "" {
+		args = append(args, "-storage", s)
+	}
+	out, err := runSync(c.Request.Context(), a.cfg.DuplicacyBinary, cliInvocation{
+		RepoRoot: repo.Path,
+		Args:     args,
+	}, 5*time.Minute)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "output": string(out)})
+		return
+	}
+	c.Data(http.StatusOK, "text/plain; charset=utf-8", out)
+}
+
+// --- helpers used by the jobs subsystem ---
+
+// invocationForBackup builds the args for `duplicacy backup`.
+func invocationForBackup(repo *Repo, storageName, tag string, threads int) cliInvocation {
+	args := []string{"backup", "-stats"}
+	if storageName != "" {
+		args = append(args, "-storage", storageName)
+	}
+	if tag != "" {
+		args = append(args, "-t", tag)
+	}
+	if threads > 0 {
+		args = append(args, "-threads", strconv.Itoa(threads))
+	}
+	return cliInvocation{RepoRoot: repo.Path, Args: args}
+}
+
+// invocationForRestore builds args for `duplicacy restore`.
+func invocationForRestore(repo *Repo, storageName string, revision int, paths []string, overwrite bool) cliInvocation {
+	args := []string{"restore", "-r", strconv.Itoa(revision)}
+	if storageName != "" {
+		args = append(args, "-storage", storageName)
+	}
+	if overwrite {
+		args = append(args, "-overwrite")
+	}
+	args = append(args, paths...)
+	return cliInvocation{RepoRoot: repo.Path, Args: args}
+}
+
+// invocationForCheck builds args for `duplicacy check`.
+func invocationForCheck(repo *Repo, storageName string, revisions string, all bool) cliInvocation {
+	args := []string{"check"}
+	if storageName != "" {
+		args = append(args, "-storage", storageName)
+	}
+	if revisions != "" {
+		args = append(args, "-r", revisions)
+	}
+	if all {
+		args = append(args, "-all")
+	}
+	return cliInvocation{RepoRoot: repo.Path, Args: args}
+}
+
+// invocationForPrune builds args for `duplicacy prune`.
+func invocationForPrune(repo *Repo, storageName string, keepRules []string, exclusive, exhaustive bool) cliInvocation {
+	args := []string{"prune"}
+	if storageName != "" {
+		args = append(args, "-storage", storageName)
+	}
+	for _, k := range keepRules {
+		args = append(args, "-keep", k)
+	}
+	if exclusive {
+		args = append(args, "-exclusive")
+	}
+	if exhaustive {
+		args = append(args, "-exhaustive")
+	}
+	return cliInvocation{RepoRoot: repo.Path, Args: args}
+}
+
+// invocationForInit builds args for `duplicacy init <snapshot-id> <storage-url>`.
+func invocationForInit(repoRoot, snapshotID, storageURL string, encrypted bool) cliInvocation {
+	args := []string{"init"}
+	if encrypted {
+		args = append(args, "-encrypt")
+	}
+	args = append(args, snapshotID, storageURL)
+	return cliInvocation{RepoRoot: repoRoot, Args: args}
+}
+
+// ensureDir creates a directory if missing, propagating mode 0700.
+// Used by handleInitRepo when initializing a new repo root.
+func ensureDir(p string) error {
+	return os.MkdirAll(filepath.Clean(p), 0700)
+}
