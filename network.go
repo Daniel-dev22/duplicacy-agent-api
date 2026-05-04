@@ -14,23 +14,25 @@ import (
 // buildControlCenterClient returns the process-global pooled HTTP client used
 // for all agent → controller traffic (event push, schedule pull, filter pull).
 //
-// Mirrors controller router's `crossSiteClient` pattern but with one twist:
-// the agent runs on a Docker host (not in the K8s cluster), so it can't resolve
-// `controller-api.<domain>` to the local Traefik via cluster DNS. Instead
-// the DialContext resolves the Docker DNS name (default "traefik") to the local
-// Traefik container's IP and dials that on TraefikDialPort, while preserving
-// the original Host (and thus TLS SNI) for Traefik's IngressRoute matching.
+// Two operating modes, picked by whether TraefikDockerDNS is set:
 //
-// Result: traffic stays on the docker bridge network and never leaves the host,
-// while Traefik still sees the public hostname and routes accordingly.
+//   - **Direct mode** (TraefikDockerDNS == ""): the URL host is dialed normally.
+//     Used on k3s nodes where the agent reaches the cluster via cluster DNS
+//     (e.g. http://controller-router.controller.svc.cluster.local:5000)
+//     directly through the flannel CNI — no Traefik in the path.
 //
-//   - mTLS client cert if configured (required by /api/duplicacy/jobs/*/event)
-//   - MaxIdleConns 20 / per-host 10
-//   - IdleConnTimeout 0 (never expire — rely on TCP keepalive)
-//   - 15s TCP keepalive (more frequent since this hits Traefik through Docker bridge)
+//   - **Traefik-rewrite mode** (TraefikDockerDNS != ""): the DialContext rewrites
+//     the dial target to `<TraefikDockerDNS>:<TraefikDialPort>` while keeping
+//     the original URL host as TLS SNI. Used on NAS / non-k3s docker hosts
+//     where the local docker Traefik mirrors the K8s ServersTransport pattern
+//     (attaches the mTLS client cert and forwards into the cluster).
 //
 // Per project CLAUDE.md "Standard HTTP Client Patterns": process-global, no
 // per-request client instantiation anywhere in the codebase.
+//
+//   - MaxIdleConns 20 / per-host 10
+//   - IdleConnTimeout 0 (never expire — rely on TCP keepalive)
+//   - 15s TCP keepalive
 func buildControlCenterClient(cfg Config) (*http.Client, error) {
 	tlsCfg := &tls.Config{}
 
@@ -59,21 +61,23 @@ func buildControlCenterClient(cfg Config) (*http.Client, error) {
 		KeepAlive: 15 * time.Second,
 	}
 
-	traefikTarget := net.JoinHostPort(cfg.TraefikDockerDNS, cfg.TraefikDialPort)
-
 	transport := &http.Transport{
 		TLSClientConfig:     tlsCfg,
 		MaxIdleConns:        20,
 		MaxIdleConnsPerHost: 10,
 		IdleConnTimeout:     0,
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			// Always dial the local Traefik container (resolved fresh from Docker DNS
-			// each connect — picks up Traefik restarts without an agent restart).
-			// The original `addr` is intentionally ignored; TLS SNI comes from
-			// TLSClientConfig.ServerName which the http package auto-derives from
-			// the request URL host, preserving Traefik's IngressRoute matching.
+	}
+
+	if cfg.TraefikDockerDNS != "" {
+		traefikTarget := net.JoinHostPort(cfg.TraefikDockerDNS, cfg.TraefikDialPort)
+		transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			// Rewrite-mode: ignore URL host, dial Traefik fresh each connect so
+			// a Traefik restart is picked up without an agent restart. TLS SNI
+			// still comes from the URL host via http package auto-derivation.
 			return dialer.DialContext(ctx, network, traefikTarget)
-		},
+		}
+	} else {
+		transport.DialContext = dialer.DialContext
 	}
 
 	return &http.Client{
