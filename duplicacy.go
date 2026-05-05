@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -232,8 +233,11 @@ func invocationForPrune(repo *Repo, storageName string, keepRules []string, excl
 }
 
 // invocationForInit builds args for `duplicacy init <snapshot-id> <storage-url>`.
+// Always passes -no-save-password so duplicacy does not write credentials into
+// .duplicacy/preferences. The agent supplies all secrets via env vars at run
+// time and post-scrubs the preferences file as defense-in-depth.
 func invocationForInit(repoRoot, snapshotID, storageURL string, encrypted bool) cliInvocation {
-	args := []string{"init"}
+	args := []string{"init", "-no-save-password"}
 	if encrypted {
 		args = append(args, "-encrypt")
 	}
@@ -241,8 +245,63 @@ func invocationForInit(repoRoot, snapshotID, storageURL string, encrypted bool) 
 	return cliInvocation{RepoRoot: repoRoot, Args: args}
 }
 
+// invocationForAdd builds args for `duplicacy add <storage-name> <snapshot-id> <storage-url>`.
+// Used to register secondary storages on a repo that already has a primary.
+// Same -no-save-password rationale as invocationForInit.
+func invocationForAdd(repoRoot, storageName, snapshotID, storageURL string, encrypted bool) cliInvocation {
+	args := []string{"add", "-no-save-password"}
+	if encrypted {
+		args = append(args, "-encrypt")
+	}
+	args = append(args, storageName, snapshotID, storageURL)
+	return cliInvocation{RepoRoot: repoRoot, Args: args}
+}
+
 // ensureDir creates a directory if missing, propagating mode 0700.
 // Used by handleInitRepo when initializing a new repo root.
 func ensureDir(p string) error {
 	return os.MkdirAll(filepath.Clean(p), 0700)
+}
+
+// scrubPreferences strips credential material from .duplicacy/preferences in
+// the given repo root. duplicacy occasionally persists secrets despite
+// -no-save-password (different versions, edge cases) — this is defense in
+// depth so the on-disk preferences file never carries cred material.
+//
+// Operations per storage entry:
+//   - encrypted_password   → ""
+//   - keys[*]              → cleared (whole map replaced with empty)
+//   - no_save_password     → true
+//
+// The 'name', 'id', 'storage', and 'encrypted' fields are preserved (they're
+// the duplicacy-side routing info; non-secret).
+func scrubPreferences(repoRoot string) error {
+	prefsPath := filepath.Join(repoRoot, ".duplicacy", "preferences")
+	data, err := os.ReadFile(prefsPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", prefsPath, err)
+	}
+	var raws []rawPreference
+	if err := json.Unmarshal(data, &raws); err != nil {
+		return fmt.Errorf("parse %s: %w", prefsPath, err)
+	}
+	for i := range raws {
+		raws[i].Keys = map[string]string{}
+		raws[i].DoNotSavePassword = true
+		// rawPreference doesn't have encrypted_password — duplicacy emits it
+		// as part of Keys when present, so clearing Keys covers it.
+	}
+	out, err := json.MarshalIndent(raws, "", "    ")
+	if err != nil {
+		return fmt.Errorf("marshal scrubbed prefs: %w", err)
+	}
+	tmp := prefsPath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0600); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, prefsPath); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename %s: %w", prefsPath, err)
+	}
+	return nil
 }

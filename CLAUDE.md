@@ -28,7 +28,7 @@ Read `README.md` first for the architecture summary. Read the canonical design a
 
 - **No JSON output.** Backup/restore/check/prune emit human-readable stdout. Stream raw stdout to WebSocket clients verbatim; only the *summary line* needs structured extraction.
 - **Lock-free across hosts** — multiple `duplicacy backup` invocations against the same storage from different repos/hosts are safe by design. We don't need cross-host coordination.
-- **Credentials**: env var `DUPLICACY_<STORAGENAME>_<PASSWORDTYPE>` (uppercase) → `keys` map in preferences (plaintext) → OS keyring → prompt. Keyring is non-functional in our containers (no daemon). We use the **plaintext-in-preferences** route, mode 0600, owned by container user. Same model as the saspus container we're replacing.
+- **Credentials**: env var `DUPLICACY_<STORAGENAME>_<PASSWORDTYPE>` (uppercase) → `keys` map in preferences (plaintext) → OS keyring → prompt. Keyring is non-functional in our containers (no daemon). We use the **env-vars-only** route: every duplicacy invocation gets `-no-save-password`, env vars are pulled from the controller via mTLS at the moment of execution (cached 60s in-memory keyed by credential_id), `.duplicacy/preferences` is post-scrubbed to drop any persisted secrets, and SFTP/GCS file-based creds materialize to `/dev/shm` tmpfiles that are unlinked after the duplicacy process exits. Secrets never live on disk.
 - **Repo state** lives in `.duplicacy/preferences` (JSON `Preference` struct from CLI source `duplicacy_preference.go`). One file per repo root.
 
 ## Build

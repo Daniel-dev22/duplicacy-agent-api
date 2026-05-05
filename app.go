@@ -18,7 +18,9 @@ type app struct {
 	scheduler           *scheduler
 	filters             *filterCache
 	events              *eventBuffer
-	stop                chan struct{} // closed in close(); subsystems range on it for shutdown
+	mapping             *repoMappingStore // controller-managed repo↔credential mapping
+	secrets             *secretCache      // 60s TTL cache of vended bundles
+	stop                chan struct{}     // closed in close(); subsystems range on it for shutdown
 }
 
 func newApp(ctx context.Context, cfg Config) (*app, error) {
@@ -37,9 +39,9 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 
 	repos := newRepoIndex(cfg.BackupRoots, cfg.DuplicacyBinary)
 
-	sched, err := newScheduler(cfg, cc, jobs, repos)
-	if err != nil {
-		return nil, fmt.Errorf("scheduler: %w", err)
+	mapping := newRepoMappingStore(cfg.ConfigDir)
+	if err := mapping.load(); err != nil {
+		return nil, fmt.Errorf("load repo mapping: %w", err)
 	}
 
 	filters, err := newFilterCache(cfg, cc, repos)
@@ -47,16 +49,26 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 		return nil, fmt.Errorf("filter cache: %w", err)
 	}
 
+	// Construct app first so the scheduler can borrow a.prepareEnvForRepo via a
+	// bound method literal. This avoids leaking the *app pointer into scheduler;
+	// only the function value travels.
 	a := &app{
 		cfg:                 cfg,
 		controlCenterClient: cc,
 		jobs:                jobs,
 		repos:               repos,
 		events:              events,
-		scheduler:           sched,
 		filters:             filters,
+		mapping:             mapping,
+		secrets:             newSecretCache(),
 		stop:                make(chan struct{}),
 	}
+
+	sched, err := newScheduler(cfg, cc, jobs, repos, a.prepareEnvForRepo)
+	if err != nil {
+		return nil, fmt.Errorf("scheduler: %w", err)
+	}
+	a.scheduler = sched
 
 	// Best-effort initial repo scan so /repos returns something on first call.
 	if err := a.repos.scan(); err != nil {

@@ -84,6 +84,7 @@ type Job struct {
 	cancel      context.CancelFunc
 	ringBuffer  []string
 	subscribers map[chan string]struct{}
+	cleanup     func() // unlink tmpfs cred files after cmd.Wait() returns
 }
 
 // snapshot returns a goroutine-safe copy of the JSON-serializable fields.
@@ -177,7 +178,11 @@ func (r *jobRegistry) emit(j *Job, evt JobEvent) {
 
 // start spawns a CLI invocation and returns its Job. The CLI is started immediately;
 // caller should subscribe to logs via WebSocket if it wants live output.
-func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo, action JobAction, storage string, inv cliInvocation, scheduleID, triggerKey string) (*Job, error) {
+//
+// cleanup, if non-nil, is invoked exactly once after cmd.Wait() returns. Used
+// for unlinking /dev/shm tmpfiles that hold ephemeral cred material (SFTP
+// keys, GCS service-account JSON).
+func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo, action JobAction, storage string, inv cliInvocation, scheduleID, triggerKey string, cleanup func()) (*Job, error) {
 	jobCtx, cancel := context.WithCancel(parentCtx)
 
 	j := &Job{
@@ -192,6 +197,7 @@ func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo
 		TriggerKey:  triggerKey,
 		cancel:      cancel,
 		subscribers: map[chan string]struct{}{},
+		cleanup:     cleanup,
 	}
 
 	r.mu.Lock()
@@ -212,6 +218,9 @@ func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo
 
 	if err := cmd.Start(); err != nil {
 		cancel()
+		if j.cleanup != nil {
+			j.cleanup()
+		}
 		j.mu.Lock()
 		j.State = JobFailed
 		j.ErrorMsg = err.Error()
@@ -253,7 +262,13 @@ func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo
 		}
 		j.subscribers = map[chan string]struct{}{}
 		state := j.State
+		cleanup := j.cleanup
+		j.cleanup = nil
 		j.mu.Unlock()
+
+		if cleanup != nil {
+			cleanup()
+		}
 
 		r.markTerminated(j)
 		if state == JobCompleted {
@@ -455,8 +470,14 @@ func (a *app) handleBackup(c *gin.Context) {
 	if req.TriggerKey == "" {
 		req.TriggerKey = "manual"
 	}
+	env, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
+		return
+	}
 	inv := invocationForBackup(repo, req.Storage, req.Tag, req.Threads)
-	j, err := a.jobs.start(c.Request.Context(), a.cfg.DuplicacyBinary, repo, ActionBackup, req.Storage, inv, req.ScheduleID, req.TriggerKey)
+	inv.EnvAdds = append(inv.EnvAdds, env...)
+	j, err := a.jobs.start(c.Request.Context(), a.cfg.DuplicacyBinary, repo, ActionBackup, req.Storage, inv, req.ScheduleID, req.TriggerKey, cleanup)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "job_id": j.ID})
 		return
@@ -490,8 +511,14 @@ func (a *app) handleRestore(c *gin.Context) {
 	if req.TriggerKey == "" {
 		req.TriggerKey = "manual"
 	}
+	env, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
+		return
+	}
 	inv := invocationForRestore(repo, req.Storage, req.Revision, req.Paths, req.Overwrite)
-	j, err := a.jobs.start(c.Request.Context(), a.cfg.DuplicacyBinary, repo, ActionRestore, req.Storage, inv, "", req.TriggerKey)
+	inv.EnvAdds = append(inv.EnvAdds, env...)
+	j, err := a.jobs.start(c.Request.Context(), a.cfg.DuplicacyBinary, repo, ActionRestore, req.Storage, inv, "", req.TriggerKey, cleanup)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "job_id": j.ID})
 		return
@@ -517,8 +544,14 @@ func (a *app) handleCheck(c *gin.Context) {
 	if req.TriggerKey == "" {
 		req.TriggerKey = "manual"
 	}
+	env, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
+		return
+	}
 	inv := invocationForCheck(repo, req.Storage, req.Revisions, req.All)
-	j, err := a.jobs.start(c.Request.Context(), a.cfg.DuplicacyBinary, repo, ActionCheck, req.Storage, inv, "", req.TriggerKey)
+	inv.EnvAdds = append(inv.EnvAdds, env...)
+	j, err := a.jobs.start(c.Request.Context(), a.cfg.DuplicacyBinary, repo, ActionCheck, req.Storage, inv, "", req.TriggerKey, cleanup)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "job_id": j.ID})
 		return
@@ -545,8 +578,14 @@ func (a *app) handlePrune(c *gin.Context) {
 	if req.TriggerKey == "" {
 		req.TriggerKey = "manual"
 	}
+	env, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
+		return
+	}
 	inv := invocationForPrune(repo, req.Storage, req.KeepRules, req.Exclusive, req.Exhaustive)
-	j, err := a.jobs.start(c.Request.Context(), a.cfg.DuplicacyBinary, repo, ActionPrune, req.Storage, inv, "", req.TriggerKey)
+	inv.EnvAdds = append(inv.EnvAdds, env...)
+	j, err := a.jobs.start(c.Request.Context(), a.cfg.DuplicacyBinary, repo, ActionPrune, req.Storage, inv, "", req.TriggerKey, cleanup)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "job_id": j.ID})
 		return

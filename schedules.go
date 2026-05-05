@@ -58,12 +58,18 @@ type scheduleCache struct {
 	LastFetchedAt time.Time            `json:"last_fetched_at"`
 }
 
+// prepareEnvFn returns env vars + cleanup func for one duplicacy invocation
+// against the given repo. Implemented by app.prepareEnvForRepo. Defining it
+// as a function-value here keeps the scheduler decoupled from the app struct.
+type prepareEnvFn func(ctx context.Context, repo *Repo) ([]string, func(), error)
+
 type scheduler struct {
-	cfg       Config
-	client    *http.Client
-	jobs      *jobRegistry
-	repos     *repoIndex
-	easternTZ *time.Location
+	cfg        Config
+	client     *http.Client
+	jobs       *jobRegistry
+	repos      *repoIndex
+	prepareEnv prepareEnvFn
+	easternTZ  *time.Location
 
 	mu       sync.RWMutex
 	cache    scheduleCache
@@ -74,19 +80,20 @@ type scheduler struct {
 	wg       sync.WaitGroup
 }
 
-func newScheduler(cfg Config, client *http.Client, jobs *jobRegistry, repos *repoIndex) (*scheduler, error) {
+func newScheduler(cfg Config, client *http.Client, jobs *jobRegistry, repos *repoIndex, prepareEnv prepareEnvFn) (*scheduler, error) {
 	tz, err := time.LoadLocation("America/New_York")
 	if err != nil {
 		return nil, fmt.Errorf("load eastern tz: %w", err)
 	}
 	s := &scheduler{
-		cfg:       cfg,
-		client:    client,
-		jobs:      jobs,
-		repos:     repos,
-		easternTZ: tz,
-		cachePath: filepath.Join(cfg.ConfigDir, "schedules.json"),
-		stop:      make(chan struct{}),
+		cfg:        cfg,
+		client:     client,
+		jobs:       jobs,
+		repos:      repos,
+		prepareEnv: prepareEnv,
+		easternTZ:  tz,
+		cachePath:  filepath.Join(cfg.ConfigDir, "schedules.json"),
+		stop:       make(chan struct{}),
 	}
 	s.cache = scheduleCache{LastFiredAt: map[string]time.Time{}}
 	if err := s.loadCache(); err != nil {
@@ -295,7 +302,24 @@ func (s *scheduler) fire(ctx context.Context, sch LocalSchedule, triggerKey stri
 		return
 	}
 
-	j, err := s.jobs.start(ctx, s.cfg.DuplicacyBinary, repo, sch.Action, sch.Storage, inv, sch.ID, triggerKey)
+	var (
+		env     []string
+		cleanup func()
+	)
+	if s.prepareEnv != nil {
+		var err error
+		env, cleanup, err = s.prepareEnv(ctx, repo)
+		if err != nil {
+			log.Error().Err(err).Str("schedule", sch.ID).Msg("schedule fire: vend secrets failed; skipping")
+			return
+		}
+	}
+	if cleanup == nil {
+		cleanup = func() {}
+	}
+	inv.EnvAdds = append(inv.EnvAdds, env...)
+
+	j, err := s.jobs.start(ctx, s.cfg.DuplicacyBinary, repo, sch.Action, sch.Storage, inv, sch.ID, triggerKey, cleanup)
 	if err != nil {
 		log.Error().Err(err).Str("schedule", sch.ID).Msg("schedule fire failed to start job")
 		return
