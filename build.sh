@@ -11,10 +11,10 @@ IMAGE_NAME="duplicacy-agent-api"
 
 setup_buildx() {
   echo -e "${YELLOW}Setting up Docker buildx with host network...${NC}"
-  if docker buildx inspect mybuilder &>/dev/null; then
-    docker buildx rm mybuilder --force >/dev/null 2>&1
+  if docker buildx inspect duplicacy-agent-api-builder &>/dev/null; then
+    docker buildx rm duplicacy-agent-api-builder --force >/dev/null 2>&1
   fi
-  docker buildx create --name mybuilder --driver docker-container --driver-opt network=host --use
+  docker buildx create --name duplicacy-agent-api-builder --driver docker-container --driver-opt network=host --use
   docker buildx inspect --bootstrap
   echo -e "${GREEN}Buildx setup completed${NC}"
 }
@@ -22,8 +22,8 @@ setup_buildx() {
 cleanup_buildx() {
   echo -e "${YELLOW}Cleaning up Docker buildx...${NC}"
   docker buildx prune -f >/dev/null 2>&1 || true
-  if docker buildx inspect mybuilder &>/dev/null; then
-    docker buildx rm mybuilder --force >/dev/null 2>&1 || true
+  if docker buildx inspect duplicacy-agent-api-builder &>/dev/null; then
+    docker buildx rm duplicacy-agent-api-builder --force >/dev/null 2>&1 || true
   fi
   echo -e "${GREEN}Buildx cleanup completed${NC}"
 }
