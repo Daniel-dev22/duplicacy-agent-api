@@ -187,13 +187,18 @@ func invocationForBackup(repo *Repo, storageName, tag string, threads int) cliIn
 }
 
 // invocationForRestore builds args for `duplicacy restore`.
-func invocationForRestore(repo *Repo, storageName string, revision int, paths []string, overwrite bool) cliInvocation {
+// rsaPrivKeyPath is the /dev/shm path to the rsa_private_key PEM when the
+// targeted storage is RSA-encrypted; empty string otherwise.
+func invocationForRestore(repo *Repo, storageName string, revision int, paths []string, overwrite bool, rsaPrivKeyPath string) cliInvocation {
 	args := []string{"restore", "-r", strconv.Itoa(revision)}
 	if storageName != "" {
 		args = append(args, "-storage", storageName)
 	}
 	if overwrite {
 		args = append(args, "-overwrite")
+	}
+	if rsaPrivKeyPath != "" {
+		args = append(args, "-key", rsaPrivKeyPath)
 	}
 	args = append(args, paths...)
 	return cliInvocation{RepoRoot: repo.Path, Args: args}
@@ -236,10 +241,15 @@ func invocationForPrune(repo *Repo, storageName string, keepRules []string, excl
 // Always passes -no-save-password so duplicacy does not write credentials into
 // .duplicacy/preferences. The agent supplies all secrets via env vars at run
 // time and post-scrubs the preferences file as defense-in-depth.
-func invocationForInit(repoRoot, snapshotID, storageURL string, encrypted bool) cliInvocation {
+// rsaPubKeyPath is the /dev/shm path to the rsa_public_key PEM when this
+// storage uses RSA asymmetric encryption; empty string otherwise.
+func invocationForInit(repoRoot, snapshotID, storageURL string, encrypted bool, rsaPubKeyPath string) cliInvocation {
 	args := []string{"init", "-no-save-password"}
 	if encrypted {
 		args = append(args, "-encrypt")
+	}
+	if rsaPubKeyPath != "" {
+		args = append(args, "-key", rsaPubKeyPath)
 	}
 	args = append(args, snapshotID, storageURL)
 	return cliInvocation{RepoRoot: repoRoot, Args: args}
@@ -248,10 +258,15 @@ func invocationForInit(repoRoot, snapshotID, storageURL string, encrypted bool) 
 // invocationForAdd builds args for `duplicacy add <storage-name> <snapshot-id> <storage-url>`.
 // Used to register secondary storages on a repo that already has a primary.
 // Same -no-save-password rationale as invocationForInit.
-func invocationForAdd(repoRoot, storageName, snapshotID, storageURL string, encrypted bool) cliInvocation {
+// rsaPubKeyPath is the /dev/shm path to the rsa_public_key PEM when this
+// secondary storage uses RSA asymmetric encryption; empty string otherwise.
+func invocationForAdd(repoRoot, storageName, snapshotID, storageURL string, encrypted bool, rsaPubKeyPath string) cliInvocation {
 	args := []string{"add", "-no-save-password"}
 	if encrypted {
 		args = append(args, "-encrypt")
+	}
+	if rsaPubKeyPath != "" {
+		args = append(args, "-key", rsaPubKeyPath)
 	}
 	args = append(args, storageName, snapshotID, storageURL)
 	return cliInvocation{RepoRoot: repoRoot, Args: args}

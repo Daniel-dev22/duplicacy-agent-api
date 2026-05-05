@@ -45,6 +45,11 @@ type envSpec struct {
 type buildEnvResult struct {
 	Env      []string // formatted as "NAME=VALUE", ready to append to cmd.Env
 	Tmpfiles []string // absolute paths to unlink after duplicacy exits
+	// RSA asymmetric encryption paths, populated when the credential bundle
+	// carries rsa_public_key / rsa_private_key. Always /dev/shm tmpfiles —
+	// already included in Tmpfiles for cleanup. Empty string when not present.
+	RSAPubPath  string // pass via -key on duplicacy init / duplicacy add
+	RSAPrivPath string // pass via -key on duplicacy restore
 }
 
 // buildEnv produces env vars for one storage. storageAlias is the duplicacy
@@ -71,6 +76,12 @@ type buildEnvResult struct {
 //       backend.azure_account     → DUPLICACY_AZURE_ACCOUNT
 //       backend.azure_key         → DUPLICACY_AZURE_KEY
 //   - storage_type local:         no backend env — only the encryption password.
+//
+// RSA asymmetric encryption (orthogonal to storage_type — any backend can opt
+// in by setting these on the credential):
+//   - backend.rsa_public_key   → write to /dev/shm tmp + RSAPubPath  (pass via -key on init/add)
+//   - backend.rsa_private_key  → write to /dev/shm tmp + RSAPrivPath (pass via -key on restore)
+//   - backend.rsa_passphrase   → DUPLICACY_RSA_PASSPHRASE            (unprefixed — duplicacy global)
 //
 // Any unrecognised backend keys cause buildEnv to return an error rather than
 // silently dropping them — surfaces typos and schema drift early.
@@ -180,6 +191,36 @@ func buildEnv(storageType, storageAlias string, b SecretsBundle) (buildEnvResult
 
 	default:
 		return res, fmt.Errorf("unknown storage_type %q", storageType)
+	}
+
+	// RSA asymmetric encryption (-e -key) is orthogonal to storage_type — any
+	// backend may carry an RSA keypair. Materialize each PEM to /dev/shm and
+	// return the paths so init/add/restore can pass `-key <path>`. The
+	// passphrase, when present, sets DUPLICACY_RSA_PASSPHRASE (unprefixed —
+	// duplicacy reads only the global form for restore key decryption).
+	if v, ok := b.Backend["rsa_public_key"]; ok && v != "" {
+		tmp, err := writeShmTmp("duplicacy-rsa-pub-", []byte(v))
+		if err != nil {
+			cleanupTmpfiles(res.Tmpfiles)
+			return buildEnvResult{}, fmt.Errorf("materialize rsa_public_key: %w", err)
+		}
+		res.RSAPubPath = tmp
+		res.Tmpfiles = append(res.Tmpfiles, tmp)
+		mark("rsa_public_key")
+	}
+	if v, ok := b.Backend["rsa_private_key"]; ok && v != "" {
+		tmp, err := writeShmTmp("duplicacy-rsa-priv-", []byte(v))
+		if err != nil {
+			cleanupTmpfiles(res.Tmpfiles)
+			return buildEnvResult{}, fmt.Errorf("materialize rsa_private_key: %w", err)
+		}
+		res.RSAPrivPath = tmp
+		res.Tmpfiles = append(res.Tmpfiles, tmp)
+		mark("rsa_private_key")
+	}
+	if v, ok := b.Backend["rsa_passphrase"]; ok && v != "" {
+		res.Env = append(res.Env, "DUPLICACY_RSA_PASSPHRASE="+v)
+		mark("rsa_passphrase")
 	}
 
 	for k := range b.Backend {

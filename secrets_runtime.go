@@ -24,22 +24,26 @@ import (
 // the given repo. Returns an error if no mapping exists OR any individual
 // credential vend fails AND is not present in cache.
 //
+// rsaPriv maps storage_alias → /dev/shm path of that storage's rsa_private_key
+// (when RSA-encrypted). Restore callers look up the alias they're restoring
+// from and pass the path to invocationForRestore. Backup/check/prune do not
+// need RSA private keys (the public key on the storage is sufficient).
+//
 // Usage:
 //
-//   env, cleanup, err := a.prepareEnvForRepo(ctx, repo)
+//   env, rsaPriv, cleanup, err := a.prepareEnvForRepo(ctx, repo)
 //   if err != nil { ... }
-//   defer cleanup()  // safe even if err != nil — cleanup is nil on err
+//   defer cleanup()  // safe — cleanup is no-op on err
 //
-// The cleanup closure unlinks all /dev/shm tmpfiles created for this run.
-// Caller must invoke it after the duplicacy process exits (jobs.go runs it
-// in the cmd.Wait() goroutine via the Job.cleanup field).
-func (a *app) prepareEnvForRepo(ctx context.Context, repo *Repo) ([]string, func(), error) {
+// The cleanup closure unlinks all /dev/shm tmpfiles created for this run
+// (env materialised PEMs + RSA pub/priv PEMs).
+func (a *app) prepareEnvForRepo(ctx context.Context, repo *Repo) ([]string, map[string]string, func(), error) {
 	mapping, ok := a.mapping.getByPath(repo.Path)
 	if !ok {
-		return nil, func() {}, fmt.Errorf("no controller mapping for repo at %s — register it via the controller UI", repo.Path)
+		return nil, nil, func() {}, fmt.Errorf("no controller mapping for repo at %s — register it via the controller UI", repo.Path)
 	}
 	if len(mapping.Storages) == 0 {
-		return nil, func() {}, fmt.Errorf("repo mapping for %s has no storages", repo.Path)
+		return nil, nil, func() {}, fmt.Errorf("repo mapping for %s has no storages", repo.Path)
 	}
 
 	// Bound the total fetch time at 30s — agents should fail fast if the
@@ -51,6 +55,7 @@ func (a *app) prepareEnvForRepo(ctx context.Context, repo *Repo) ([]string, func
 		env      []string
 		tmpfiles []string
 		errs     []error
+		rsaPriv  = map[string]string{}
 	)
 	for _, s := range mapping.Storages {
 		bundle, err := a.resolveCredential(fetchCtx, s.CredentialID)
@@ -70,6 +75,9 @@ func (a *app) prepareEnvForRepo(ctx context.Context, repo *Repo) ([]string, func
 		}
 		env = append(env, built.Env...)
 		tmpfiles = append(tmpfiles, built.Tmpfiles...)
+		if built.RSAPrivPath != "" {
+			rsaPriv[s.StorageAlias] = built.RSAPrivPath
+		}
 	}
 
 	cleanup := func() { cleanupTmpfiles(tmpfiles) }
@@ -77,9 +85,9 @@ func (a *app) prepareEnvForRepo(ctx context.Context, repo *Repo) ([]string, func
 	if len(errs) > 0 {
 		// On any error, clean up tmpfiles already created and return.
 		cleanup()
-		return nil, func() {}, errors.Join(errs...)
+		return nil, nil, func() {}, errors.Join(errs...)
 	}
-	return env, cleanup, nil
+	return env, rsaPriv, cleanup, nil
 }
 
 // resolveCredential returns a bundle, hitting the in-memory cache first and

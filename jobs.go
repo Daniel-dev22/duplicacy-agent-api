@@ -470,7 +470,7 @@ func (a *app) handleBackup(c *gin.Context) {
 	if req.TriggerKey == "" {
 		req.TriggerKey = "manual"
 	}
-	env, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	env, _, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
 		return
@@ -511,12 +511,19 @@ func (a *app) handleRestore(c *gin.Context) {
 	if req.TriggerKey == "" {
 		req.TriggerKey = "manual"
 	}
-	env, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	env, rsaPriv, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
 		return
 	}
-	inv := invocationForRestore(repo, req.Storage, req.Revision, req.Paths, req.Overwrite)
+	// Restore reads from a single storage; for RSA-encrypted storages we must
+	// pass -key <priv-path>. The targeted storage alias defaults to "default"
+	// when the caller leaves req.Storage empty.
+	storageAlias := req.Storage
+	if storageAlias == "" {
+		storageAlias = "default"
+	}
+	inv := invocationForRestore(repo, req.Storage, req.Revision, req.Paths, req.Overwrite, rsaPriv[storageAlias])
 	inv.EnvAdds = append(inv.EnvAdds, env...)
 	j, err := a.jobs.start(c.Request.Context(), a.cfg.DuplicacyBinary, repo, ActionRestore, req.Storage, inv, "", req.TriggerKey, cleanup)
 	if err != nil {
@@ -544,7 +551,7 @@ func (a *app) handleCheck(c *gin.Context) {
 	if req.TriggerKey == "" {
 		req.TriggerKey = "manual"
 	}
-	env, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	env, _, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
 		return
@@ -578,7 +585,7 @@ func (a *app) handlePrune(c *gin.Context) {
 	if req.TriggerKey == "" {
 		req.TriggerKey = "manual"
 	}
-	env, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	env, _, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
 		return

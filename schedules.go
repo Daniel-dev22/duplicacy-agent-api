@@ -58,10 +58,13 @@ type scheduleCache struct {
 	LastFetchedAt time.Time            `json:"last_fetched_at"`
 }
 
-// prepareEnvFn returns env vars + cleanup func for one duplicacy invocation
-// against the given repo. Implemented by app.prepareEnvForRepo. Defining it
-// as a function-value here keeps the scheduler decoupled from the app struct.
-type prepareEnvFn func(ctx context.Context, repo *Repo) ([]string, func(), error)
+// prepareEnvFn returns env vars + per-alias RSA private key paths + cleanup
+// func for one duplicacy invocation against the given repo. Implemented by
+// app.prepareEnvForRepo. Defining it as a function-value here keeps the
+// scheduler decoupled from the app struct. The scheduler only fires backup /
+// check / prune (not restore) so the RSA priv map is unused here, but the
+// signature stays consistent with the underlying implementation.
+type prepareEnvFn func(ctx context.Context, repo *Repo) ([]string, map[string]string, func(), error)
 
 type scheduler struct {
 	cfg        Config
@@ -308,7 +311,7 @@ func (s *scheduler) fire(ctx context.Context, sch LocalSchedule, triggerKey stri
 	)
 	if s.prepareEnv != nil {
 		var err error
-		env, cleanup, err = s.prepareEnv(ctx, repo)
+		env, _, cleanup, err = s.prepareEnv(ctx, repo)
 		if err != nil {
 			log.Error().Err(err).Str("schedule", sch.ID).Msg("schedule fire: vend secrets failed; skipping")
 			return

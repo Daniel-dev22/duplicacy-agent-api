@@ -95,7 +95,12 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("buildEnv %s: %v", s.StorageAlias, err)})
 			return
 		}
-		staged = append(staged, stagedStorage{req: s, env: built.Env, tmpfiles: built.Tmpfiles})
+		staged = append(staged, stagedStorage{
+			req:        s,
+			env:        built.Env,
+			tmpfiles:   built.Tmpfiles,
+			rsaPubPath: built.RSAPubPath,
+		})
 	}
 	defer rollback() // cleanup unconditionally — duplicacy has already read the files by the time it returns
 
@@ -104,7 +109,7 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 
 	// Run init for the primary.
 	primaryStaged := stagedFor(staged, primary.StorageAlias)
-	initInv := invocationForInit(req.RepoPath, req.RepoID, primary.StorageURL, true /*encrypted*/)
+	initInv := invocationForInit(req.RepoPath, req.RepoID, primary.StorageURL, true /*encrypted*/, primaryStaged.rsaPubPath)
 	initInv.EnvAdds = append(initInv.EnvAdds, primaryStaged.env...)
 	if out, err := runSync(ctx, a.cfg.DuplicacyBinary, initInv, 4*time.Minute); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -119,7 +124,7 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 		if s.req.IsPrimary {
 			continue
 		}
-		addInv := invocationForAdd(req.RepoPath, s.req.StorageAlias, req.RepoID, s.req.StorageURL, true)
+		addInv := invocationForAdd(req.RepoPath, s.req.StorageAlias, req.RepoID, s.req.StorageURL, true, s.rsaPubPath)
 		// duplicacy add reads env vars for BOTH the primary (so it can re-init
 		// the metadata layer) and the new alias. Pass primary + this storage.
 		addInv.EnvAdds = append(addInv.EnvAdds, primaryStaged.env...)
@@ -236,9 +241,10 @@ func isAgentValidStorageType(s string) bool {
 }
 
 type stagedStorage struct {
-	req      initStorageReq
-	env      []string
-	tmpfiles []string
+	req        initStorageReq
+	env        []string
+	tmpfiles   []string
+	rsaPubPath string // /dev/shm path of rsa_public_key PEM, when this storage uses RSA encryption
 }
 
 func stagedFor(staged []stagedStorage, alias string) stagedStorage {
