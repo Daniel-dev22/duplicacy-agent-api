@@ -60,6 +60,23 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 		return
 	}
 
+	// Resolve any {server}/{server_type}/{site}/{home}/{repo_id} placeholders in
+	// each storage_url against this agent's identity + the request's repo_id.
+	// The expanded URL is what gets baked into .duplicacy/preferences by
+	// `duplicacy init`, so subsequent backup/restore/check/prune ops never need
+	// to re-resolve. Unknown placeholders fail loud here, before any side
+	// effects on the storage backend.
+	tctx := a.cfg.baseTplCtx()
+	tctx.RepoID = req.RepoID
+	for i := range req.Storages {
+		expanded, err := expandStorageURL(req.Storages[i].StorageURL, tctx)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("storages[%d].storage_url: %v", i, err)})
+			return
+		}
+		req.Storages[i].StorageURL = expanded
+	}
+
 	// Ensure repo dir exists.
 	if err := ensureDir(req.RepoPath); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "ensure repo dir: " + err.Error()})
