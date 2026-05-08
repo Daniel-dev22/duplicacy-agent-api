@@ -20,6 +20,7 @@ type app struct {
 	events              *eventBuffer
 	mapping             *repoMappingStore // controller-managed repo↔credential mapping
 	secrets             *secretCache      // 60s TTL cache of vended bundles
+	compose             *composeIndex     // bounded scan of mounted COMPOSE_SCAN_ROOTS for compose project dirs
 	stop                chan struct{}     // closed in close(); subsystems range on it for shutdown
 }
 
@@ -61,6 +62,7 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 		filters:             filters,
 		mapping:             mapping,
 		secrets:             newSecretCache(),
+		compose:             newComposeIndex(cfg.ComposeScanRoots),
 		stop:                make(chan struct{}),
 	}
 

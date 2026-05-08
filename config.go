@@ -11,6 +11,7 @@ type Config struct {
 	NodeName         string   // hostname-short this agent runs on (e.g. "nuc02")
 	SiteID           string   // "kd" | "ng"
 	BackupRoots      []string // bind-mounted paths to scan for .duplicacy repos
+	ComposeScanRoots []string // bind-mounted (read-only) paths to scan for docker-compose project dirs
 	ConfigDir        string   // persistent state dir (events.sqlite, schedule cache, filter cache)
 	ControlCenterURL string   // The agent always reaches controller-api via the host's
 	                          // Traefik (or k3s Traefik on cluster nodes). Traefik handles
@@ -29,6 +30,7 @@ func loadConfig() Config {
 		NodeName:         requireEnv("NODE_NAME"),
 		SiteID:           requireEnv("SITE_ID"),
 		BackupRoots:      splitCSV(requireEnv("BACKUP_ROOTS")),
+		ComposeScanRoots: splitCSV(getEnv("COMPOSE_SCAN_ROOTS", "")),
 		ConfigDir:        getEnv("CONFIG_DIR", "/var/lib/duplicacy-agent-api"),
 		ControlCenterURL: requireEnv("CONTROL_CENTER_URL"),
 		TraefikDockerDNS: getEnv("TRAEFIK_DOCKER_DNS", "traefik"),
