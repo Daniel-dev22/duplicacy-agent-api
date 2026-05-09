@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +62,27 @@ const recentJobsRetained = 50
 // subscriberBuffer: lines a slow subscriber can lag before we drop oldest from its channel.
 const subscriberBuffer = 256
 
+// JobProgress is the structured form of duplicacy's backup-time
+// "Uploaded chunk N size X, Y/s ETA HH:MM:SS Z%" lines. Populated as the
+// agent tails stdout; cleared (nil) before backup starts and after it
+// completes. Other actions (restore, check, prune) don't emit a percent
+// reliably so we skip parsing them — the raw log stream remains the
+// source of truth for those.
+type JobProgress struct {
+	Percent       float64   `json:"percent"`
+	Speed         string    `json:"speed,omitempty"`         // verbatim ("7.50MB/s") — running only
+	ETA           string    `json:"eta,omitempty"`           // verbatim ("03:12:54", "n/a", "0h 2m 30s")
+	LastChunk     int       `json:"last_chunk,omitempty"`    // chunk index from the latest line
+	UpdatedAt     time.Time `json:"updated_at"`
+	// Final-summary fields, populated from BACKUP_STATS lines on completion.
+	// Frontend swaps the running view (percent + speed + ETA) for the
+	// completed view (chunks + bytes + duration) using state == 'completed'.
+	TotalChunks   int    `json:"total_chunks,omitempty"`     // "All chunks: <N> total, …"
+	NewChunks     int    `json:"new_chunks,omitempty"`       // "; <N> new, …"
+	BytesUploaded string `json:"bytes_uploaded,omitempty"`   // verbatim "669K"
+	Duration      string `json:"duration,omitempty"`         // verbatim "00:00:02"
+}
+
 // Job is one CLI invocation tracked through its lifecycle.
 type Job struct {
 	ID          string    `json:"id"`
@@ -74,6 +97,7 @@ type Job struct {
 	ExitCode    int       `json:"exit_code"`
 	ErrorMsg    string    `json:"error,omitempty"`
 	LineCount   int       `json:"line_count"`
+	Progress    *JobProgress `json:"progress,omitempty"`
 
 	// Caller-set context for events
 	ScheduleID string `json:"schedule_id,omitempty"`
@@ -146,12 +170,132 @@ func (j *Job) unsubscribe(ch chan string) {
 	j.mu.Unlock()
 }
 
+// progressLineRe matches duplicacy 3.x chunk progress lines, both the
+// backup variant ("Uploaded chunk …") and the restore variant
+// ("Downloaded chunk …"). Source-of-truth format string in
+// duplicacy_backupmanager.go:432 is `%s chunk %d size %d, %sB/s %s %.1f%%`,
+// so groups are: action, chunk_idx, size_bytes, speed (e.g. "7.69MB/s"),
+// eta (e.g. "0h 2m 30s" or "n/a" — may contain spaces), percent.
+//
+// ETA is captured non-greedily so the trailing percent token always wins
+// the match — duplicacy's PrettyTime can emit space-separated tokens like
+// "0h 2m 30s" that would otherwise break a strict \S+ match.
+var progressLineRe = regexp.MustCompile(
+	`^(Uploaded|Downloaded) chunk (\d+) size (\d+), (\S+) (.+?) ([\d.]+)%$`,
+)
+
+// parseProgressLine updates Job.Progress from a duplicacy stdout line.
+// Returns true if the line was a recognised progress line. Cheap regex
+// match run for every backup/restore-action line.
+func (j *Job) parseProgressLine(line string) bool {
+	m := progressLineRe.FindStringSubmatch(line)
+	if m == nil {
+		return false
+	}
+	chunkIdx, _ := strconv.Atoi(m[2])
+	pct, err := strconv.ParseFloat(m[6], 64)
+	if err != nil {
+		return false
+	}
+	// Cap percent at 100 — duplicacy's restore counter divides by 10 and
+	// can exceed 100% on incremental snapshots that re-touch chunks.
+	if pct > 100 {
+		pct = 100
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.Progress == nil {
+		j.Progress = &JobProgress{}
+	}
+	j.Progress.Percent = pct
+	j.Progress.Speed = m[4]
+	j.Progress.ETA = m[5]
+	j.Progress.LastChunk = chunkIdx
+	j.Progress.UpdatedAt = time.Now().UTC()
+	return true
+}
+
+// statsAllChunksRe matches duplicacy's final summary line, source format
+// (duplicacy_backupmanager.go:570):
+//   "All chunks: %d total, %s bytes; %d new, %s bytes, %s bytes uploaded"
+//
+// Real example from /srv/containers/duplicacy/logs/backup-….log:
+//   INFO BACKUP_STATS All chunks: 1472 total, 8,353M bytes; 5 new, 7,984K bytes, 669K bytes uploaded
+//
+// Captures: total_chunks, new_chunks, bytes_uploaded.
+// (Total bytes and new bytes are skipped — uploaded is the operator-relevant
+//  number for the dashboard; we can revisit if needed.)
+var statsAllChunksRe = regexp.MustCompile(
+	`All chunks: (\d+) total, .+? bytes; (\d+) new, .+? bytes, (\S+) bytes uploaded`,
+)
+
+// statsRunTimeRe matches the wall-clock duration line that follows the
+// All chunks summary:
+//   "Total running time: 00:00:02"
+var statsRunTimeRe = regexp.MustCompile(`Total running time: (\S+)`)
+
+// parseStatsLine populates the final-summary fields on Job.Progress when
+// either the All-chunks summary or the running-time line is observed.
+// Triggers a fleet snapshot on update so the dashboard sees the totals
+// immediately rather than waiting for the next event hook.
+func (j *Job) parseStatsLine(line string) bool {
+	if m := statsAllChunksRe.FindStringSubmatch(line); m != nil {
+		total, _ := strconv.Atoi(m[1])
+		new_, _ := strconv.Atoi(m[2])
+		j.mu.Lock()
+		if j.Progress == nil {
+			j.Progress = &JobProgress{}
+		}
+		j.Progress.TotalChunks = total
+		j.Progress.NewChunks = new_
+		j.Progress.BytesUploaded = m[3]
+		j.Progress.UpdatedAt = time.Now().UTC()
+		j.mu.Unlock()
+		return true
+	}
+	if m := statsRunTimeRe.FindStringSubmatch(line); m != nil {
+		j.mu.Lock()
+		if j.Progress == nil {
+			j.Progress = &JobProgress{}
+		}
+		j.Progress.Duration = m[1]
+		j.Progress.UpdatedAt = time.Now().UTC()
+		j.mu.Unlock()
+		return true
+	}
+	return false
+}
+
+// errorLineRe matches duplicacy's ERROR-level lines. The agent invokes
+// duplicacy without -log, so the format is bare "ERROR <TAG> <message>"
+// (no timestamp/level prefix). Examples seen in the wild:
+//   ERROR STORAGE_CREATE Failed to load the SFTP storage at sftp://…: Can't access the storage path /mnt/…
+//   ERROR UPLOAD_CHUNK Failed to upload the chunk …: RequestError: send request failed
+//   ERROR DOWNLOAD_OPEN Failed to open the file … for in-place writing
+var errorLineRe = regexp.MustCompile(`^ERROR (\S+) (.+)$`)
+
+// parseErrorLine checks for an ERROR-tag line and stores the LAST one as
+// Job.ErrorMsg, formatted "<TAG>: <message>". Replaces the generic
+// "exit status N" the cmd.Wait() path would otherwise put there. No
+// rate-limiting needed — most jobs see at most a handful of ERROR lines,
+// and overwriting is correct (we want the most recent failure cause).
+func (j *Job) parseErrorLine(line string) {
+	m := errorLineRe.FindStringSubmatch(line)
+	if m == nil {
+		return
+	}
+	j.mu.Lock()
+	j.ErrorMsg = m[1] + ": " + m[2]
+	j.mu.Unlock()
+}
+
 // jobRegistry holds active and recently-terminated jobs.
 type jobRegistry struct {
-	mu       sync.RWMutex
-	jobs     map[string]*Job
-	terminal []string // ring of terminated job IDs in terminate-order; bounded by recentJobsRetained
-	hooks    []JobEventHook
+	mu            sync.RWMutex
+	jobs          map[string]*Job
+	terminal      []string // ring of terminated job IDs in terminate-order; bounded by recentJobsRetained
+	hooks         []JobEventHook
+	progressHooks []func(*Job) // lighter-weight than JobEventHook; called on progress line parse
 }
 
 func newJobRegistry() *jobRegistry {
@@ -165,6 +309,27 @@ func (r *jobRegistry) RegisterHook(h JobEventHook) {
 	r.mu.Lock()
 	r.hooks = append(r.hooks, h)
 	r.mu.Unlock()
+}
+
+// RegisterProgressHook subscribes to progress-line updates without going
+// through the heavier event-buffer ingest path. Used by the fleet WS hub
+// to push live percent/ETA to dashboards. Call site is hot (per chunk
+// uploaded), so the hook should be cheap (typically just a coalescing
+// channel send).
+func (r *jobRegistry) RegisterProgressHook(h func(*Job)) {
+	r.mu.Lock()
+	r.progressHooks = append(r.progressHooks, h)
+	r.mu.Unlock()
+}
+
+func (r *jobRegistry) emitProgress(j *Job) {
+	r.mu.RLock()
+	hooks := make([]func(*Job), len(r.progressHooks))
+	copy(hooks, r.progressHooks)
+	r.mu.RUnlock()
+	for _, h := range hooks {
+		h(j)
+	}
 }
 
 func (r *jobRegistry) emit(j *Job, evt JobEvent) {
@@ -248,7 +413,13 @@ func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo
 		j.CompletedAt = time.Now().UTC()
 		if err != nil {
 			j.State = JobFailed
-			j.ErrorMsg = err.Error()
+			// Only fall back to "exit status N" if no friendly ERROR-tag
+			// line was captured during tail; that path produces messages
+			// like "STORAGE_CREATE: Failed to load …" which are far more
+			// useful for the operator than a bare exit code.
+			if j.ErrorMsg == "" {
+				j.ErrorMsg = err.Error()
+			}
 			if exitErr, ok := err.(interface{ ExitCode() int }); ok {
 				j.ExitCode = exitErr.ExitCode()
 			}
@@ -286,7 +457,29 @@ func (r *jobRegistry) tail(j *Job, rdr io.Reader, source string) {
 	scanner := bufio.NewScanner(rdr)
 	scanner.Buffer(make([]byte, 1024*1024), 8*1024*1024)
 	for scanner.Scan() {
-		j.appendLine(scanner.Text())
+		line := scanner.Text()
+		j.appendLine(line)
+		// Progress parse — backup AND restore both emit "Uploaded/Downloaded chunk …".
+		if j.Action == ActionBackup || j.Action == ActionRestore {
+			if updated := j.parseProgressLine(line); updated {
+				r.emitProgress(j)
+			}
+		}
+		// Final-summary parse — only for backup; the BACKUP_STATS line
+		// pattern is backup-specific. Triggers a fleet snapshot the same
+		// way progress lines do so the dashboard sees totals on the same
+		// frame the job flips to "completed".
+		if j.Action == ActionBackup {
+			if updated := j.parseStatsLine(line); updated {
+				r.emitProgress(j)
+			}
+		}
+		// ERROR-line capture — last "ERROR <TAG> <message>" wins. Replaces
+		// the generic exit-code error string with duplicacy's friendly
+		// description (e.g. "STORAGE_CREATE: Failed to load the SFTP
+		// storage at …: Can't access the storage path …"). Fires for every
+		// action so check/prune/restore failures also get clean messages.
+		j.parseErrorLine(line)
 	}
 	if err := scanner.Err(); err != nil {
 		log.Warn().Err(err).Str("job", j.ID).Str("source", source).Msg("tail scanner error")
