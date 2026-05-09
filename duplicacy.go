@@ -244,11 +244,12 @@ func invocationForPrune(repo *Repo, storageName string, keepRules []string, excl
 // rsaPubKeyPath is the /dev/shm path to the rsa_public_key PEM when this
 // storage uses RSA asymmetric encryption; empty string otherwise.
 func invocationForInit(repoRoot, snapshotID, storageURL string, encrypted bool, rsaPubKeyPath string) cliInvocation {
-	// -no-save-password is a duplicacy GLOBAL flag (lives in
-	// `duplicacy [global flags] subcommand …`) — placing it after `init`
-	// makes the urfave/cli parser treat it as an unknown subcommand flag
-	// and bail with "Incorrect Usage". Same applies to invocationForAdd.
-	args := []string{"-no-save-password", "init"}
+	// Note: duplicacy 3.2.5 does not have a -no-save-password flag (neither
+	// global nor on init). The "do not save the password" intent is
+	// realised by the post-init scrub step that rewrites
+	// `.duplicacy/preferences` with `no_save_password: true`. Adding the
+	// flag here makes urfave/cli reject the call with "Incorrect Usage".
+	args := []string{"init"}
 	if encrypted {
 		args = append(args, "-encrypt")
 	}
@@ -265,8 +266,8 @@ func invocationForInit(repoRoot, snapshotID, storageURL string, encrypted bool, 
 // rsaPubKeyPath is the /dev/shm path to the rsa_public_key PEM when this
 // secondary storage uses RSA asymmetric encryption; empty string otherwise.
 func invocationForAdd(repoRoot, storageName, snapshotID, storageURL string, encrypted bool, rsaPubKeyPath string) cliInvocation {
-	// -no-save-password is a global flag — see invocationForInit comment.
-	args := []string{"-no-save-password", "add"}
+	// duplicacy 3.2.5 has no -no-save-password flag — see invocationForInit.
+	args := []string{"add"}
 	if encrypted {
 		args = append(args, "-encrypt")
 	}
