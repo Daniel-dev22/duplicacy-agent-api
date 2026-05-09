@@ -124,6 +124,31 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Minute)
 	defer cancel()
 
+	// Pre-create the storage directory for any sftp:// backends. duplicacy
+	// stats the storage path during init and fails if missing — for a fresh
+	// node nobody has hand-prepared the dir yet, so do it ourselves over the
+	// same SSH credential. Idempotent (mkdir -p). Non-sftp storages no-op.
+	for _, s := range staged {
+		if !strings.HasPrefix(s.req.StorageURL, "sftp://") {
+			continue
+		}
+		keyFile, passphrase := sshAuthFromEnv(s.env, s.req.StorageAlias)
+		if keyFile == "" {
+			// No key in env means buildEnv already errored above; the only
+			// way we get here without one is sftp-with-password, which
+			// duplicacy supports but our pre-mkdir path doesn't yet. Let
+			// duplicacy itself handle it — if the dir's missing, init
+			// returns the existing clear error.
+			continue
+		}
+		if err := ensureSFTPStorageDir(ctx, s.req.StorageURL, keyFile, passphrase); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": fmt.Sprintf("ensure sftp storage dir for %s: %v", s.req.StorageAlias, err),
+			})
+			return
+		}
+	}
+
 	// Run init for the primary.
 	primaryStaged := stagedFor(staged, primary.StorageAlias)
 	initInv := invocationForInit(req.RepoPath, req.RepoID, primary.StorageURL, true /*encrypted*/, primaryStaged.rsaPubPath)
@@ -311,6 +336,32 @@ func stagedFor(staged []stagedStorage, alias string) stagedStorage {
 		}
 	}
 	return stagedStorage{}
+}
+
+// sshAuthFromEnv extracts the SSH key file path and passphrase the secrets
+// pipeline materialised for this storage. Mirrors buildEnv's prefix logic:
+// the default storage uses bare DUPLICACY_SSH_KEY_FILE; aliased storages
+// use DUPLICACY_<ALIAS>_SSH_KEY_FILE. Returns empty strings if the storage
+// is password-auth or has no key configured.
+func sshAuthFromEnv(env []string, alias string) (keyFile, passphrase string) {
+	prefix := "DUPLICACY_"
+	if alias != "" && !strings.EqualFold(alias, "default") {
+		prefix = "DUPLICACY_" + strings.ToUpper(alias) + "_"
+	}
+	for _, kv := range env {
+		eq := strings.IndexByte(kv, '=')
+		if eq < 0 {
+			continue
+		}
+		k, v := kv[:eq], kv[eq+1:]
+		switch k {
+		case prefix + "SSH_KEY_FILE":
+			keyFile = v
+		case prefix + "SSH_KEY_PASSPHRASE":
+			passphrase = v
+		}
+	}
+	return
 }
 
 func toMappingStorages(in []initStorageReq) []RepoStorageMapping {
