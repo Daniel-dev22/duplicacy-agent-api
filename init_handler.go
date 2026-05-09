@@ -178,6 +178,8 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 	if err := a.repos.ScanForce(); err != nil {
 		log.Warn().Err(err).Msg("post-init repo scan failed")
 	}
+	// Push the new state to any connected fleet WS subscribers.
+	a.fleet.Trigger()
 
 	c.JSON(http.StatusOK, gin.H{
 		"status":    "initialized",

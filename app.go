@@ -21,6 +21,7 @@ type app struct {
 	mapping             *repoMappingStore // controller-managed repo↔credential mapping
 	secrets             *secretCache      // 60s TTL cache of vended bundles
 	compose             *composeIndex     // bounded scan of mounted COMPOSE_SCAN_ROOTS for compose project dirs
+	fleet               *fleetHub         // /ws/fleet broadcaster — pushes snapshot on init / job state change
 	stop                chan struct{}     // closed in close(); subsystems range on it for shutdown
 }
 
@@ -65,6 +66,10 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 		compose:             newComposeIndex(cfg.ComposeScanRoots),
 		stop:                make(chan struct{}),
 	}
+	a.fleet = newFleetHub(a)
+	// Trigger a fleet snapshot on every job lifecycle event so connected
+	// dashboards see state transitions in real time.
+	jobs.RegisterHook(func(_ *Job, _ JobEvent) { a.fleet.Trigger() })
 
 	sched, err := newScheduler(cfg, cc, jobs, repos, a.prepareEnvForRepo)
 	if err != nil {
@@ -100,6 +105,7 @@ func (a *app) startBackgroundWorkers(ctx context.Context) {
 	go a.events.drainLoop(ctx)
 	a.scheduler.Start(ctx)
 	go a.filters.reconcileLoop(ctx, a.stop)
+	go a.fleet.Run(ctx)
 	log.Info().Msg("background workers started")
 }
 

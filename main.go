@@ -92,6 +92,7 @@ func registerRoutes(r *gin.Engine, app *app) {
 	r.GET("/jobs", app.handleListJobs)
 	r.GET("/jobs/:id", app.handleGetJob)
 	r.GET("/ws/jobs/:id/logs", app.handleJobLogsWS)
+	r.GET("/ws/fleet", app.handleFleetWS)
 
 	r.GET("/global-filters/cache", app.handleGlobalFiltersCache)
 	r.POST("/global-filters/refresh", app.handleGlobalFiltersRefresh)
