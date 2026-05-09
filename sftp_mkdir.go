@@ -6,12 +6,11 @@ package main
 // if the directory is missing — preventing a fresh repo from ever starting on
 // a host that hasn't been hand-prepared.
 //
-// We open a single SSH session reusing the same key/passphrase the credential
-// would have given to duplicacy, run `mkdir -p PATH`, and close. Idempotent:
-// `mkdir -p` on an existing dir is a no-op.
-//
-// Only sftp:// URLs are handled — other backends (b2, s3, gcs, azure) create
-// their own buckets/containers as needed.
+// We talk SFTP (not SSH-exec) because the typical `duplicacy@host` user is
+// shell-less (e.g. /sbin/nologin) for security: SSH command execution is
+// rejected with "This account is currently not available." even though the
+// SFTP subsystem is enabled. duplicacy itself uses the SFTP protocol, so
+// reusing it here matches the credential's actual capability.
 
 import (
 	"context"
@@ -23,16 +22,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pkg/sftp"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/crypto/ssh"
 )
 
-// ensureSFTPStorageDir parses storageURL, dials the SSH host with keyFile (and
-// optional passphrase), and runs `mkdir -p` on the path component.
+// ensureSFTPStorageDir parses storageURL, opens an SFTP session over the
+// supplied SSH key (and optional passphrase), and recursively creates the
+// path component if missing. Idempotent.
 //
-// Non-sftp URLs are a no-op success. Missing key file returns an error so the
-// caller can decide whether to abort init or proceed (we abort — without the
-// dir duplicacy will fail anyway).
+// Non-sftp URLs are a no-op success. Other backends (b2, s3, gcs, azure)
+// create their own buckets/containers as needed.
 func ensureSFTPStorageDir(ctx context.Context, storageURL, keyFile, passphrase string) error {
 	if !strings.HasPrefix(storageURL, "sftp://") {
 		return nil
@@ -52,9 +52,9 @@ func ensureSFTPStorageDir(ctx context.Context, storageURL, keyFile, passphrase s
 		host += ":22"
 	}
 	// url.Parse for sftp://host//abs/path leaves u.Path = "//abs/path".
-	// Collapse to a single leading slash for the remote `mkdir` argument —
-	// the double-slash is only a URL convention, the actual path on the
-	// SFTP server is the absolute filesystem path.
+	// Collapse to a single leading slash for the remote path arg — the
+	// double slash is only a URL convention; the actual filesystem path
+	// is the absolute /-rooted form.
 	remotePath := strings.TrimLeft(u.Path, "/")
 	if remotePath == "" {
 		return errors.New("sftp url missing path")
@@ -79,13 +79,9 @@ func ensureSFTPStorageDir(ctx context.Context, storageURL, keyFile, passphrase s
 	}
 
 	cfg := &ssh.ClientConfig{
-		User: u.User.Username(),
-		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		// We don't pin host keys here — the credential's existing init/backup
-		// path doesn't either (duplicacy itself would also accept-on-first-use).
-		// The local network and traffic is already inside the home network's
-		// trust boundary.
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		User:            u.User.Username(),
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // same posture as duplicacy itself for sftp
 		Timeout:         15 * time.Second,
 	}
 
@@ -101,65 +97,34 @@ func ensureSFTPStorageDir(ctx context.Context, storageURL, keyFile, passphrase s
 		_ = conn.Close()
 		return fmt.Errorf("ssh handshake: %w", err)
 	}
-	client := ssh.NewClient(c, chans, reqs)
-	defer client.Close()
+	sshClient := ssh.NewClient(c, chans, reqs)
+	defer sshClient.Close()
 
-	// Defence-in-depth: reject anything outside our allowlist before
-	// templating the path into a shell command. The URL came from our own
-	// credential template, but the check is cheap.
-	if !validRemotePath(remotePath) {
-		return fmt.Errorf("remote path %q contains disallowed characters", remotePath)
-	}
-
-	// Phase 1 — probe with the credential. `test -d PATH` returns 0 if the
-	// directory exists and the user can read it. Any non-zero exit means
-	// either the path is missing or the SSH user lacks permission. Doing
-	// this first gives us a clear "the cred works, we just need to create"
-	// signal vs. surfacing an mkdir-failed error that confuses missing-path
-	// with no-permission.
-	probeSess, err := client.NewSession()
+	sftpClient, err := sftp.NewClient(sshClient)
 	if err != nil {
-		return fmt.Errorf("ssh session (probe): %w", err)
+		return fmt.Errorf("open sftp subsystem: %w", err)
 	}
-	probeErr := probeSess.Run(fmt.Sprintf("test -d %q", remotePath))
-	probeSess.Close()
-	if probeErr == nil {
+	defer sftpClient.Close()
+
+	// Phase 1 — probe. Stat tells us "exists and reachable" vs "missing"
+	// vs "permission denied" with clearer error semantics than blindly
+	// calling MkdirAll.
+	if info, err := sftpClient.Stat(remotePath); err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("remote path %s exists but is not a directory", remotePath)
+		}
 		log.Info().Str("host", host).Str("path", remotePath).Msg("sftp storage dir already exists; skipping mkdir")
 		return nil
+	} else if !os.IsNotExist(err) {
+		// Some non-"missing" error — auth/permission/network. Surface it
+		// clearly so the operator doesn't chase a phantom mkdir failure.
+		return fmt.Errorf("stat %s via sftp: %w", remotePath, err)
 	}
 
-	// Phase 2 — try to create. If this fails the credential is bad or the
-	// parent path is unwritable; bubble both signals up.
-	mkSess, err := client.NewSession()
-	if err != nil {
-		return fmt.Errorf("ssh session (mkdir): %w", err)
-	}
-	defer mkSess.Close()
-	out, err := mkSess.CombinedOutput(fmt.Sprintf("mkdir -p %q", remotePath))
-	if err != nil {
-		return fmt.Errorf("remote mkdir -p %s failed: %w (output: %s)", remotePath, err, strings.TrimSpace(string(out)))
+	// Phase 2 — create recursively.
+	if err := sftpClient.MkdirAll(remotePath); err != nil {
+		return fmt.Errorf("sftp MkdirAll %s: %w", remotePath, err)
 	}
 	log.Info().Str("host", host).Str("path", remotePath).Msg("created sftp storage dir")
 	return nil
-}
-
-// validRemotePath restricts to characters safe in a "%q" Go-quoted shell
-// argument (no $, backtick, newline, etc.). Allows the typical paths we use
-// (/mnt/array/...).
-func validRemotePath(p string) bool {
-	if p == "" {
-		return false
-	}
-	for _, r := range p {
-		switch {
-		case r >= 'a' && r <= 'z',
-			r >= 'A' && r <= 'Z',
-			r >= '0' && r <= '9',
-			r == '/', r == '-', r == '_', r == '.':
-			continue
-		default:
-			return false
-		}
-	}
-	return true
 }
