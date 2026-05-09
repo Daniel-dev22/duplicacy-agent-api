@@ -70,5 +70,42 @@ func expandStorageURL(template string, ctx tplCtx) (string, error) {
 	if m := unknownPlaceholderRe.FindString(out); m != "" {
 		return "", fmt.Errorf("unknown placeholder %s in storage_url (supported: {server} {server_type} {site} {home} {repo_id})", m)
 	}
-	return out, nil
+	return normalizeSFTPAbsolutePath(out), nil
+}
+
+// normalizeSFTPAbsolutePath ensures an sftp:// URL whose path component
+// looks like a host filesystem absolute path (starts with /mnt, /home, /var,
+// /opt, /srv, /data, /backup) is encoded with the double-slash convention
+// duplicacy/Go's url package expect for absolute SSH paths. A single slash
+// after the authority is interpreted by SFTP servers as relative-to-the-
+// SSH-user's-home-directory; absolute paths require `sftp://host//path`.
+//
+// If the URL already uses // we leave it alone. If it's not sftp://, we
+// leave it alone. If the path looks user-relative (e.g. sftp://host/backups
+// where ~/backups is intentional), we leave it alone — only well-known
+// system roots get rewritten.
+func normalizeSFTPAbsolutePath(u string) string {
+	const prefix = "sftp://"
+	if !strings.HasPrefix(u, prefix) {
+		return u
+	}
+	rest := u[len(prefix):]
+	// split authority from path on the first '/'.
+	idx := strings.IndexByte(rest, '/')
+	if idx < 0 {
+		return u
+	}
+	authority := rest[:idx]
+	path := rest[idx:] // includes leading '/'
+	if strings.HasPrefix(path, "//") {
+		return u // already absolute (double slash)
+	}
+	// only rewrite if the path's first segment is a well-known host root.
+	systemRoots := []string{"/mnt/", "/home/", "/var/", "/opt/", "/srv/", "/data/", "/backup/"}
+	for _, root := range systemRoots {
+		if strings.HasPrefix(path, root) || path == strings.TrimSuffix(root, "/") {
+			return prefix + authority + "/" + path
+		}
+	}
+	return u
 }
