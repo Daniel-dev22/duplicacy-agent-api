@@ -173,7 +173,9 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 	}
 
 	// Refresh the in-memory repo index so /repos returns the new repo.
-	if err := a.repos.scan(); err != nil {
+	// ScanForce bypasses the TTL cache — the just-created repo must be visible
+	// on the very next /repos poll.
+	if err := a.repos.ScanForce(); err != nil {
 		log.Warn().Err(err).Msg("post-init repo scan failed")
 	}
 

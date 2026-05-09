@@ -58,13 +58,23 @@ type rawPreference struct {
 
 // repoIndex caches scanned repos. The HTTP layer reads from the cache; a refresh
 // is triggered by handleListRepos and by anything that mutates a repo (init, storage add).
+//
+// scanTTL bounds how often the on-disk walk runs in response to /repos polls.
+// The fleet-page polls every 15s × N nodes; without a cache each call walks
+// ALL backup roots to depth 3 (~1.5–2s on busy hosts), making the dashboard
+// feel sluggish. Mutating ops (init, storage add, delete) call ScanForce()
+// to invalidate the cache and re-walk immediately so the next list reflects
+// fresh state.
 type repoIndex struct {
 	roots  []string
 	binary string
 
-	mu    sync.RWMutex
-	repos map[string]*Repo // keyed by Repo.ID
+	mu          sync.RWMutex
+	repos       map[string]*Repo // keyed by Repo.ID
+	lastScanned time.Time
 }
+
+const repoScanTTL = 30 * time.Second
 
 func newRepoIndex(roots []string, binary string) *repoIndex {
 	return &repoIndex{
@@ -74,10 +84,25 @@ func newRepoIndex(roots []string, binary string) *repoIndex {
 	}
 }
 
-// scan walks each backup root looking for .duplicacy/preferences files.
+// scan walks each backup root looking for .duplicacy/preferences files,
+// honouring the cache TTL. Use ScanForce after init/storage-add/delete.
+func (r *repoIndex) scan() error {
+	r.mu.RLock()
+	fresh := !r.lastScanned.IsZero() && time.Since(r.lastScanned) < repoScanTTL
+	r.mu.RUnlock()
+	if fresh {
+		return nil
+	}
+	return r.scanLocked()
+}
+
+// ScanForce always rewalks regardless of cache state.
+func (r *repoIndex) ScanForce() error { return r.scanLocked() }
+
+// scanLocked walks each backup root looking for .duplicacy/preferences files.
 // Cap depth at 3 so we cover both "root IS a repo" and "root contains a few repos"
 // without descending into the file tree we're meant to back up.
-func (r *repoIndex) scan() error {
+func (r *repoIndex) scanLocked() error {
 	const maxDepth = 3
 
 	found := map[string]*Repo{}
@@ -115,6 +140,7 @@ func (r *repoIndex) scan() error {
 
 	r.mu.Lock()
 	r.repos = found
+	r.lastScanned = time.Now()
 	r.mu.Unlock()
 
 	log.Info().Int("count", len(found)).Msg("repo scan complete")
