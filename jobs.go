@@ -670,7 +670,12 @@ func (a *app) handleBackup(c *gin.Context) {
 	}
 	inv := invocationForBackup(repo, req.Storage, req.Tag, req.Threads)
 	inv.EnvAdds = append(inv.EnvAdds, env...)
-	j, err := a.jobs.start(c.Request.Context(), a.cfg.DuplicacyBinary, repo, ActionBackup, req.Storage, inv, req.ScheduleID, req.TriggerKey, cleanup)
+	// Detached context — the spawned duplicacy process must outlive the
+	// HTTP request, otherwise gin cancels c.Request.Context() on return
+	// and the job dies with "signal: killed" before the first chunk runs.
+	// jobRegistry.start wraps this in its own WithCancel so the registry
+	// can still abort the job.
+	j, err := a.jobs.start(context.Background(), a.cfg.DuplicacyBinary, repo, ActionBackup, req.Storage, inv, req.ScheduleID, req.TriggerKey, cleanup)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "job_id": j.ID})
 		return
@@ -718,7 +723,8 @@ func (a *app) handleRestore(c *gin.Context) {
 	}
 	inv := invocationForRestore(repo, req.Storage, req.Revision, req.Paths, req.Overwrite, rsaPriv[storageAlias])
 	inv.EnvAdds = append(inv.EnvAdds, env...)
-	j, err := a.jobs.start(c.Request.Context(), a.cfg.DuplicacyBinary, repo, ActionRestore, req.Storage, inv, "", req.TriggerKey, cleanup)
+	// Detached context — see handleBackup comment.
+	j, err := a.jobs.start(context.Background(), a.cfg.DuplicacyBinary, repo, ActionRestore, req.Storage, inv, "", req.TriggerKey, cleanup)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "job_id": j.ID})
 		return
@@ -751,7 +757,8 @@ func (a *app) handleCheck(c *gin.Context) {
 	}
 	inv := invocationForCheck(repo, req.Storage, req.Revisions, req.All)
 	inv.EnvAdds = append(inv.EnvAdds, env...)
-	j, err := a.jobs.start(c.Request.Context(), a.cfg.DuplicacyBinary, repo, ActionCheck, req.Storage, inv, "", req.TriggerKey, cleanup)
+	// Detached context — see handleBackup comment.
+	j, err := a.jobs.start(context.Background(), a.cfg.DuplicacyBinary, repo, ActionCheck, req.Storage, inv, "", req.TriggerKey, cleanup)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "job_id": j.ID})
 		return
@@ -785,7 +792,8 @@ func (a *app) handlePrune(c *gin.Context) {
 	}
 	inv := invocationForPrune(repo, req.Storage, req.KeepRules, req.Exclusive, req.Exhaustive)
 	inv.EnvAdds = append(inv.EnvAdds, env...)
-	j, err := a.jobs.start(c.Request.Context(), a.cfg.DuplicacyBinary, repo, ActionPrune, req.Storage, inv, "", req.TriggerKey, cleanup)
+	// Detached context — see handleBackup comment.
+	j, err := a.jobs.start(context.Background(), a.cfg.DuplicacyBinary, repo, ActionPrune, req.Storage, inv, "", req.TriggerKey, cleanup)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "job_id": j.ID})
 		return
