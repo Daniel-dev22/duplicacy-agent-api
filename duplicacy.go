@@ -114,12 +114,25 @@ func parseListOutput(out string) []Snapshot {
 // --- HTTP handlers (override placeholders) ---
 
 // GET /repos/:id/snapshots — runs `duplicacy list` and parses revisions.
+//
+// Vends per-storage credentials before invoking duplicacy: the SFTP/S3/B2/etc
+// secrets live in the controller (Bitwarden-vended) and never on agent disk,
+// so without prepareEnvForRepo duplicacy fails to authenticate against the
+// storage backend ("No private key file is provided" for SFTP, etc.) and the
+// UI sees zero snapshots even when the storage is full of them.
 func (a *app) handleListSnapshots(c *gin.Context) {
 	repo, ok := a.repos.get(c.Param("id"))
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "repo not found"})
 		return
 	}
+	env, _, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
+		return
+	}
+	defer cleanup()
+
 	storage := c.Query("storage")
 	args := []string{"list"}
 	if storage != "" {
@@ -128,6 +141,7 @@ func (a *app) handleListSnapshots(c *gin.Context) {
 	out, err := runSync(c.Request.Context(), a.cfg.DuplicacyBinary, cliInvocation{
 		RepoRoot: repo.Path,
 		Args:     args,
+		EnvAdds:  env,
 	}, 60*time.Second)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -143,6 +157,9 @@ func (a *app) handleListSnapshots(c *gin.Context) {
 }
 
 // GET /repos/:id/snapshots/:rev/files — `duplicacy list -files -r <rev>`
+//
+// Same credential-vending requirement as handleListSnapshots — file listing
+// reads chunk metadata from the storage backend.
 func (a *app) handleSnapshotFiles(c *gin.Context) {
 	repo, ok := a.repos.get(c.Param("id"))
 	if !ok {
@@ -154,6 +171,13 @@ func (a *app) handleSnapshotFiles(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "revision must be a positive integer"})
 		return
 	}
+	env, _, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
+		return
+	}
+	defer cleanup()
+
 	args := []string{"list", "-files", "-r", strconv.Itoa(rev)}
 	if s := c.Query("storage"); s != "" {
 		args = append(args, "-storage", s)
@@ -161,6 +185,7 @@ func (a *app) handleSnapshotFiles(c *gin.Context) {
 	out, err := runSync(c.Request.Context(), a.cfg.DuplicacyBinary, cliInvocation{
 		RepoRoot: repo.Path,
 		Args:     args,
+		EnvAdds:  env,
 	}, 5*time.Minute)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "output": string(out)})
