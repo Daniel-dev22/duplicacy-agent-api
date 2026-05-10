@@ -24,6 +24,8 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/rs/zerolog/log"
 )
 
 // readErrorBody reads up to 4 KiB of an error response body as a UTF-8 string,
@@ -125,11 +127,21 @@ func fetchSecrets(ctx context.Context, client *http.Client, controlCenterURL, no
 		return SecretsBundle{}, fmt.Errorf("build vend request: %w", err)
 	}
 
+	// Diagnostic: log the exact URL we're about to dial so we can
+	// distinguish "agent built a wrong URL" from "router returned 404"
+	// when troubleshooting credential vending. Bearer header is attached
+	// by bearerAuthRoundTripper; we log presence (not value).
+	log.Info().Str("url", url).
+		Bool("has_authorization_already", req.Header.Get("Authorization") != "").
+		Msg("vend secrets: dialing controller")
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return SecretsBundle{}, fmt.Errorf("call controller: %w", err)
 	}
 	defer resp.Body.Close()
+
+	log.Info().Str("url", url).Int("status", resp.StatusCode).Msg("vend secrets: response")
 
 	switch resp.StatusCode {
 	case http.StatusOK:
