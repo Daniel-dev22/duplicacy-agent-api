@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,9 +33,17 @@ type Storage struct {
 // Repo is one duplicacy-initialised directory (one .duplicacy/preferences file).
 // Each Repo can have multiple Storages (e.g. NAS + S3 for the same source tree).
 type Repo struct {
-	ID            string    `json:"id"`            // stable hash of Path
-	Path          string    `json:"path"`          // absolute path to repo root
-	SnapshotID    string    `json:"snapshot_id"`   // duplicacy snapshot id (typically same across storages)
+	ID         string `json:"id"`   // stable hash of Path
+	Path       string `json:"path"` // absolute path to repo root (container-side)
+	// HostPath is the host-side path that the operator originally typed when
+	// initing the repo. Reverse-translated from Path via BACKUP_ROOT_MOUNTS
+	// when a mapping exists (e.g. container /backuproot/path1 → host
+	// /home/user). Empty when the agent has no mount mapping for the repo
+	// or when running on a host where Path == HostPath. The Adopt tab uses
+	// this to match agent-discovered repos against centrally-registered ones
+	// (which always store the host path).
+	HostPath      string    `json:"host_path,omitempty"`
+	SnapshotID    string    `json:"snapshot_id"` // duplicacy snapshot id (typically same across storages)
 	Storages      []Storage `json:"storages"`
 	HasFilters    bool      `json:"has_filters"`
 	LastScannedAt time.Time `json:"last_scanned_at"`
@@ -66,8 +75,9 @@ type rawPreference struct {
 // to invalidate the cache and re-walk immediately so the next list reflects
 // fresh state.
 type repoIndex struct {
-	roots  []string
-	binary string
+	roots           []string
+	binary          string
+	hostToContainer map[string]string // for reverse container→host lookup on Repo.HostPath
 
 	mu          sync.RWMutex
 	repos       map[string]*Repo // keyed by Repo.ID
@@ -76,12 +86,37 @@ type repoIndex struct {
 
 const repoScanTTL = 30 * time.Second
 
-func newRepoIndex(roots []string, binary string) *repoIndex {
+func newRepoIndex(roots []string, binary string, hostToContainer map[string]string) *repoIndex {
 	return &repoIndex{
-		roots:  roots,
-		binary: binary,
-		repos:  map[string]*Repo{},
+		roots:           roots,
+		binary:          binary,
+		hostToContainer: hostToContainer,
+		repos:           map[string]*Repo{},
 	}
+}
+
+// containerToHost is the reverse of init_handler.translateHostPath. Given a
+// container path like "/backuproot/path1/foo" and the host:container mount
+// map, returns the host path "/home/user/foo" if the longest container
+// prefix matches; otherwise the original path and false.
+func containerToHost(path string, hostToContainer map[string]string) (string, bool) {
+	if len(hostToContainer) == 0 {
+		return path, false
+	}
+	bestContainer, bestHost := "", ""
+	for host, container := range hostToContainer {
+		cc := filepath.Clean(container)
+		if path == cc || strings.HasPrefix(path, cc+string(filepath.Separator)) {
+			if len(cc) > len(bestContainer) {
+				bestContainer, bestHost = cc, filepath.Clean(host)
+			}
+		}
+	}
+	if bestContainer == "" {
+		return path, false
+	}
+	suffix := strings.TrimPrefix(path, bestContainer)
+	return bestHost + suffix, true
 }
 
 // scan walks each backup root looking for .duplicacy/preferences files,
@@ -125,7 +160,7 @@ func (r *repoIndex) scanLocked() error {
 				return nil
 			}
 			repoRoot := filepath.Dir(path)
-			repo, err := loadRepo(repoRoot)
+			repo, err := r.loadRepo(repoRoot)
 			if err != nil {
 				log.Warn().Err(err).Str("repo", repoRoot).Msg("failed to load repo (skipping)")
 				return filepath.SkipDir
@@ -155,7 +190,7 @@ func walkDepth(root, path string) int {
 	return len(filepath.SplitList(rel)) // not perfect on win; we're linux-only
 }
 
-func loadRepo(repoRoot string) (*Repo, error) {
+func (r *repoIndex) loadRepo(repoRoot string) (*Repo, error) {
 	prefsPath := filepath.Join(repoRoot, ".duplicacy", "preferences")
 	data, err := os.ReadFile(prefsPath)
 	if err != nil {
@@ -189,10 +224,19 @@ func loadRepo(repoRoot string) (*Repo, error) {
 
 	id := repoIDFromPath(repoRoot)
 	hasFilters := fileExists(filepath.Join(repoRoot, ".duplicacy", "filters"))
+	// Reverse-translate container path → host path so the controller's
+	// Adopt walkthrough can match agent-discovered repos against centrally-
+	// registered ones (which always store the host path the operator
+	// originally typed). Empty when no mount mapping covers this path.
+	hostPath := ""
+	if hp, ok := containerToHost(repoRoot, r.hostToContainer); ok {
+		hostPath = hp
+	}
 
 	return &Repo{
 		ID:            id,
 		Path:          repoRoot,
+		HostPath:      hostPath,
 		SnapshotID:    raws[0].SnapshotID,
 		Storages:      storages,
 		HasFilters:    hasFilters,
