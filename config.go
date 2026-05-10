@@ -41,7 +41,16 @@ func loadConfig() Config {
 		ComposeScanRoots: splitCSV(getEnv("COMPOSE_SCAN_ROOTS", "")),
 		ConfigDir:        getEnv("CONFIG_DIR", "/var/lib/duplicacy-agent-api"),
 		ControlCenterURL: requireEnv("CONTROL_CENTER_URL"),
-		TraefikDockerDNS: getEnv("TRAEFIK_DOCKER_DNS", "traefik"),
+		// Empty default — k3s nodes leave this unset and use direct mode
+		// (URL host resolved normally via Docker DNS, kube-proxy DNATs the
+		// cluster ClusterIP). NAS hosts must explicitly set this to
+		// "traefik" in their docker-compose env to opt into rewrite mode
+		// where the dialer ignores the URL and connects to the local
+		// docker Traefik so the host's mTLS ServersTransport can attach.
+		// Earlier default of "traefik" silently broke k3s nodes — every
+		// agent → controller call landed on the local Traefik (which
+		// has no route for the cluster service hostname) and returned 404.
+		TraefikDockerDNS: getEnv("TRAEFIK_DOCKER_DNS", ""),
 		TraefikDialPort:  getEnv("TRAEFIK_DIAL_PORT", "1443"),
 		DuplicacyBinary:  getEnv("DUPLICACY_BINARY", "/usr/local/bin/duplicacy"),
 		BearerTokenFile:  getEnv("BEARER_TOKEN_FILE", "/etc/duplicacy-agent-api/bearer-token"),
