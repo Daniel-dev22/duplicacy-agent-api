@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -718,6 +720,13 @@ type restoreRequest struct {
 	Revision   int      `json:"revision"`
 	Paths      []string `json:"paths"`
 	Overwrite  bool     `json:"overwrite"`
+	// Target controls where files land:
+	//   ""         → restore in-place over the original repo root (legacy)
+	//   "scratch"  → agent expands to <RestoreScratchRoot>/<snapshot_id>-r<rev>/
+	//   "/abs/dir" → arbitrary absolute path (custom target)
+	// For non-empty targets, the agent symlinks .duplicacy into the target so
+	// duplicacy resolves storage config the same way it would in-place.
+	Target     string   `json:"target"`
 	TriggerKey string   `json:"trigger_key"`
 }
 
@@ -739,8 +748,22 @@ func (a *app) handleRestore(c *gin.Context) {
 	if req.TriggerKey == "" {
 		req.TriggerKey = "manual"
 	}
-	env, rsaPriv, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+
+	// Resolve restore target. Scratch sentinel + arbitrary absolute path both
+	// require .duplicacy to be visible from the target dir; agent prepares
+	// that here and tracks teardown via prepCleanup so the registry's cleanup
+	// chain runs it after cmd.Wait().
+	targetRoot, prepCleanup, err := a.prepareRestoreTarget(repo, req.Target, req.Revision)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "restore target: " + err.Error()})
+		return
+	}
+
+	env, rsaPriv, credCleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	if err != nil {
+		if prepCleanup != nil {
+			prepCleanup()
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
 		return
 	}
@@ -751,8 +774,17 @@ func (a *app) handleRestore(c *gin.Context) {
 	if storageAlias == "" {
 		storageAlias = "default"
 	}
-	inv := invocationForRestore(repo, req.Storage, req.Revision, req.Paths, req.Overwrite, rsaPriv[storageAlias])
+	inv := invocationForRestore(repo, req.Storage, req.Revision, req.Paths, req.Overwrite, rsaPriv[storageAlias], targetRoot)
 	inv.EnvAdds = append(inv.EnvAdds, env...)
+	cleanup := credCleanup
+	if prepCleanup != nil {
+		cleanup = func() {
+			if credCleanup != nil {
+				credCleanup()
+			}
+			prepCleanup()
+		}
+	}
 	// Detached context — see handleBackup comment.
 	j, err := a.jobs.start(context.Background(), a.cfg.DuplicacyBinary, repo, ActionRestore, req.Storage, inv, "", req.TriggerKey, cleanup)
 	if err != nil {
@@ -760,6 +792,54 @@ func (a *app) handleRestore(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusAccepted, gin.H{"job_id": j.ID})
+}
+
+// prepareRestoreTarget resolves the request's Target into an absolute path
+// for duplicacy to chdir into, and returns a teardown closure that removes
+// the .duplicacy symlink we plant there. Returns ("", nil, nil) when the
+// caller wants in-place restore (Target == "") so the existing behaviour
+// is unchanged.
+func (a *app) prepareRestoreTarget(repo *Repo, target string, revision int) (string, func(), error) {
+	if target == "" {
+		return "", nil, nil
+	}
+	var dir string
+	if target == "scratch" {
+		root := a.cfg.RestoreScratchRoot
+		if root == "" {
+			return "", nil, fmt.Errorf("scratch target requested but RESTORE_SCRATCH_ROOT is empty")
+		}
+		dir = filepath.Join(root, fmt.Sprintf("%s-r%d", repo.SnapshotID, revision))
+	} else {
+		if !filepath.IsAbs(target) {
+			return "", nil, fmt.Errorf("custom target must be an absolute path")
+		}
+		dir = filepath.Clean(target)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", nil, fmt.Errorf("create target dir %q: %w", dir, err)
+	}
+	// duplicacy resolves storage config from <cwd>/.duplicacy/preferences.
+	// Symlink it from the original repo so the restore knows where to read
+	// chunks from. If a .duplicacy already exists at the target (e.g. from
+	// a previous restore), leave it alone.
+	link := filepath.Join(dir, ".duplicacy")
+	src := filepath.Join(repo.Path, ".duplicacy")
+	if _, err := os.Lstat(link); os.IsNotExist(err) {
+		if err := os.Symlink(src, link); err != nil {
+			return "", nil, fmt.Errorf("symlink .duplicacy into target: %w", err)
+		}
+	} else if err != nil {
+		return "", nil, fmt.Errorf("stat existing .duplicacy at target: %w", err)
+	}
+	cleanup := func() {
+		// Best-effort: only remove the symlink (not real directories) so we
+		// never accidentally rm an operator's pre-existing folder.
+		if fi, err := os.Lstat(link); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			_ = os.Remove(link)
+		}
+	}
+	return dir, cleanup, nil
 }
 
 type checkRequest struct {

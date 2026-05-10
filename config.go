@@ -30,6 +30,12 @@ type Config struct {
 	DuplicacyBinary  string   // path to duplicacy CLI (default /usr/local/bin/duplicacy)
 	BearerTokenFile  string   // path to file containing this node's bearer token (per-host)
 	BearerToken      string   // populated at startup from BearerTokenFile contents
+	// RestoreScratchRoot is where target=scratch restores land — agent expands
+	// the sentinel to <root>/<snapshot_id>-r<rev>/ at handleRestore time. The
+	// directory is created at restore time (mode 0700) inside the agent
+	// container; operator may bind-mount this path read-write to a host dir
+	// to inspect restored files outside the container.
+	RestoreScratchRoot string
 }
 
 func loadConfig() Config {
@@ -52,8 +58,9 @@ func loadConfig() Config {
 		// has no route for the cluster service hostname) and returned 404.
 		TraefikDockerDNS: getEnv("TRAEFIK_DOCKER_DNS", ""),
 		TraefikDialPort:  getEnv("TRAEFIK_DIAL_PORT", "1443"),
-		DuplicacyBinary:  getEnv("DUPLICACY_BINARY", "/usr/local/bin/duplicacy"),
-		BearerTokenFile:  getEnv("BEARER_TOKEN_FILE", "/etc/duplicacy-agent-api/bearer-token"),
+		DuplicacyBinary:    getEnv("DUPLICACY_BINARY", "/usr/local/bin/duplicacy"),
+		BearerTokenFile:    getEnv("BEARER_TOKEN_FILE", "/etc/duplicacy-agent-api/bearer-token"),
+		RestoreScratchRoot: getEnv("RESTORE_SCRATCH_ROOT", "/tmp/duplicacy-restore"),
 	}
 	// Load bearer token from file once at startup. Missing/empty token is
 	// fatal — without it the controller will reject every credential vend.

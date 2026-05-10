@@ -193,7 +193,11 @@ func invocationForBackup(repo *Repo, storageName, tag string, threads int) cliIn
 // invocationForRestore builds args for `duplicacy restore`.
 // rsaPrivKeyPath is the /dev/shm path to the rsa_private_key PEM when the
 // targeted storage is RSA-encrypted; empty string otherwise.
-func invocationForRestore(repo *Repo, storageName string, revision int, paths []string, overwrite bool, rsaPrivKeyPath string) cliInvocation {
+// targetRoot, when non-empty, overrides the repo's root via duplicacy's
+// global -repository flag — the agent uses this to land restores in a
+// scratch dir by default, keeping operators from accidentally overwriting
+// prod files when they just wanted to inspect a revision.
+func invocationForRestore(repo *Repo, storageName string, revision int, paths []string, overwrite bool, rsaPrivKeyPath, targetRoot string) cliInvocation {
 	args := []string{"restore", "-r", strconv.Itoa(revision)}
 	if storageName != "" {
 		args = append(args, "-storage", storageName)
@@ -205,7 +209,11 @@ func invocationForRestore(repo *Repo, storageName string, revision int, paths []
 		args = append(args, "-key", rsaPrivKeyPath)
 	}
 	args = append(args, paths...)
-	return cliInvocation{RepoRoot: repo.Path, Args: args}
+	root := repo.Path
+	if targetRoot != "" {
+		root = targetRoot
+	}
+	return cliInvocation{RepoRoot: root, Args: args}
 }
 
 // invocationForCheck builds args for `duplicacy check`.
