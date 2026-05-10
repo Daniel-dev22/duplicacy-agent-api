@@ -17,12 +17,14 @@ package main
 //   - 15s TCP keepalive
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -127,13 +129,25 @@ func fetchSecrets(ctx context.Context, client *http.Client, controlCenterURL, no
 		return SecretsBundle{}, fmt.Errorf("build vend request: %w", err)
 	}
 
-	// Diagnostic: log the exact URL we're about to dial so we can
-	// distinguish "agent built a wrong URL" from "router returned 404"
-	// when troubleshooting credential vending. Bearer header is attached
-	// by bearerAuthRoundTripper; we log presence (not value).
-	log.Info().Str("url", url).
-		Bool("has_authorization_already", req.Header.Get("Authorization") != "").
-		Msg("vend secrets: dialing controller")
+	// Diagnostic: log the exact URL + the IP the dialer connects to,
+	// the response status, and the response body length / first 200
+	// chars. Pins down "agent built wrong URL" vs "router responded 404
+	// from somewhere unexpected" vs "the response body isn't from the
+	// router we think we're talking to".
+	trace := &httptrace.ClientTrace{
+		ConnectStart: func(network, addr string) {
+			log.Info().Str("url", url).Str("addr", addr).Msg("vend secrets: TCP dial start")
+		},
+		ConnectDone: func(network, addr string, err error) {
+			log.Info().Str("url", url).Str("addr", addr).Err(err).Msg("vend secrets: TCP dial done")
+		},
+		GotFirstResponseByte: func() {
+			log.Info().Str("url", url).Msg("vend secrets: first response byte")
+		},
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+	log.Info().Str("url", url).Int("token_len", len(req.Header.Get("Authorization"))).
+		Msg("vend secrets: about to call client.Do")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -141,7 +155,18 @@ func fetchSecrets(ctx context.Context, client *http.Client, controlCenterURL, no
 	}
 	defer resp.Body.Close()
 
-	log.Info().Str("url", url).Int("status", resp.StatusCode).Msg("vend secrets: response")
+	// Read body so we can log it AND still decode below.
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
+	resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	preview := string(bodyBytes)
+	if len(preview) > 200 {
+		preview = preview[:200] + "..."
+	}
+	log.Info().Str("url", url).Int("status", resp.StatusCode).
+		Int("body_len", len(bodyBytes)).
+		Str("body_preview", preview).
+		Msg("vend secrets: response")
 
 	switch resp.StatusCode {
 	case http.StatusOK:
