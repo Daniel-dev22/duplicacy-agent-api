@@ -18,6 +18,8 @@ package main
 import (
 	"context"
 	"net/http"
+	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -32,9 +34,41 @@ const (
 	fleetEventSnapshot fleetEventType = "snapshot"
 )
 
+// HostInfo carries static facts about the host the agent runs on. Computed
+// once at hub creation; identical across every snapshot. The frontend uses
+// AutoThreads to render an honest "Auto (= N)" placeholder in the threads
+// field of JobOptionsForm — no per-host config required to make a Pi 4 use
+// 2 threads instead of 4.
+type HostInfo struct {
+	Hostname    string `json:"hostname"`
+	NumCPU      int    `json:"num_cpu"`
+	AutoThreads int    `json:"auto_threads"`
+}
+
+// autoThreads returns the agent's default thread count for backup/restore
+// when the caller passes 0. max(1, NumCPU/2) — half the box reserved for
+// other workloads. Pi 4 (4 CPUs) → 2; NUC 8 → 4; NAS 16 → 8.
+func autoThreads() int {
+	auto := runtime.NumCPU() / 2
+	if auto < 1 {
+		auto = 1
+	}
+	return auto
+}
+
+func newHostInfo() *HostInfo {
+	hn, _ := os.Hostname()
+	return &HostInfo{
+		Hostname:    hn,
+		NumCPU:      runtime.NumCPU(),
+		AutoThreads: autoThreads(),
+	}
+}
+
 type fleetSnapshot struct {
-	Repos []*Repo `json:"repos"`
-	Jobs  []Job   `json:"jobs"`
+	Host  *HostInfo `json:"host,omitempty"`
+	Repos []*Repo   `json:"repos"`
+	Jobs  []Job     `json:"jobs"`
 }
 
 type fleetEvent struct {
@@ -53,7 +87,8 @@ type fleetClient struct {
 // trigger channel collapses bursty triggers (e.g. several job state
 // transitions in the same second) into one snapshot send.
 type fleetHub struct {
-	app *app
+	app  *app
+	host *HostInfo
 
 	mu      sync.RWMutex
 	clients map[*fleetClient]struct{}
@@ -66,6 +101,7 @@ type fleetHub struct {
 func newFleetHub(a *app) *fleetHub {
 	return &fleetHub{
 		app:        a,
+		host:       newHostInfo(),
 		clients:    map[*fleetClient]struct{}{},
 		register:   make(chan *fleetClient),
 		unregister: make(chan *fleetClient),
@@ -128,6 +164,7 @@ func (h *fleetHub) buildSnapshot() (fleetEvent, bool) {
 	return fleetEvent{
 		Type: fleetEventSnapshot,
 		Data: fleetSnapshot{
+			Host:  h.host,
 			Repos: h.app.repos.list(),
 			Jobs:  h.app.jobs.list(),
 		},

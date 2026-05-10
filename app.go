@@ -70,6 +70,10 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 	// Trigger a fleet snapshot on every job lifecycle event so connected
 	// dashboards see state transitions in real time.
 	jobs.RegisterHook(func(_ *Job, _ JobEvent) { a.fleet.Trigger() })
+	// Also trigger on progress-line updates during a backup. Fires per
+	// chunk-uploaded line; the hub's coalescing channel collapses bursts
+	// into one snapshot per broadcast cycle, so this is cheap.
+	jobs.RegisterProgressHook(func(_ *Job) { a.fleet.Trigger() })
 
 	sched, err := newScheduler(cfg, cc, jobs, repos, a.prepareEnvForRepo)
 	if err != nil {

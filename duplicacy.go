@@ -171,7 +171,10 @@ func (a *app) handleSnapshotFiles(c *gin.Context) {
 
 // --- helpers used by the jobs subsystem ---
 
-// invocationForBackup builds the args for `duplicacy backup`.
+// invocationForBackup builds the args for `duplicacy backup`. When threads
+// <= 0, falls back to the agent-computed auto value (max(1, NumCPU/2)) and
+// emits an explicit -threads N so the resolved value is logged and the
+// duplicacy CLI default (1) doesn't kick in.
 func invocationForBackup(repo *Repo, storageName, tag string, threads int) cliInvocation {
 	args := []string{"backup", "-stats"}
 	if storageName != "" {
@@ -180,9 +183,10 @@ func invocationForBackup(repo *Repo, storageName, tag string, threads int) cliIn
 	if tag != "" {
 		args = append(args, "-t", tag)
 	}
-	if threads > 0 {
-		args = append(args, "-threads", strconv.Itoa(threads))
+	if threads <= 0 {
+		threads = autoThreads()
 	}
+	args = append(args, "-threads", strconv.Itoa(threads))
 	return cliInvocation{RepoRoot: repo.Path, Args: args}
 }
 

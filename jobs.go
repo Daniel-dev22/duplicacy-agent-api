@@ -48,6 +48,7 @@ const (
 	EventProgress  JobEvent = "progress"
 	EventCompleted JobEvent = "completed"
 	EventFailed    JobEvent = "failed"
+	EventCancelled JobEvent = "cancelled"
 )
 
 // JobEventHook is registered by events.go to receive lifecycle notifications.
@@ -412,13 +413,20 @@ func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo
 		j.mu.Lock()
 		j.CompletedAt = time.Now().UTC()
 		if err != nil {
-			j.State = JobFailed
-			// Only fall back to "exit status N" if no friendly ERROR-tag
-			// line was captured during tail; that path produces messages
-			// like "STORAGE_CREATE: Failed to load …" which are far more
-			// useful for the operator than a bare exit code.
-			if j.ErrorMsg == "" {
-				j.ErrorMsg = err.Error()
+			// Preserve JobCancelled when the user explicitly cancelled — the
+			// cmd error is just the consequence of context cancellation, not
+			// a real failure. Don't override with JobFailed.
+			if j.State != JobCancelled {
+				j.State = JobFailed
+				// Only fall back to "exit status N" if no friendly ERROR-tag
+				// line was captured during tail; that path produces messages
+				// like "STORAGE_CREATE: Failed to load …" which are far more
+				// useful for the operator than a bare exit code.
+				if j.ErrorMsg == "" {
+					j.ErrorMsg = err.Error()
+				}
+			} else if j.ErrorMsg == "" {
+				j.ErrorMsg = "cancelled by user"
 			}
 			if exitErr, ok := err.(interface{ ExitCode() int }); ok {
 				j.ExitCode = exitErr.ExitCode()
@@ -442,9 +450,12 @@ func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo
 		}
 
 		r.markTerminated(j)
-		if state == JobCompleted {
+		switch state {
+		case JobCompleted:
 			r.emit(j, EventCompleted)
-		} else {
+		case JobCancelled:
+			r.emit(j, EventCancelled)
+		default:
 			r.emit(j, EventFailed)
 		}
 		log.Info().Str("job", j.ID).Str("state", string(state)).Msg("job terminal")
@@ -549,6 +560,25 @@ func (a *app) handleGetJob(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, j.snapshot())
+}
+
+// handleCancelJob signals SIGTERM-equivalent (context cancellation) to a
+// running job. Returns 200 if cancellation was sent, 404 if no such job,
+// 409 if the job was already in a terminal state. The fleet snapshot push
+// triggered by the eventual EventCancelled emission carries the new state
+// to the UI within ~1s.
+func (a *app) handleCancelJob(c *gin.Context) {
+	id := c.Param("id")
+	j, ok := a.jobs.get(id)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "job not found"})
+		return
+	}
+	if !a.jobs.cancel(id) {
+		c.JSON(http.StatusConflict, gin.H{"error": "job not in a cancellable state", "state": j.snapshot().State})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"cancelled": true, "job_id": id})
 }
 
 var wsUpgrader = websocket.Upgrader{
