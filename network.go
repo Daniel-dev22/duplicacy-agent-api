@@ -135,6 +135,18 @@ func fetchSecrets(ctx context.Context, client *http.Client, controlCenterURL, no
 	// from somewhere unexpected" vs "the response body isn't from the
 	// router we think we're talking to".
 	trace := &httptrace.ClientTrace{
+		GetConn: func(hostPort string) {
+			log.Info().Str("url", url).Str("hostPort", hostPort).Msg("vend secrets: GetConn (about to acquire conn from pool or dial)")
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			log.Info().Str("url", url).
+				Str("local", info.Conn.LocalAddr().String()).
+				Str("remote", info.Conn.RemoteAddr().String()).
+				Bool("reused", info.Reused).
+				Bool("was_idle", info.WasIdle).
+				Dur("idle_time", info.IdleTime).
+				Msg("vend secrets: GotConn")
+		},
 		ConnectStart: func(network, addr string) {
 			log.Info().Str("url", url).Str("addr", addr).Msg("vend secrets: TCP dial start")
 		},
