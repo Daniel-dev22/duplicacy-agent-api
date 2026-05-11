@@ -34,12 +34,13 @@ import (
 
 // initStorageReq is one storage entry in the init body.
 type initStorageReq struct {
-	StorageAlias string        `json:"storage_alias"`
-	CredentialID string        `json:"credential_id"`
-	IsPrimary    bool          `json:"is_primary"`
-	StorageType  string        `json:"storage_type"`
-	StorageURL   string        `json:"storage_url"`
-	Secrets      SecretsBundle `json:"secrets"`
+	StorageAlias   string        `json:"storage_alias"`
+	CredentialID   string        `json:"credential_id"`
+	IsPrimary      bool          `json:"is_primary"`
+	StorageType    string        `json:"storage_type"`
+	StorageURL     string        `json:"storage_url"`
+	ServerOverride string        `json:"server_override,omitempty"`
+	Secrets        SecretsBundle `json:"secrets"`
 }
 
 // initRepoReq is the full init body.
@@ -60,16 +61,18 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 		return
 	}
 
-	// Resolve any {server}/{server_type}/{site}/{home}/{repo_id} placeholders in
-	// each storage_url against this agent's identity + the request's repo_id.
-	// The expanded URL is what gets baked into .duplicacy/preferences by
-	// `duplicacy init`, so subsequent backup/restore/check/prune ops never need
-	// to re-resolve. Unknown placeholders fail loud here, before any side
-	// effects on the storage backend.
+	// Resolve any {server}/{server_type}/{site}/{home}/{remote_home}/{repo_id}
+	// placeholders in each storage_url against this agent's identity + the
+	// request's repo_id. Per-storage server_override (if set) overrides the
+	// {server} placeholder so multi-storage repos that target different server
+	// subdirs can share one credential template. The expanded URL is what
+	// gets baked into .duplicacy/preferences by `duplicacy init`, so subsequent
+	// backup/restore/check/prune ops never need to re-resolve. Unknown
+	// placeholders fail loud here, before any side effects on the storage backend.
 	tctx := a.cfg.baseTplCtx()
 	tctx.RepoID = req.RepoID
 	for i := range req.Storages {
-		expanded, err := expandStorageURL(req.Storages[i].StorageURL, tctx)
+		expanded, err := expandStorageURL(req.Storages[i].StorageURL, tctx, req.Storages[i].ServerOverride)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("storages[%d].storage_url: %v", i, err)})
 			return

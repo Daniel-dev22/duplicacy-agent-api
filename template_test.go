@@ -31,14 +31,16 @@ func TestExpandStorageURL(t *testing.T) {
 		ServerType: "nuc",
 		Site:       "kd",
 		Home:       "site-a",
+		RemoteHome: "site-b",
 		RepoID:     "nuc01-data",
 	}
 
 	cases := []struct {
-		name    string
-		in      string
-		want    string
-		wantErr string // substring; empty = no error
+		name           string
+		in             string
+		serverOverride string
+		want           string
+		wantErr        string // substring; empty = no error
 	}{
 		{
 			name: "no placeholders pass through",
@@ -51,9 +53,9 @@ func TestExpandStorageURL(t *testing.T) {
 			want: "sftp://x@h//srv/nuc01/d",
 		},
 		{
-			name: "all five placeholders",
-			in:   "{site}/{home}/{server}/{server_type}/{repo_id}",
-			want: "kd/site-a/nuc01/nuc/nuc01-data",
+			name: "all six placeholders",
+			in:   "{site}/{home}/{remote_home}/{server}/{server_type}/{repo_id}",
+			want: "kd/site-a/site-b/nuc01/nuc/nuc01-data",
 		},
 		{
 			name: "user's S3 example",
@@ -64,6 +66,23 @@ func TestExpandStorageURL(t *testing.T) {
 			name: "user's SFTP example with home and server",
 			in:   "sftp://backup@nas.{home}apps.com:22//mnt/array/{home}_backup/servers/{server}/duplicacy",
 			want: "sftp://backup@nas.example.com:22//mnt/array/site-a_backup/servers/nuc01/duplicacy",
+		},
+		{
+			name: "cross-site backup uses {remote_home} for destination host",
+			in:   "sftp://backup@nas.{remote_home}apps.com:22//mnt/array/{home}_backup/servers/{server}/duplicacy",
+			want: "sftp://backup@nas.example.net:22//mnt/array/site-a_backup/servers/nuc01/duplicacy",
+		},
+		{
+			name:           "server_override wins over ctx.Server",
+			in:             "sftp://x@h//srv/{server}/d",
+			serverOverride: "pi",
+			want:           "sftp://x@h//srv/pi/d",
+		},
+		{
+			name:           "server_override only affects {server}, not {server_type}",
+			in:             "{server}/{server_type}",
+			serverOverride: "nuc",
+			want:           "nuc/nuc",
 		},
 		{
 			name:    "unknown placeholder rejected",
@@ -84,7 +103,7 @@ func TestExpandStorageURL(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := expandStorageURL(c.in, ctx)
+			got, err := expandStorageURL(c.in, ctx, c.serverOverride)
 			if c.wantErr != "" {
 				if err == nil {
 					t.Fatalf("expected error containing %q, got nil (out=%q)", c.wantErr, got)
@@ -110,7 +129,19 @@ func TestBaseTplCtx(t *testing.T) {
 	if ctx.Server != "nuc02" || ctx.ServerType != "nuc" || ctx.Site != "ng" || ctx.Home != "site-b" {
 		t.Fatalf("baseTplCtx wrong: %+v", ctx)
 	}
+	if ctx.RemoteHome != "site-a" {
+		t.Fatalf("RemoteHome for site=ng should be site-a, got %q", ctx.RemoteHome)
+	}
 	if ctx.RepoID != "" {
 		t.Fatalf("RepoID should default to empty (caller fills it in), got %q", ctx.RepoID)
+	}
+}
+
+func TestSiteIDToRemoteHome(t *testing.T) {
+	cases := map[string]string{"kd": "site-b", "ng": "site-a", "xx": "xxhome"}
+	for in, want := range cases {
+		if got := siteIDToRemoteHome(in); got != want {
+			t.Errorf("siteIDToRemoteHome(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

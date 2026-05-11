@@ -9,9 +9,11 @@ package main
 //
 // Supported placeholders:
 //   {server}       — cfg.NodeName                              (e.g. "nuc01")
+//                    Per-storage server_override wins over this.
 //   {server_type}  — cfg.NodeName with trailing digits stripped (e.g. "nuc")
 //   {site}         — cfg.SiteID                                 (e.g. "kd")
 //   {home}         — cfg.SiteID + "home"                        (e.g. "site-a")
+//   {remote_home}  — the OTHER site's home                      (e.g. site=kd → "site-b")
 //   {repo_id}      — per-init repo's snapshot id                (e.g. "nuc01-data")
 //
 // Unknown placeholders are NOT silently passed through — expandStorageURL
@@ -30,6 +32,7 @@ type tplCtx struct {
 	ServerType string
 	Site       string
 	Home       string
+	RemoteHome string
 	RepoID     string
 }
 
@@ -39,7 +42,20 @@ func (c Config) baseTplCtx() tplCtx {
 		ServerType: serverTypeFromNode(c.NodeName),
 		Site:       c.SiteID,
 		Home:       c.SiteID + "home",
+		RemoteHome: siteIDToRemoteHome(c.SiteID),
 	}
+}
+
+// siteIDToRemoteHome maps the local site to the *other* site's home string.
+// Mirror of router/duplicacy_template.go::siteIDToRemoteHome.
+func siteIDToRemoteHome(site string) string {
+	switch site {
+	case "kd":
+		return "site-b"
+	case "ng":
+		return "site-a"
+	}
+	return site + "home"
 }
 
 // serverTypeFromNode strips trailing digits from a NodeName so "nuc01" → "nuc",
@@ -58,17 +74,27 @@ var unknownPlaceholderRe = regexp.MustCompile(`\{[a-z_][a-z0-9_]*\}`)
 // expandStorageURL replaces every supported placeholder in template with its
 // value from ctx. Returns an error if any unsupported placeholder remains.
 // Templates with no placeholders pass through unchanged.
-func expandStorageURL(template string, ctx tplCtx) (string, error) {
+//
+// serverOverride is a per-storage override: when non-empty it wins over
+// ctx.Server for the {server} placeholder only. This lets one credential
+// serve multiple storage aliases on the same node whose URLs differ only by
+// server segment (e.g. nas-side ng-nas-{nuc,pi,nas}-storage trio).
+func expandStorageURL(template string, ctx tplCtx, serverOverride string) (string, error) {
+	server := ctx.Server
+	if serverOverride != "" {
+		server = serverOverride
+	}
 	r := strings.NewReplacer(
-		"{server}", ctx.Server,
+		"{server}", server,
 		"{server_type}", ctx.ServerType,
 		"{site}", ctx.Site,
 		"{home}", ctx.Home,
+		"{remote_home}", ctx.RemoteHome,
 		"{repo_id}", ctx.RepoID,
 	)
 	out := r.Replace(template)
 	if m := unknownPlaceholderRe.FindString(out); m != "" {
-		return "", fmt.Errorf("unknown placeholder %s in storage_url (supported: {server} {server_type} {site} {home} {repo_id})", m)
+		return "", fmt.Errorf("unknown placeholder %s in storage_url (supported: {server} {server_type} {site} {home} {remote_home} {repo_id})", m)
 	}
 	return normalizeSFTPAbsolutePath(out), nil
 }
