@@ -85,9 +85,16 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 	a.trees = newTreeWalker(cfg, repos, a)
 
 	// Best-effort initial repo scan so /repos returns something on first call.
-	if err := a.repos.scan(); err != nil {
-		log.Warn().Err(err).Msg("initial repo scan failed (will retry on first /repos call)")
-	}
+	// Run asynchronously so it doesn't block newApp returning — otherwise
+	// startup is gated on walking every backup root (on pi-class hosts with
+	// /var/lib/rancher/k3s bind-mounted, that has overrun the ansible
+	// /health/ready readiness probe). The HTTP listener is up immediately;
+	// any /repos call landing before the scan finishes triggers its own.
+	go func() {
+		if err := a.repos.scan(); err != nil {
+			log.Warn().Err(err).Msg("initial repo scan failed (will retry on first /repos call)")
+		}
+	}()
 	return a, nil
 }
 

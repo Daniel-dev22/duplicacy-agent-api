@@ -187,7 +187,12 @@ func walkDepth(root, path string) int {
 	if err != nil || rel == "." {
 		return 0
 	}
-	return len(filepath.SplitList(rel)) // not perfect on win; we're linux-only
+	// filepath.SplitList splits on the OS PATH-list separator (':' on Linux,
+	// ';' on Windows) — it does NOT split a single path into components.
+	// Previous use of SplitList always returned [rel], so this function
+	// reported depth=1 for every entry and the maxDepth cap in scanLocked
+	// was never enforced. Split on filepath.Separator instead.
+	return strings.Count(rel, string(filepath.Separator)) + 1
 }
 
 func (r *repoIndex) loadRepo(repoRoot string) (*Repo, error) {
