@@ -22,6 +22,7 @@ type app struct {
 	secrets             *secretCache      // 60s TTL cache of vended bundles
 	compose             *composeIndex     // bounded scan of mounted COMPOSE_SCAN_ROOTS for compose project dirs
 	fleet               *fleetHub         // /ws/fleet broadcaster — pushes snapshot on init / job state change
+	trees               *treeWalker       // 5-min push of repo + node filesystem trees to controller
 	stop                chan struct{}     // closed in close(); subsystems range on it for shutdown
 }
 
@@ -81,6 +82,8 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 	}
 	a.scheduler = sched
 
+	a.trees = newTreeWalker(cfg, repos, a)
+
 	// Best-effort initial repo scan so /repos returns something on first call.
 	if err := a.repos.scan(); err != nil {
 		log.Warn().Err(err).Msg("initial repo scan failed (will retry on first /repos call)")
@@ -110,6 +113,7 @@ func (a *app) startBackgroundWorkers(ctx context.Context) {
 	a.scheduler.Start(ctx)
 	go a.filters.reconcileLoop(ctx, a.stop)
 	go a.fleet.Run(ctx)
+	a.trees.Start(ctx)
 	log.Info().Msg("background workers started")
 }
 
