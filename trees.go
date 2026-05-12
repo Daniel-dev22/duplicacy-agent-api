@@ -172,16 +172,21 @@ func (w *treeWalker) walkRoot(containerRoot string) *treeNode {
 		Name:     filepath.Base(hostRoot),
 		Path:     hostRoot,
 		Type:     "directory",
-		Children: w.walkDir(containerRoot, hostRoot, st.ModTime(), 0),
+		Children: w.walkDir(containerRoot, st.ModTime(), 0),
 	}
 	return root
 }
 
 // walkDir returns the children of dir (one level), recursing depth-first up to
 // treeMaxDepth. Uses the mtime cache to short-circuit unchanged subtrees.
-// containerDir is the path on the filesystem; hostDir is its host-side
-// equivalent for emission into TreeNode.path.
-func (w *treeWalker) walkDir(containerDir, hostDir string, mtime time.Time, depth int) []*treeNode {
+// childHost is computed via toHost(childContainer) per entry rather than
+// joining a base hostDir — that's load-bearing for duplicacy-web migrated
+// repos where the source is /backuproot (the agent's synthetic mount parent).
+// With per-entry translation, /backuproot's children path1/path2/path3
+// individually resolve to /home/user, /srv/containers, etc.
+// containerToHost is prefix-based so descendants inside a translated subtree
+// keep the same host-rooted naming.
+func (w *treeWalker) walkDir(containerDir string, mtime time.Time, depth int) []*treeNode {
 	if depth >= treeMaxDepth {
 		return nil
 	}
@@ -218,7 +223,7 @@ func (w *treeWalker) walkDir(containerDir, hostDir string, mtime time.Time, dept
 		}
 
 		childContainer := filepath.Join(containerDir, name)
-		childHost := filepath.Join(hostDir, name)
+		childHost := w.toHost(childContainer)
 
 		if e.IsDir() {
 			// Lstat for mtime — one extra syscall but lets the cache work.
@@ -230,7 +235,7 @@ func (w *treeWalker) walkDir(containerDir, hostDir string, mtime time.Time, dept
 				Name:     name,
 				Path:     childHost,
 				Type:     "directory",
-				Children: w.walkDir(childContainer, childHost, info.ModTime(), depth+1),
+				Children: w.walkDir(childContainer, info.ModTime(), depth+1),
 			})
 		} else if typ.IsRegular() {
 			files = append(files, &treeNode{
@@ -251,7 +256,7 @@ func (w *treeWalker) walkDir(containerDir, hostDir string, mtime time.Time, dept
 		children = append(children, dirs...)
 		children = append(children, &treeNode{
 			Name:      fmt.Sprintf("%d files (too many to list)", len(files)),
-			Path:      hostDir,
+			Path:      w.toHost(containerDir),
 			Type:      "truncated",
 			FileCount: len(files),
 		})

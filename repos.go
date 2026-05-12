@@ -148,10 +148,14 @@ func (r *repoIndex) scan() error {
 func (r *repoIndex) ScanForce() error { return r.scanLocked() }
 
 // scanLocked walks each backup root looking for .duplicacy/preferences files.
-// Cap depth at 3 so we cover both "root IS a repo" and "root contains a few repos"
-// without descending into the file tree we're meant to back up.
+// maxDepth=8 covers both shallow init'd repos and duplicacy-web migrated
+// layouts where preferences lives at .../duplicacy/cache/localhost/N/.duplicacy/
+// (depth 5 under /backuproot/pathN). We SkipDir once .duplicacy is found, so
+// the cap only bounds the wasted walk in dirs that contain no repo at all
+// (most of /var/lib/rancher/k3s, big media trees, etc.) — keeping it generous
+// here costs little because excludeBasenames already prunes the noisy ones.
 func (r *repoIndex) scanLocked() error {
-	const maxDepth = 3
+	const maxDepth = 8
 
 	found := map[string]*Repo{}
 
