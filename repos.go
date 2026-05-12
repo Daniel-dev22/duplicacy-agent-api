@@ -47,6 +47,19 @@ type Repo struct {
 	Storages      []Storage `json:"storages"`
 	HasFilters    bool      `json:"has_filters"`
 	LastScannedAt time.Time `json:"last_scanned_at"`
+	// SourcePath is the container-side path the agent should walk when
+	// building this repo's filter-picker tree. Derived from
+	// preferences[0].repository: if it names a host path that maps via
+	// HostToContainer, the container equivalent is stored here; if it's the
+	// agent's synthetic umbrella (/backuproot) we keep that — walking it
+	// surfaces every mounted backup root. Empty means walk Repo.Path as a
+	// fallback (covers the case where preferences has no usable repository).
+	SourcePath string `json:"source_path,omitempty"`
+	// SourceHostPath is the host-side display version of SourcePath. Used as
+	// the source_path field in /api/duplicacy/repo-trees so the UI can show
+	// the operator-meaningful path even though the agent walked a synthetic
+	// container path.
+	SourceHostPath string `json:"source_host_path,omitempty"`
 }
 
 // rawPreference is the on-disk shape from duplicacy_preference.go::Preference.
@@ -238,14 +251,38 @@ func (r *repoIndex) loadRepo(repoRoot string) (*Repo, error) {
 		hostPath = hp
 	}
 
+	// Resolve the source path the filter-picker tree should walk. duplicacy's
+	// preferences[0].repository is the duplicacy-side view of the source —
+	// for repos init'd inside the duplicacy-web container it's the synthetic
+	// "/backuproot" umbrella, for repos init'd via this agent's CLI it's
+	// already a container path under /backuproot/pathN, and for ones init'd
+	// directly on a host it may be a real host path like /home/user/photos.
+	// We translate host → container when we can; otherwise we keep the raw
+	// value (it's already container-accessible for the synthetic case since
+	// docker creates /backuproot as the bind-mount parent). Empty / "/" /
+	// missing falls back to repoRoot so the picker degrades to walking the
+	// repo's own dir rather than the entire filesystem.
+	sourcePath := strings.TrimRight(raws[0].RepositoryPath, "/")
+	if sourcePath == "" {
+		sourcePath = repoRoot
+	} else if translated, ok := translateHostPath(filepath.Clean(sourcePath), r.hostToContainer); ok {
+		sourcePath = translated
+	}
+	sourceHostPath := sourcePath
+	if hp, ok := containerToHost(sourcePath, r.hostToContainer); ok {
+		sourceHostPath = hp
+	}
+
 	return &Repo{
-		ID:            id,
-		Path:          repoRoot,
-		HostPath:      hostPath,
-		SnapshotID:    raws[0].SnapshotID,
-		Storages:      storages,
-		HasFilters:    hasFilters,
-		LastScannedAt: time.Now().UTC(),
+		ID:             id,
+		Path:           repoRoot,
+		HostPath:       hostPath,
+		SnapshotID:     raws[0].SnapshotID,
+		Storages:       storages,
+		HasFilters:     hasFilters,
+		LastScannedAt:  time.Now().UTC(),
+		SourcePath:     sourcePath,
+		SourceHostPath: sourceHostPath,
 	}, nil
 }
 

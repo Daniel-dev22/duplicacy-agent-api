@@ -303,13 +303,26 @@ func (w *treeWalker) pushRepoTrees(ctx context.Context) error {
 
 	out := make([]repoTreeOut, 0, len(repos))
 	for _, r := range repos {
-		root := w.walkRoot(r.Path)
+		// Walk the duplicacy source (preferences[0].repository), not the
+		// repo's cache dir. For duplicacy-web migrated repos repo.Path
+		// points at /srv/containers/duplicacy/cache/localhost/N
+		// which only contains .duplicacy/, so the picker showed an empty
+		// tree. loadRepo resolves SourcePath to a container-side path that
+		// walks the actual files being backed up.
+		container := r.SourcePath
+		if container == "" {
+			container = r.Path
+		}
+		root := w.walkRoot(container)
 		if root == nil {
 			continue
 		}
-		sourcePath := r.HostPath
+		sourcePath := r.SourceHostPath
 		if sourcePath == "" {
-			sourcePath = r.Path
+			sourcePath = r.HostPath
+		}
+		if sourcePath == "" {
+			sourcePath = container
 		}
 		// Repo identity on the central side is the snapshot id (HostPath-derived
 		// resource), not the agent's short hash — match what the controller's
