@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -357,6 +358,88 @@ func tailString(s string, n int) string {
 		return s
 	}
 	return s[len(s)-n:]
+}
+
+// -----------------------------------------------------------------------------
+// Bind endpoint: POST /repos/bind
+//
+// Same payload as /repos/init but skips the actual `duplicacy init`/`add`
+// calls — purely refreshes the agent-local controller mapping (repos.json)
+// for a repo that is already initialized on disk. Use when the agent's
+// repos.json has been wiped (volume reset, post-migration cleanup) but the
+// repo's .duplicacy/preferences is intact. Idempotent.
+//
+// Distinct from /repos/init because init's first step is `duplicacy init`
+// which refuses with "The repository … has already been initialized" — so
+// /repos/init cannot be a re-bind safely.
+// -----------------------------------------------------------------------------
+
+func (a *app) handleBindRepo(c *gin.Context) {
+	var req initRepoReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := a.validateInitReq(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Expand storage URL placeholders against this agent's identity. Mirrors
+	// /repos/init so the persisted mapping reflects what duplicacy actually
+	// reads from preferences.
+	tctx := a.cfg.baseTplCtx()
+	tctx.RepoID = req.RepoID
+	for i := range req.Storages {
+		expanded, err := expandStorageURL(req.Storages[i].StorageURL, tctx, req.Storages[i].ServerOverride)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("storages[%d].storage_url: %v", i, err)})
+			return
+		}
+		req.Storages[i].StorageURL = expanded
+	}
+
+	// Refuse if .duplicacy/preferences is missing — bind is only valid for
+	// already-initialized repos. For fresh init, callers should use /repos/init.
+	prefsPath := filepath.Join(req.RepoPath, ".duplicacy", "preferences")
+	if _, err := os.Stat(prefsPath); err != nil {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": fmt.Sprintf("repo at %s is not initialized (%s missing); use /repos/init instead", req.RepoPath, prefsPath),
+		})
+		return
+	}
+
+	// Persist mapping. Same shape as /repos/init.
+	mapping := RepoMapping{
+		RepoPath:     req.RepoPath,
+		RepoID:       req.RepoID,
+		Storages:     toMappingStorages(req.Storages),
+		RegisteredAt: time.Now().UTC(),
+	}
+	if err := a.mapping.upsert(mapping); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "persist repo mapping: " + err.Error()})
+		return
+	}
+
+	// Drop any cached credentials so the very next vend re-fetches with the
+	// fresh mapping. Cheap insurance against stale-credential bugs where the
+	// mapping changes but the cache still has the old binding.
+	for _, s := range req.Storages {
+		a.secrets.invalidate(s.CredentialID)
+	}
+
+	// Force a repo rescan so /repos picks up the now-bound state, and notify
+	// any WS subscribers.
+	if err := a.repos.ScanForce(); err != nil {
+		log.Warn().Err(err).Msg("post-bind repo scan failed")
+	}
+	a.fleet.Trigger()
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":    "bound",
+		"repo_path": req.RepoPath,
+		"repo_id":   req.RepoID,
+	})
 }
 
 // -----------------------------------------------------------------------------

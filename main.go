@@ -72,6 +72,7 @@ func registerRoutes(r *gin.Engine, app *app) {
 	r.GET("/compose-projects", app.handleListComposeProjects)
 	r.POST("/repos", app.handleInitRepo)
 	r.POST("/repos/init", app.handleInitRepoNew)
+	r.POST("/repos/bind", app.handleBindRepo)
 	r.GET("/repos/:id/snapshots", app.handleListSnapshots)
 	r.GET("/repos/:id/snapshots/:rev/files", app.handleSnapshotFiles)
 	r.POST("/repos/:id/backup", app.handleBackup)
