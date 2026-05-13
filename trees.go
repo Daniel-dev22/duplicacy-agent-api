@@ -155,8 +155,7 @@ func (w *treeWalker) tick(ctx context.Context) {
 // Walk + cache
 // -----------------------------------------------------------------------------
 
-// walkRoot returns the tree rooted at containerRoot, with TreeNode.path
-// reverse-translated to host paths. nil if the root is unreadable.
+// walkRoot returns the tree rooted at root. nil if the root is unreadable.
 func (w *treeWalker) walkRoot(root string) *treeNode {
 	st, err := os.Lstat(root)
 	if err != nil {
@@ -172,6 +171,36 @@ func (w *treeWalker) walkRoot(root string) *treeNode {
 		Path:     root,
 		Type:     "directory",
 		Children: w.walkDir(root, st.ModTime(), 0),
+	}
+}
+
+// walkBackupRootsUmbrella builds a synthetic tree rooted at the agent's
+// BackupRoots union. Used as a fallback when a repo's source_path can't be
+// resolved to a real on-disk path — e.g. duplicacy-web migrated repos whose
+// preferences say `repository=/backuproot` (the umbrella covering every bind
+// mount in duplicacy-web's container). With mirrored mounts there is no
+// /backuproot dir, so we emit each backup root as a child of a virtual root.
+// The picker shows real files; the filter patterns the operator builds are
+// absolute host paths under one of those roots.
+func (w *treeWalker) walkBackupRootsUmbrella() *treeNode {
+	if len(w.cfg.BackupRoots) == 0 {
+		return nil
+	}
+	children := make([]*treeNode, 0, len(w.cfg.BackupRoots))
+	for _, r := range w.cfg.BackupRoots {
+		child := w.walkRoot(r)
+		if child != nil {
+			children = append(children, child)
+		}
+	}
+	if len(children) == 0 {
+		return nil
+	}
+	return &treeNode{
+		Name:     "(all backup roots)",
+		Path:     "/",
+		Type:     "directory",
+		Children: children,
 	}
 }
 
@@ -292,26 +321,28 @@ func (w *treeWalker) pushRepoTrees(ctx context.Context) error {
 	out := make([]repoTreeOut, 0, len(repos))
 	for _, r := range repos {
 		// Walk the duplicacy source (preferences[0].repository), not the
-		// repo's cache dir. For duplicacy-web migrated repos repo.Path
-		// points at /srv/containers/duplicacy/cache/localhost/N
-		// which only contains .duplicacy/, so the picker showed an empty
-		// tree. loadRepo resolves SourcePath to a container-side path that
-		// walks the actual files being backed up.
-		container := r.SourcePath
-		if container == "" {
-			container = r.Path
+		// repo's cache dir. duplicacy-web migrated repos either contain a
+		// real host subpath under /backuproot (rewritten in loadRepo via
+		// LegacyBackuprootMap) OR the bare umbrella `/backuproot` which
+		// covered every bind mount in duplicacy-web's container. With
+		// mirrored mounts the umbrella doesn't exist as a real dir, so
+		// fall back to walking the agent's BackupRoots as a synthetic
+		// tree — the picker still surfaces real files.
+		source := r.SourcePath
+		if source == "" {
+			source = r.Path
 		}
-		root := w.walkRoot(container)
+		var root *treeNode
+		if source == "/backuproot" {
+			root = w.walkBackupRootsUmbrella()
+			source = "(all backup roots)"
+		} else {
+			root = w.walkRoot(source)
+		}
 		if root == nil {
 			continue
 		}
-		sourcePath := r.SourceHostPath
-		if sourcePath == "" {
-			sourcePath = r.HostPath
-		}
-		if sourcePath == "" {
-			sourcePath = container
-		}
+		sourcePath := source
 		// Repo identity on the central side is the snapshot id (HostPath-derived
 		// resource), not the agent's short hash — match what the controller's
 		// duplicacy_repos table stores in repo_id.
