@@ -45,8 +45,16 @@ type RepoMapping struct {
 type repoMappingStore struct {
 	path string
 
-	mu    sync.RWMutex
-	byID  map[string]*RepoMapping // keyed by 12-char Repo.ID hash from repos.go (matches Repo.ID)
+	mu   sync.RWMutex
+	byID map[string]*RepoMapping // keyed by 12-char Repo.ID hash from repos.go (matches Repo.ID)
+
+	// persistMu serializes the write-tmp / rename pair in persist() so two
+	// concurrent upserts can't both write `<path>.tmp` and have the second
+	// rename fail with "no such file or directory" (witnessed during a fleet
+	// reinit-all against initialized repos). Decoupled from `mu` because
+	// upsert() releases mu before calling persist(), so reusing mu would
+	// either re-lock recursively or hold the data lock across disk I/O.
+	persistMu sync.Mutex
 }
 
 // newRepoMappingStore constructs the store rooted at <CONFIG_DIR>/repos.json.
@@ -142,7 +150,12 @@ func (s *repoMappingStore) list() []RepoMapping {
 
 // persist writes the current store to disk atomically (.tmp + rename).
 // Caller has either released or never held the mutex when this is called.
+// persistMu serializes the file IO so concurrent upserts don't race on the
+// shared `<path>.tmp` filename.
 func (s *repoMappingStore) persist() error {
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+
 	s.mu.RLock()
 	entries := make([]*RepoMapping, 0, len(s.byID))
 	for _, m := range s.byID {
