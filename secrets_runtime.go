@@ -18,6 +18,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/rs/zerolog/log"
 )
 
 // prepareEnvForRepo gathers env vars + tmpfile cleanup for every storage of
@@ -77,6 +79,20 @@ func (a *app) prepareEnvForRepo(ctx context.Context, repo *Repo) ([]string, map[
 		tmpfiles = append(tmpfiles, built.Tmpfiles...)
 		if built.RSAPrivPath != "" {
 			rsaPriv[s.StorageAlias] = built.RSAPrivPath
+		}
+
+		// SFTP storages: make sure the server's host key is in known_hosts
+		// before duplicacy spawns. ensureHostKey is a no-op once the entry
+		// exists (steady-state cost is one file stat per storage). On
+		// failure we log + continue rather than abort: duplicacy will then
+		// surface a clean "host key not trusted" error rather than us
+		// pre-empting with our own.
+		if s.StorageType == "sftp" {
+			if host, ok := sftpHostFromURL(bundle.StorageURL); ok {
+				if err := ensureHostKey(a.cfg, host); err != nil {
+					log.Warn().Err(err).Str("host", host).Msg("ensure SFTP host key failed; duplicacy may reject the handshake")
+				}
+			}
 		}
 	}
 

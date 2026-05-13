@@ -47,6 +47,15 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 		return nil, fmt.Errorf("load repo mapping: %w", err)
 	}
 
+	// Ensure /root/.ssh/known_hosts symlinks into the persistent state mount
+	// before any SFTP work runs. Idempotent — a no-op once set up. Don't
+	// fail-fast on error: an SFTP-less agent (b2/s3/gcs only) shouldn't be
+	// blocked from starting just because we couldn't prep a file it'll
+	// never need.
+	if err := ensureKnownHostsSetup(cfg); err != nil {
+		log.Warn().Err(err).Msg("known_hosts setup failed (SFTP storages will fail until resolved)")
+	}
+
 	filters, err := newFilterCache(cfg, cc, repos)
 	if err != nil {
 		return nil, fmt.Errorf("filter cache: %w", err)
