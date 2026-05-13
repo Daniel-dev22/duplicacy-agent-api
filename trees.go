@@ -157,35 +157,27 @@ func (w *treeWalker) tick(ctx context.Context) {
 
 // walkRoot returns the tree rooted at containerRoot, with TreeNode.path
 // reverse-translated to host paths. nil if the root is unreadable.
-func (w *treeWalker) walkRoot(containerRoot string) *treeNode {
-	hostRoot := w.toHost(containerRoot)
-	st, err := os.Lstat(containerRoot)
+func (w *treeWalker) walkRoot(root string) *treeNode {
+	st, err := os.Lstat(root)
 	if err != nil {
-		log.Warn().Err(err).Str("root", containerRoot).Msg("tree walk: root lstat failed")
+		log.Warn().Err(err).Str("root", root).Msg("tree walk: root lstat failed")
 		return nil
 	}
 	if !st.IsDir() {
 		return nil
 	}
 
-	root := &treeNode{
-		Name:     filepath.Base(hostRoot),
-		Path:     hostRoot,
+	return &treeNode{
+		Name:     filepath.Base(root),
+		Path:     root,
 		Type:     "directory",
-		Children: w.walkDir(containerRoot, st.ModTime(), 0),
+		Children: w.walkDir(root, st.ModTime(), 0),
 	}
-	return root
 }
 
 // walkDir returns the children of dir (one level), recursing depth-first up to
 // treeMaxDepth. Uses the mtime cache to short-circuit unchanged subtrees.
-// childHost is computed via toHost(childContainer) per entry rather than
-// joining a base hostDir — that's load-bearing for duplicacy-web migrated
-// repos where the source is /backuproot (the agent's synthetic mount parent).
-// With per-entry translation, /backuproot's children path1/path2/path3
-// individually resolve to /home/user, /srv/containers, etc.
-// containerToHost is prefix-based so descendants inside a translated subtree
-// keep the same host-rooted naming.
+// Mounts are mirrored so paths are emitted as-is (no host/container split).
 func (w *treeWalker) walkDir(containerDir string, mtime time.Time, depth int) []*treeNode {
 	if depth >= treeMaxDepth {
 		return nil
@@ -222,8 +214,7 @@ func (w *treeWalker) walkDir(containerDir string, mtime time.Time, depth int) []
 			continue
 		}
 
-		childContainer := filepath.Join(containerDir, name)
-		childHost := w.toHost(childContainer)
+		childPath := filepath.Join(containerDir, name)
 
 		if e.IsDir() {
 			// Lstat for mtime — one extra syscall but lets the cache work.
@@ -233,14 +224,14 @@ func (w *treeWalker) walkDir(containerDir string, mtime time.Time, depth int) []
 			}
 			dirs = append(dirs, &treeNode{
 				Name:     name,
-				Path:     childHost,
+				Path:     childPath,
 				Type:     "directory",
-				Children: w.walkDir(childContainer, info.ModTime(), depth+1),
+				Children: w.walkDir(childPath, info.ModTime(), depth+1),
 			})
 		} else if typ.IsRegular() {
 			files = append(files, &treeNode{
 				Name: name,
-				Path: childHost,
+				Path: childPath,
 				Type: "file",
 			})
 		}
@@ -256,7 +247,7 @@ func (w *treeWalker) walkDir(containerDir string, mtime time.Time, depth int) []
 		children = append(children, dirs...)
 		children = append(children, &treeNode{
 			Name:      fmt.Sprintf("%d files (too many to list)", len(files)),
-			Path:      w.toHost(containerDir),
+			Path:      containerDir,
 			Type:      "truncated",
 			FileCount: len(files),
 		})
@@ -273,16 +264,8 @@ func (w *treeWalker) walkDir(containerDir string, mtime time.Time, depth int) []
 	return children
 }
 
-// toHost reverse-translates a container-side path to its host-side equivalent
-// using the BACKUP_ROOT_MOUNTS map. Falls back to the input when no mapping
-// covers the path (e.g. hosts where container == host paths or
-// COMPOSE_SCAN_ROOTS that aren't bind-translated).
-func (w *treeWalker) toHost(p string) string {
-	if hp, ok := containerToHost(p, w.cfg.HostToContainer); ok {
-		return hp
-	}
-	return p
-}
+// toHost is intentionally removed. Mirrored mounts mean container path
+// equals host path; the walker emits paths as-is.
 
 // -----------------------------------------------------------------------------
 // Push — repo trees (one per loaded repo, rooted at repo source path)
@@ -372,15 +355,15 @@ func (w *treeWalker) pushNodeTrees(ctx context.Context) error {
 	}
 
 	out := make([]nodeTreeOut, 0, len(w.cfg.BackupRoots))
-	for _, containerRoot := range w.cfg.BackupRoots {
-		root := w.walkRoot(containerRoot)
+	for _, hostRoot := range w.cfg.BackupRoots {
+		root := w.walkRoot(hostRoot)
 		if root == nil {
 			continue
 		}
 		out = append(out, nodeTreeOut{
 			Node:     w.cfg.NodeName,
 			Site:     w.cfg.SiteID,
-			RootPath: w.toHost(containerRoot),
+			RootPath: hostRoot,
 			Tree:     root,
 		})
 	}

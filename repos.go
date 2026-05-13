@@ -32,34 +32,28 @@ type Storage struct {
 
 // Repo is one duplicacy-initialised directory (one .duplicacy/preferences file).
 // Each Repo can have multiple Storages (e.g. NAS + S3 for the same source tree).
+//
+// Mounts are mirrored — host path == container path. HostPath is therefore
+// always equal to Path, and SourceHostPath always equals SourcePath; both
+// host_* JSON fields are kept for backward compatibility with the controller's
+// Adopt flow (which used to match agent-discovered repos against centrally-
+// stored host paths). With mirrored mounts that match is trivial because the
+// paths are identical, but the field stays so older controllers don't break.
 type Repo struct {
-	ID         string `json:"id"`   // stable hash of Path
-	Path       string `json:"path"` // absolute path to repo root (container-side)
-	// HostPath is the host-side path that the operator originally typed when
-	// initing the repo. Reverse-translated from Path via BACKUP_ROOT_MOUNTS
-	// when a mapping exists (e.g. container /backuproot/path1 → host
-	// /home/user). Empty when the agent has no mount mapping for the repo
-	// or when running on a host where Path == HostPath. The Adopt tab uses
-	// this to match agent-discovered repos against centrally-registered ones
-	// (which always store the host path).
-	HostPath      string    `json:"host_path,omitempty"`
+	ID            string    `json:"id"`   // stable hash of Path
+	Path          string    `json:"path"` // absolute path to repo root (host == container)
+	HostPath      string    `json:"host_path,omitempty"` // always == Path on mirrored mounts
 	SnapshotID    string    `json:"snapshot_id"` // duplicacy snapshot id (typically same across storages)
 	Storages      []Storage `json:"storages"`
 	HasFilters    bool      `json:"has_filters"`
 	LastScannedAt time.Time `json:"last_scanned_at"`
-	// SourcePath is the container-side path the agent should walk when
-	// building this repo's filter-picker tree. Derived from
-	// preferences[0].repository: if it names a host path that maps via
-	// HostToContainer, the container equivalent is stored here; if it's the
-	// agent's synthetic umbrella (/backuproot) we keep that — walking it
-	// surfaces every mounted backup root. Empty means walk Repo.Path as a
-	// fallback (covers the case where preferences has no usable repository).
-	SourcePath string `json:"source_path,omitempty"`
-	// SourceHostPath is the host-side display version of SourcePath. Used as
-	// the source_path field in /api/duplicacy/repo-trees so the UI can show
-	// the operator-meaningful path even though the agent walked a synthetic
-	// container path.
-	SourceHostPath string `json:"source_host_path,omitempty"`
+	// SourcePath is the path the agent walks when building this repo's
+	// filter-picker tree. Comes from preferences[0].repository, with any
+	// legacy /backuproot/pathN prefix rewritten to the matching host path via
+	// the LegacyBackuprootMap config. Empty when preferences has no usable
+	// repository value (falls back to walking Repo.Path).
+	SourcePath     string `json:"source_path,omitempty"`
+	SourceHostPath string `json:"source_host_path,omitempty"` // always == SourcePath on mirrored mounts
 }
 
 // rawPreference is the on-disk shape from duplicacy_preference.go::Preference.
@@ -88,9 +82,14 @@ type rawPreference struct {
 // to invalidate the cache and re-walk immediately so the next list reflects
 // fresh state.
 type repoIndex struct {
-	roots           []string
-	binary          string
-	hostToContainer map[string]string // for reverse container→host lookup on Repo.HostPath
+	roots  []string
+	binary string
+	// legacyBackuprootMap rewrites stale on-disk preferences whose
+	// `repository` field still references the old synthetic /backuproot/pathN
+	// paths. Empty in fresh deploys; populated for hosts that have repos
+	// migrated from duplicacy-web. Used only by rewriteLegacyBackuproot at
+	// preferences-load time — no other code path consults it.
+	legacyBackuprootMap map[string]string
 
 	mu          sync.RWMutex
 	repos       map[string]*Repo // keyed by Repo.ID
@@ -99,37 +98,37 @@ type repoIndex struct {
 
 const repoScanTTL = 30 * time.Second
 
-func newRepoIndex(roots []string, binary string, hostToContainer map[string]string) *repoIndex {
+func newRepoIndex(roots []string, binary string, legacyBackuprootMap map[string]string) *repoIndex {
 	return &repoIndex{
-		roots:           roots,
-		binary:          binary,
-		hostToContainer: hostToContainer,
-		repos:           map[string]*Repo{},
+		roots:               roots,
+		binary:              binary,
+		legacyBackuprootMap: legacyBackuprootMap,
+		repos:               map[string]*Repo{},
 	}
 }
 
-// containerToHost is the reverse of init_handler.translateHostPath. Given a
-// container path like "/backuproot/path1/foo" and the host:container mount
-// map, returns the host path "/home/user/foo" if the longest container
-// prefix matches; otherwise the original path and false.
-func containerToHost(path string, hostToContainer map[string]string) (string, bool) {
-	if len(hostToContainer) == 0 {
-		return path, false
+// rewriteLegacyBackuproot turns "/backuproot/pathN/X" into the matching host
+// path "/home/user/X" (etc) using the legacyMap. Longest-prefix wins so a
+// more specific synthetic key overrides a less specific one. Returns the input
+// unchanged when no key matches — the path is then either a real mirrored host
+// path already or genuinely unknown (lstat at walk time decides).
+func rewriteLegacyBackuproot(path string, legacyMap map[string]string) string {
+	if len(legacyMap) == 0 || path == "" {
+		return path
 	}
-	bestContainer, bestHost := "", ""
-	for host, container := range hostToContainer {
-		cc := filepath.Clean(container)
-		if path == cc || strings.HasPrefix(path, cc+string(filepath.Separator)) {
-			if len(cc) > len(bestContainer) {
-				bestContainer, bestHost = cc, filepath.Clean(host)
+	bestSynthetic, bestHost := "", ""
+	for synth, host := range legacyMap {
+		sc := filepath.Clean(synth)
+		if path == sc || strings.HasPrefix(path, sc+string(filepath.Separator)) {
+			if len(sc) > len(bestSynthetic) {
+				bestSynthetic, bestHost = sc, filepath.Clean(host)
 			}
 		}
 	}
-	if bestContainer == "" {
-		return path, false
+	if bestSynthetic == "" {
+		return path
 	}
-	suffix := strings.TrimPrefix(path, bestContainer)
-	return bestHost + suffix, true
+	return bestHost + strings.TrimPrefix(path, bestSynthetic)
 }
 
 // scan walks each backup root looking for .duplicacy/preferences files,
@@ -246,47 +245,32 @@ func (r *repoIndex) loadRepo(repoRoot string) (*Repo, error) {
 
 	id := repoIDFromPath(repoRoot)
 	hasFilters := fileExists(filepath.Join(repoRoot, ".duplicacy", "filters"))
-	// Reverse-translate container path → host path so the controller's
-	// Adopt walkthrough can match agent-discovered repos against centrally-
-	// registered ones (which always store the host path the operator
-	// originally typed). Empty when no mount mapping covers this path.
-	hostPath := ""
-	if hp, ok := containerToHost(repoRoot, r.hostToContainer); ok {
-		hostPath = hp
-	}
 
-	// Resolve the source path the filter-picker tree should walk. duplicacy's
-	// preferences[0].repository is the duplicacy-side view of the source —
-	// for repos init'd inside the duplicacy-web container it's the synthetic
-	// "/backuproot" umbrella, for repos init'd via this agent's CLI it's
-	// already a container path under /backuproot/pathN, and for ones init'd
-	// directly on a host it may be a real host path like /home/user/photos.
-	// We translate host → container when we can; otherwise we keep the raw
-	// value (it's already container-accessible for the synthetic case since
-	// docker creates /backuproot as the bind-mount parent). Empty / "/" /
-	// missing falls back to repoRoot so the picker degrades to walking the
-	// repo's own dir rather than the entire filesystem.
+	// Resolve the source path the filter-picker tree should walk. Mirrored
+	// mounts mean preferences[0].repository is usable as-is — UNLESS the
+	// preferences file is a legacy duplicacy-web migrated one that still
+	// names the synthetic /backuproot/pathN umbrella. rewriteLegacyBackuproot
+	// turns those substrings into the matching host path; on fresh deploys
+	// the map is empty and the function is a passthrough. Empty / "/" falls
+	// back to repoRoot so the picker degrades to the repo's own dir rather
+	// than the whole filesystem.
 	sourcePath := strings.TrimRight(raws[0].RepositoryPath, "/")
-	if sourcePath == "" {
+	if sourcePath == "" || sourcePath == "/" {
 		sourcePath = repoRoot
-	} else if translated, ok := translateHostPath(filepath.Clean(sourcePath), r.hostToContainer); ok {
-		sourcePath = translated
-	}
-	sourceHostPath := sourcePath
-	if hp, ok := containerToHost(sourcePath, r.hostToContainer); ok {
-		sourceHostPath = hp
+	} else {
+		sourcePath = rewriteLegacyBackuproot(filepath.Clean(sourcePath), r.legacyBackuprootMap)
 	}
 
 	return &Repo{
 		ID:             id,
 		Path:           repoRoot,
-		HostPath:       hostPath,
+		HostPath:       repoRoot, // mirrored mounts — host == container
 		SnapshotID:     raws[0].SnapshotID,
 		Storages:       storages,
 		HasFilters:     hasFilters,
 		LastScannedAt:  time.Now().UTC(),
 		SourcePath:     sourcePath,
-		SourceHostPath: sourceHostPath,
+		SourceHostPath: sourcePath, // mirrored mounts — host == container
 	}, nil
 }
 

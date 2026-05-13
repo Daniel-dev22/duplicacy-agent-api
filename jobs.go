@@ -720,12 +720,16 @@ type restoreRequest struct {
 	Revision   int      `json:"revision"`
 	Paths      []string `json:"paths"`
 	Overwrite  bool     `json:"overwrite"`
-	// Target controls where files land:
-	//   ""         → restore in-place over the original repo root (legacy)
-	//   "scratch"  → agent expands to <RestoreScratchRoot>/<snapshot_id>-r<rev>/
+	// Target controls where files land. Safe-by-default semantics — an unset
+	// or empty Target is treated as "scratch" so restores never overwrite
+	// the source unless the operator explicitly opts in:
+	//   ""         → "scratch" (default; lands in RestoreScratchRoot)
+	//   "scratch"  → <RestoreScratchRoot>/<snapshot_id>-r<rev>/
+	//   "original" → restore in-place over the original repo root
 	//   "/abs/dir" → arbitrary absolute path (custom target)
-	// For non-empty targets, the agent symlinks .duplicacy into the target so
-	// duplicacy resolves storage config the same way it would in-place.
+	// For non-original targets, the agent symlinks .duplicacy into the
+	// target so duplicacy resolves storage config the same way it would in-
+	// place.
 	Target     string   `json:"target"`
 	TriggerKey string   `json:"trigger_key"`
 }
@@ -796,11 +800,17 @@ func (a *app) handleRestore(c *gin.Context) {
 
 // prepareRestoreTarget resolves the request's Target into an absolute path
 // for duplicacy to chdir into, and returns a teardown closure that removes
-// the .duplicacy symlink we plant there. Returns ("", nil, nil) when the
-// caller wants in-place restore (Target == "") so the existing behaviour
-// is unchanged.
+// the .duplicacy symlink we plant there. Safe-by-default — an empty Target
+// is treated as "scratch" so restores never overwrite source unless the
+// operator explicitly passes Target="original". Returns ("", nil, nil) only
+// for Target=="original", meaning duplicacy chdir's into the repo root
+// directly (the legacy in-place behaviour).
 func (a *app) prepareRestoreTarget(repo *Repo, target string, revision int) (string, func(), error) {
+	// Map the safe default and the explicit in-place sentinel.
 	if target == "" {
+		target = "scratch"
+	}
+	if target == "original" {
 		return "", nil, nil
 	}
 	var dir string

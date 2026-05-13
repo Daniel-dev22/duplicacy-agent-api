@@ -224,16 +224,10 @@ func (a *app) validateInitReq(req *initRepoReq) error {
 	if clean != req.RepoPath {
 		return fmt.Errorf("repo_path is not canonical (got %q, want %q)", req.RepoPath, clean)
 	}
-	// If the caller supplied a HOST path (e.g. /home/user) instead of the
-	// synthetic container path the agent sees (/backuproot/path1), translate
-	// it. The synthetic paths are kept intentionally so duplicacy's own
-	// preferences file points at /backuproot/pathN — restores then need an
-	// explicit operator-targeted host path rather than auto-clobbering prod.
-	if translated, ok := translateHostPath(clean, a.cfg.HostToContainer); ok {
-		log.Info().Str("host", clean).Str("container", translated).Msg("init: translated host path to container path")
-		req.RepoPath = translated
-		clean = translated
-	}
+	// Mounts are mirrored (host path == container path) — the caller's path
+	// is already directly usable. We just require it to fall under one of the
+	// agent's BACKUP_ROOTS so a malformed request can't init outside the
+	// bind-mounted area.
 	if !pathInsideAny(clean, a.cfg.BackupRoots) {
 		return fmt.Errorf("repo_path %s is not inside any BACKUP_ROOTS (%v)",
 			clean, a.cfg.BackupRoots)
@@ -291,31 +285,9 @@ func pathInsideAny(path string, roots []string) bool {
 	return false
 }
 
-// translateHostPath rewrites a host-side path (e.g. "/home/user/foo") to its
-// bind-mounted container equivalent (e.g. "/backuproot/path1/foo") using the
-// host:container map. Returns the rewritten path and true on a hit; the
-// original path and false otherwise.
-//
-// The longest matching host prefix wins so a more specific mount overrides a
-// less specific one (e.g. /home/user/special before /home/user).
-func translateHostPath(path string, hostToContainer map[string]string) (string, bool) {
-	if len(hostToContainer) == 0 {
-		return path, false
-	}
-	bestHost, bestContainer := "", ""
-	for host, container := range hostToContainer {
-		hc := filepath.Clean(host)
-		if path == hc || strings.HasPrefix(path, hc+string(filepath.Separator)) {
-			if len(hc) > len(bestHost) {
-				bestHost, bestContainer = hc, filepath.Clean(container)
-			}
-		}
-	}
-	if bestHost == "" {
-		return path, false
-	}
-	return bestContainer + strings.TrimPrefix(path, bestHost), true
-}
+// translateHostPath is intentionally removed. Mounts are mirrored — host path
+// equals container path — so no translation layer exists. Use pathInsideAny
+// to validate that a caller-supplied path is under the agent's BACKUP_ROOTS.
 
 func isAgentValidStorageType(s string) bool {
 	switch s {

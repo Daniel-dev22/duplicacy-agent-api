@@ -10,14 +10,15 @@ import (
 type Config struct {
 	NodeName         string   // hostname-short this agent runs on (e.g. "nuc02")
 	SiteID           string   // "kd" | "ng"
-	BackupRoots      []string // bind-mounted paths (container-side) to scan for .duplicacy repos
-	// HostToContainer maps host paths to their bind-mounted container equivalents
-	// (e.g. "/home/user" → "/backuproot/path1"). Populated from BACKUP_ROOT_MOUNTS.
-	// Lets the user pick a host path in the UI; the agent translates it to the
-	// synthetic container path before init/backup/check/prune so the duplicacy
-	// preferences file stays anchored at /backuproot/pathN — keeping restores
-	// from auto-targeting the host's prod filesystem.
-	HostToContainer  map[string]string
+	BackupRoots      []string // host paths to scan for .duplicacy repos (mirrored: host == container)
+	// LegacyBackuprootMap rewrites stale on-disk preferences that still say
+	// `repository=/backuproot/pathN/...` in memory at preferences-load time.
+	// Populated from LEGACY_BACKUPROOT_MAP env var (e.g.
+	// "/backuproot/path1:/home/user,/backuproot/path2:/srv/containers").
+	// Empty when every repo has been re-init'd against the mirrored layout —
+	// at which point this field, the env var, and rewriteLegacyBackuproot can
+	// be deleted. No bearing on any other code path.
+	LegacyBackuprootMap map[string]string
 	ComposeScanRoots []string // bind-mounted (read-only) paths to scan for docker-compose project dirs
 	ConfigDir        string   // persistent state dir (events.sqlite, schedule cache, filter cache)
 	ControlCenterURL string   // The agent always reaches controller-api via the host's
@@ -42,8 +43,8 @@ func loadConfig() Config {
 	cfg := Config{
 		NodeName:         requireEnv("NODE_NAME"),
 		SiteID:           requireEnv("SITE_ID"),
-		BackupRoots:      splitCSV(requireEnv("BACKUP_ROOTS")),
-		HostToContainer:  parseMountMap(getEnv("BACKUP_ROOT_MOUNTS", "")),
+		BackupRoots:         splitCSV(requireEnv("BACKUP_ROOTS")),
+		LegacyBackuprootMap: parseMountMap(getEnv("LEGACY_BACKUPROOT_MAP", "")),
 		ComposeScanRoots: splitCSV(getEnv("COMPOSE_SCAN_ROOTS", "")),
 		ConfigDir:        getEnv("CONFIG_DIR", "/var/lib/duplicacy-agent-api"),
 		ControlCenterURL: requireEnv("CONTROL_CENTER_URL"),
