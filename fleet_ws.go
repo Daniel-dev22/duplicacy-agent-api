@@ -156,11 +156,16 @@ func (h *fleetHub) buildSnapshot() (fleetEvent, bool) {
 	if h.app == nil {
 		return fleetEvent{}, false
 	}
-	// /repos respects the TTL cache; if mutating ops just ScanForce-d, the
-	// cache is fresh. No additional walk here.
-	if err := h.app.repos.scan(); err != nil {
-		log.Warn().Err(err).Msg("fleet snapshot: repo scan failed")
-	}
+	// Pure cache read. Earlier this called h.app.repos.scan() inline; the
+	// initial cold scan on slow hosts (Pi 4 with /var/lib/rancher/k3s in
+	// BACKUP_ROOTS, NAS with deep trees) takes 7–20 seconds, which exceeds
+	// the frontend's WS connect timeout and causes useDuplicacyFleet to
+	// mark the host offline. Subsequent mutating ops (init/bind/delete,
+	// job-state transitions) call ScanForce or trigger via job hooks, so
+	// the cache stays current without forcing a synchronous walk on every
+	// client connect. The initial scan runs in a goroutine from newApp,
+	// which fires fleet.Trigger() on completion to refresh any client
+	// that connected before the cache warmed.
 	return fleetEvent{
 		Type: fleetEventSnapshot,
 		Data: fleetSnapshot{

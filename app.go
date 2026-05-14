@@ -99,10 +99,17 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 	// /var/lib/rancher/k3s bind-mounted, that has overrun the ansible
 	// /health/ready readiness probe). The HTTP listener is up immediately;
 	// any /repos call landing before the scan finishes triggers its own.
+	//
+	// On completion we trigger the fleet hub so any WS clients that
+	// connected during the cold scan (and got an empty snapshot from the
+	// pre-warm cache) receive a refreshed broadcast with the real repo
+	// list. Without this, slow-disk hosts looked offline until the next
+	// job event happened to land.
 	go func() {
 		if err := a.repos.scan(); err != nil {
 			log.Warn().Err(err).Msg("initial repo scan failed (will retry on first /repos call)")
 		}
+		a.fleet.Trigger()
 	}()
 	return a, nil
 }
