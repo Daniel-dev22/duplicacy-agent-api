@@ -303,6 +303,37 @@ func (r *repoIndex) get(id string) (*Repo, bool) {
 	return rp, ok
 }
 
+// getBySnapshotID looks up a repo by its duplicacy snapshot_id (the value
+// stored in .duplicacy/preferences.name and persisted to the controller's
+// duplicacy_repos.repo_id). Used by callers — like the scheduler — that
+// only carry the snapshot_id and don't know the agent's local 12-char
+// path-hash ID. Linear scan over the indexed map; the map is small (a
+// few dozen repos at most per agent) so O(n) is fine. Returns the first
+// match if multiple repos share the same snapshot_id (a misconfiguration,
+// but at least we pick one deterministically by path order).
+func (r *repoIndex) getBySnapshotID(snapID string) (*Repo, bool) {
+	if snapID == "" {
+		return nil, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var bestPath string
+	var best *Repo
+	for _, rp := range r.repos {
+		if rp.SnapshotID != snapID {
+			continue
+		}
+		if best == nil || rp.Path < bestPath {
+			best = rp
+			bestPath = rp.Path
+		}
+	}
+	if best == nil {
+		return nil, false
+	}
+	return best, true
+}
+
 // --- HTTP handlers (override the placeholders in app.go) ---
 
 func (a *app) handleListRepos(c *gin.Context) {

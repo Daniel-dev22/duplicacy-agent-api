@@ -284,7 +284,13 @@ func contains(haystack []string, needle string) bool {
 
 // fire dispatches a job for the given schedule.
 func (s *scheduler) fire(ctx context.Context, sch LocalSchedule, triggerKey string, isMissedRecovery bool) {
-	repo, ok := s.repos.get(sch.RepoID)
+	// sch.RepoID is the duplicacy snapshot_id (matches controller's
+	// duplicacy_repos.repo_id column), NOT the agent's 12-char path-hash
+	// Repo.ID. Use getBySnapshotID — previously the scheduler called the
+	// generic get() which only indexes by hash, so every fire missed and
+	// the schedule looked like it was disabled even though scheduleMatches
+	// was returning true on every tick.
+	repo, ok := s.repos.getBySnapshotID(sch.RepoID)
 	if !ok {
 		log.Warn().Str("schedule", sch.ID).Str("repo", sch.RepoID).Msg("schedule fire: repo not found, skipping")
 		return
