@@ -150,10 +150,19 @@ func (a *app) handleListSnapshots(c *gin.Context) {
 		})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"repo":      repo.ID,
 		"snapshots": parseListOutput(string(out)),
-	})
+	}
+	// ?debug=1 returns the raw duplicacy stdout/stderr alongside the parsed
+	// snapshots so operators can diagnose mismatches between what's on the
+	// storage and what duplicacy reports (e.g. parsing regex misses, version-
+	// specific output format changes). Off by default — adds a couple KiB
+	// per response. The full body is bounded by duplicacy's own output cap.
+	if c.Query("debug") == "1" {
+		resp["raw"] = string(out)
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // GET /repos/:id/snapshots/:rev/files — `duplicacy list -files -r <rev>`
