@@ -81,9 +81,23 @@ func streamLines(ctx context.Context, r io.Reader, lines chan<- string) {
 
 // snapshotLine matches the per-revision rows from `duplicacy list`.
 //
-//	Snapshot home revision 17 created at 2026-04-30 02:00:11 -hash
+// duplicacy 3.2.5 emits two formats interchangeably within a single list
+// output:
+//
+//	Snapshot home revision 1 created at 2026-04-30 02:00:11 -hash
+//	Snapshot home revision 2 created at 2026-05-01 02:00
+//
+// (Same storage, same repo — the trailing ` -hash` is present on older
+// revisions and missing on newer ones; seconds are sometimes truncated.)
+// The earlier regex required exactly three whitespace-separated tokens
+// after `created at`, so any revision without the `-hash` suffix was
+// silently dropped from /repos/:id/snapshots — operators saw only the
+// first revision in the UI even when the storage had many more.
+//
+// Capture only the date + time (always present) and tolerate optional
+// trailing fragments. parseTime below handles both timestamp variants.
 var snapshotLineRe = regexp.MustCompile(
-	`^Snapshot\s+(\S+)\s+revision\s+(\d+)\s+created at\s+(\S+\s+\S+\s+\S+)`)
+	`^Snapshot\s+(\S+)\s+revision\s+(\d+)\s+created at\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)`)
 
 type Snapshot struct {
 	SnapshotID string    `json:"snapshot_id"`
@@ -100,7 +114,14 @@ func parseListOutput(out string) []Snapshot {
 			continue
 		}
 		rev, _ := strconv.Atoi(m[2])
-		t, _ := time.Parse("2006-01-02 15:04:05 -0700", m[3])
+		// duplicacy emits either "YYYY-MM-DD HH:MM" or "YYYY-MM-DD HH:MM:SS"
+		// depending on the revision; try the second-precision form first and
+		// fall back to minute precision. Zero-value time is acceptable —
+		// frontend renders "Invalid Date" rather than rejecting the row.
+		t, err := time.Parse("2006-01-02 15:04:05", m[3])
+		if err != nil {
+			t, _ = time.Parse("2006-01-02 15:04", m[3])
+		}
 		snaps = append(snaps, Snapshot{
 			SnapshotID: m[1],
 			Revision:   rev,
