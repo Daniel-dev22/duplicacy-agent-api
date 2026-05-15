@@ -73,6 +73,7 @@ func registerRoutes(r *gin.Engine, app *app) {
 	r.POST("/repos", app.handleInitRepo)
 	r.POST("/repos/init", app.handleInitRepoNew)
 	r.POST("/repos/bind", app.handleBindRepo)
+	r.POST("/repos/delete", app.handleDeleteRepo)
 	r.GET("/repos/:id/snapshots", app.handleListSnapshots)
 	r.GET("/repos/:id/snapshots/:rev/files", app.handleSnapshotFiles)
 	r.POST("/repos/:id/backup", app.handleBackup)

@@ -136,6 +136,7 @@ func (a *app) startBackgroundWorkers(ctx context.Context) {
 	a.scheduler.Start(ctx)
 	go a.filters.reconcileLoop(ctx, a.stop)
 	go a.fleet.Run(ctx)
+	go a.reconcileLoop(ctx)
 	a.trees.Start(ctx)
 	log.Info().Msg("background workers started")
 }
