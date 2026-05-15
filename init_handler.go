@@ -48,6 +48,7 @@ type initStorageReq struct {
 type initRepoReq struct {
 	RepoPath string           `json:"repo_path"`
 	RepoID   string           `json:"repo_id"`
+	RepoUUID string           `json:"repo_uuid"` // duplicacy_repos.id (UUID) — needed for reconcile orphan-detection
 	Storages []initStorageReq `json:"storages"`
 }
 
@@ -194,6 +195,7 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 	mapping := RepoMapping{
 		RepoPath:     req.RepoPath,
 		RepoID:       req.RepoID,
+		UUID:         req.RepoUUID,
 		Storages:     toMappingStorages(req.Storages),
 		RegisteredAt: time.Now().UTC(),
 	}
@@ -413,6 +415,7 @@ func (a *app) handleBindRepo(c *gin.Context) {
 	mapping := RepoMapping{
 		RepoPath:     req.RepoPath,
 		RepoID:       req.RepoID,
+		UUID:         req.RepoUUID,
 		Storages:     toMappingStorages(req.Storages),
 		RegisteredAt: time.Now().UTC(),
 	}

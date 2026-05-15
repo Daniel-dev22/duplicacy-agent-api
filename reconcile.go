@@ -97,6 +97,13 @@ func (a *app) reconcileOrphans(ctx context.Context) error {
 
 	wiped := 0
 	for _, m := range a.mapping.list() {
+		if m.UUID == "" {
+			// Legacy mapping persisted before mapping.UUID was wired up.
+			// Without a UUID we cannot reliably distinguish "valid but
+			// un-backfilled" from "actually orphaned" — skip to avoid
+			// false-positive deletion. New init/bind calls populate UUID.
+			continue
+		}
 		if keep[m.UUID] {
 			continue
 		}
