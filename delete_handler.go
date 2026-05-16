@@ -6,6 +6,22 @@ package main
 // first). The router calls this fire-and-forget after dropping the central
 // duplicacy_repos row; if it can't reach the agent, reconcile.go cleans up
 // the orphan on the next tick.
+//
+// Path resolution: the router may send EITHER the parent directory of the
+// on-disk `.duplicacy/` (legacy) OR the source path stored by the adopt flow
+// (which is what `canonicalRepoPath` produces — preferences[0].repository,
+// not the cache-wrapper dir). Adopt-via-cache-wrapper repos have
+// `.duplicacy/` at e.g. `/x/duplicacy/cache/localhost/3/.duplicacy/` but
+// `duplicacy_repos.repo_path` = `/x`. Without resolution, the literal
+// `os.Stat("/x/.duplicacy")` returns ENOENT and the real `.duplicacy/`
+// survives, producing orphan re-discovery loops. When the literal target
+// doesn't exist, fall back to the scan cache: any Repo whose SourcePath
+// matches `clean` points us at the actual on-disk Path; wipe every match
+// (cache-wrapper + ISO-root mirror can both resolve to the same source).
+//
+// Active-job guard checks BOTH the literal-path repo id and every scan-cache
+// match before any removal — otherwise resolving multiple repos could
+// silently skip the job check on the sibling rows.
 
 import (
 	"errors"
@@ -24,8 +40,10 @@ type deleteRepoReq struct {
 }
 
 type deleteRepoResp struct {
-	Removed  bool   `json:"removed"`
-	RepoPath string `json:"repo_path"`
+	Removed       bool     `json:"removed"`
+	RepoPath      string   `json:"repo_path"`
+	WipedPaths    []string `json:"wiped_paths,omitempty"`     // every .duplicacy/ parent we removed
+	ResolvedVia   string   `json:"resolved_via,omitempty"`    // "literal" | "scan-cache" | "none"
 }
 
 func (a *app) handleDeleteRepo(c *gin.Context) {
@@ -48,40 +66,95 @@ func (a *app) handleDeleteRepo(c *gin.Context) {
 		return
 	}
 
-	repoID := repoIDFromPath(clean)
-	for _, j := range a.jobs.list() {
-		if j.RepoID == repoID && j.State == JobRunning {
-			c.JSON(http.StatusConflict, gin.H{
-				"error": fmt.Sprintf("%s job %s is running on this repo — cancel it first", j.Action, j.ID),
-			})
-			return
+	// Resolve every on-disk `.duplicacy/` parent path this request should
+	// wipe. Literal path first; if that doesn't exist, fall back to the
+	// scan cache by matching against SourcePath / SourceHostPath.
+	literalTarget := filepath.Join(clean, ".duplicacy")
+	resolvedParents := []string{}
+	resolvedVia := "none"
+	if _, err := os.Stat(literalTarget); err == nil {
+		resolvedParents = append(resolvedParents, clean)
+		resolvedVia = "literal"
+	} else if !errors.Is(err, os.ErrNotExist) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "stat .duplicacy: " + err.Error()})
+		return
+	} else {
+		// Fall back to scan-cache lookup. Ensure cache is reasonably fresh.
+		if err := a.repos.scan(); err != nil {
+			log.Warn().Err(err).Msg("pre-delete scan failed (continuing with cached state)")
+		}
+		for _, r := range a.repos.list() {
+			if r.SourcePath == clean || r.SourceHostPath == clean {
+				resolvedParents = append(resolvedParents, r.Path)
+			}
+		}
+		if len(resolvedParents) > 0 {
+			resolvedVia = "scan-cache"
 		}
 	}
 
-	target := filepath.Join(clean, ".duplicacy")
-	removed := true
-	if _, err := os.Stat(target); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			removed = false
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "stat .duplicacy: " + err.Error()})
-			return
+	// Active-job guard runs against EVERY repo we're about to touch, not
+	// just the literal-path repo. With multi-resolution this matters: the
+	// cache-wrapper and ISO-root mirror are two distinct Repo.IDs.
+	checkIDs := []string{repoIDFromPath(clean)}
+	for _, p := range resolvedParents {
+		checkIDs = append(checkIDs, repoIDFromPath(p))
+	}
+	for _, j := range a.jobs.list() {
+		if j.State != JobRunning {
+			continue
+		}
+		for _, id := range checkIDs {
+			if j.RepoID == id {
+				c.JSON(http.StatusConflict, gin.H{
+					"error": fmt.Sprintf("%s job %s is running on this repo — cancel it first", j.Action, j.ID),
+				})
+				return
+			}
 		}
 	}
-	if removed {
+
+	wiped := []string{}
+	for _, parent := range resolvedParents {
+		// Re-validate the resolved parent stays inside BACKUP_ROOTS. The
+		// scan cache only adds repos found under a backup root, but defence
+		// in depth: a path that escapes (e.g. via symlink walk) must not
+		// trigger RemoveAll.
+		if !pathInsideAny(parent, a.cfg.BackupRoots) {
+			log.Warn().Str("resolved", parent).Msg("resolved .duplicacy/ parent outside BACKUP_ROOTS — refusing")
+			continue
+		}
+		target := filepath.Join(parent, ".duplicacy")
 		if err := os.RemoveAll(target); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "remove .duplicacy: " + err.Error()})
 			return
 		}
+		wiped = append(wiped, parent)
+		// Drop mapping entry keyed on the resolved parent (where the
+		// init/bind flow would have stored it). The original `clean` may
+		// not match any mapping id when we resolved via the source path.
+		if err := a.mapping.delete(parent); err != nil {
+			log.Warn().Err(err).Str("repo", parent).Msg("mapping delete failed (non-fatal)")
+		}
 	}
+	// Also try the literal `clean` against the mapping — covers the legacy
+	// case where the mapping happened to be keyed on the source path.
 	if err := a.mapping.delete(clean); err != nil {
-		log.Warn().Err(err).Str("repo", clean).Msg("mapping delete failed (non-fatal)")
+		log.Warn().Err(err).Str("repo", clean).Msg("mapping delete (literal) failed (non-fatal)")
 	}
 	if err := a.repos.ScanForce(); err != nil {
 		log.Warn().Err(err).Msg("post-delete repo scan failed")
 	}
 	a.fleet.Trigger()
 
-	log.Info().Str("repo", clean).Bool("removed", removed).Msg("repo deleted on-disk")
-	c.JSON(http.StatusOK, deleteRepoResp{Removed: removed, RepoPath: clean})
+	log.Info().Str("repo", clean).
+		Str("resolved_via", resolvedVia).
+		Strs("wiped", wiped).
+		Msg("repo deleted on-disk")
+	c.JSON(http.StatusOK, deleteRepoResp{
+		Removed:     len(wiped) > 0,
+		RepoPath:    clean,
+		WipedPaths:  wiped,
+		ResolvedVia: resolvedVia,
+	})
 }
