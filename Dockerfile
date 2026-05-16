@@ -1,8 +1,21 @@
+# syntax=docker/dockerfile:1.7
+#
+# BuildKit syntax directive required for `RUN --mount=type=ssh` below, which
+# we use to fetch the private agent-kit-go module via the host's SSH agent
+# without baking the key into the image. Build invocation must pass
+# `--ssh default` (ansible playbook handles this).
 FROM golang:1.25-alpine AS builder
 WORKDIR /app
-RUN apk add --no-cache git
+RUN apk add --no-cache git openssh-client
+# Bypass the public proxy for our private GitHub org so go mod download
+# hits git directly. Rewrite https:// → git@ so it uses the SSH agent.
+ENV GOPRIVATE=github.com/Daniel-dev22/*
+RUN git config --global url."git@github.com:".insteadOf "https://github.com/" && \
+    mkdir -p /root/.ssh && \
+    ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> /root/.ssh/known_hosts
 COPY go.mod go.sum* ./
-RUN go mod download
+# Mount the SSH agent only for this RUN — key never lands in the image.
+RUN --mount=type=ssh go mod download
 COPY *.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o duplicacy-agent-api .
 
