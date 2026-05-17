@@ -107,7 +107,11 @@ type Snapshot struct {
 }
 
 func parseListOutput(out string) []Snapshot {
-	var snaps []Snapshot
+	// Initialize as empty slice (not nil) so JSON marshals as `[]` rather than
+	// `null` for a fresh repo with zero snapshots — the frontend's snapshots
+	// state is typed Snapshot[] and `null` makes `snapshots.length` crash the
+	// repo detail page on the very first click after init.
+	snaps := make([]Snapshot, 0)
 	for _, line := range strings.Split(out, "\n") {
 		m := snapshotLineRe.FindStringSubmatch(line)
 		if m == nil {
