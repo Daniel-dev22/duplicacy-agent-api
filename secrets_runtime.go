@@ -70,7 +70,7 @@ func (a *app) prepareEnvForRepo(ctx context.Context, repo *Repo) ([]string, map[
 			// certainly a stale repos.json. Trust the controller.
 			s.StorageType = bundle.StorageType
 		}
-		built, err := buildEnv(s.StorageType, s.StorageAlias, bundle)
+		built, err := buildEnv(s.StorageType, s.StorageAlias, s.IsPrimary, bundle)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("storage %s buildEnv: %w", s.StorageAlias, err))
 			continue

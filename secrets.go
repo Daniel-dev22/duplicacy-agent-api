@@ -6,8 +6,10 @@ package main
 //
 //  1. SecretsBundle — what the controller hands us when we vend secrets.
 //
-//  2. buildEnv(storageType, storageAlias, bundle) — produces:
-//       - the DUPLICACY_*_* env strings for that storage
+//  2. buildEnv(storageType, storageAlias, isPrimary, bundle) — produces:
+//       - the DUPLICACY_*_* env strings for that storage (primary always uses
+//         the bare DUPLICACY_ prefix; non-primary non-"default" aliases get
+//         DUPLICACY_<ALIAS>_)
 //       - any /dev/shm tmpfiles created (PEM keys for SFTP, JSON keys for GCS)
 //     Caller is responsible for unlinking the tmpfiles after duplicacy exits.
 //
@@ -55,8 +57,18 @@ type buildEnvResult struct {
 // buildEnv produces env vars for one storage. storageAlias is the duplicacy
 // storage name ("default" for the primary, custom strings for secondaries).
 //
-// Mapping rules (default storage uses bare prefix; aliased storages prepend
-// DUPLICACY_<ALIAS_UPPER>_ where the var name lives):
+// isPrimary forces the bare DUPLICACY_ prefix regardless of storageAlias.
+// Rationale: `duplicacy init` always creates the primary preference with
+// name="default" (cmd flag -storage-name unused; see duplicacy_main.go:263-267),
+// and duplicacy's env-var lookup uses preference.Name (utils.go:165-186) — so
+// for the primary we must emit unprefixed DUPLICACY_* even if the controller
+// gave us a non-"default" alias. Without this, a primary registered with
+// alias "kd-nas" would have its DUPLICACY_KD-NAS_SSH_KEY_FILE set but
+// duplicacy would look up DUPLICACY_SSH_KEY_FILE — finding nothing, falling
+// to interactive prompt, failing init with "No private key file is provided".
+//
+// Mapping rules (primary OR alias=="default" uses bare prefix; other aliased
+// storages prepend DUPLICACY_<ALIAS_UPPER>_ where the var name lives):
 //
 //   - encryption_password         → DUPLICACY_PASSWORD              (or DUPLICACY_<ALIAS>_PASSWORD)
 //   - storage_type b2:
@@ -85,13 +97,13 @@ type buildEnvResult struct {
 //
 // Any unrecognised backend keys cause buildEnv to return an error rather than
 // silently dropping them — surfaces typos and schema drift early.
-func buildEnv(storageType, storageAlias string, b SecretsBundle) (buildEnvResult, error) {
+func buildEnv(storageType, storageAlias string, isPrimary bool, b SecretsBundle) (buildEnvResult, error) {
 	if b.EncryptionPassword == "" {
 		return buildEnvResult{}, errors.New("encryption_password missing in secrets bundle")
 	}
 
 	prefix := "DUPLICACY_"
-	if storageAlias != "" && !strings.EqualFold(storageAlias, "default") {
+	if !isPrimary && storageAlias != "" && !strings.EqualFold(storageAlias, "default") {
 		prefix = "DUPLICACY_" + strings.ToUpper(storageAlias) + "_"
 	}
 

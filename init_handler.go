@@ -111,7 +111,7 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 		}
 	}
 	for _, s := range req.Storages {
-		built, err := buildEnv(s.StorageType, s.StorageAlias, s.Secrets)
+		built, err := buildEnv(s.StorageType, s.StorageAlias, s.IsPrimary, s.Secrets)
 		if err != nil {
 			rollback()
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("buildEnv %s: %v", s.StorageAlias, err)})
@@ -137,7 +137,7 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 		if !strings.HasPrefix(s.req.StorageURL, "sftp://") {
 			continue
 		}
-		keyFile, passphrase := sshAuthFromEnv(s.env, s.req.StorageAlias)
+		keyFile, passphrase := sshAuthFromEnv(s.env, s.req.StorageAlias, s.req.IsPrimary)
 		if keyFile == "" {
 			// No key in env means buildEnv already errored above; the only
 			// way we get here without one is sftp-with-password, which
@@ -318,12 +318,12 @@ func stagedFor(staged []stagedStorage, alias string) stagedStorage {
 
 // sshAuthFromEnv extracts the SSH key file path and passphrase the secrets
 // pipeline materialised for this storage. Mirrors buildEnv's prefix logic:
-// the default storage uses bare DUPLICACY_SSH_KEY_FILE; aliased storages
-// use DUPLICACY_<ALIAS>_SSH_KEY_FILE. Returns empty strings if the storage
-// is password-auth or has no key configured.
-func sshAuthFromEnv(env []string, alias string) (keyFile, passphrase string) {
+// primary storages (and any storage with alias "default" or empty) use bare
+// DUPLICACY_SSH_KEY_FILE; other aliased storages use DUPLICACY_<ALIAS>_SSH_KEY_FILE.
+// Returns empty strings if the storage is password-auth or has no key configured.
+func sshAuthFromEnv(env []string, alias string, isPrimary bool) (keyFile, passphrase string) {
 	prefix := "DUPLICACY_"
-	if alias != "" && !strings.EqualFold(alias, "default") {
+	if !isPrimary && alias != "" && !strings.EqualFold(alias, "default") {
 		prefix = "DUPLICACY_" + strings.ToUpper(alias) + "_"
 	}
 	for _, kv := range env {
