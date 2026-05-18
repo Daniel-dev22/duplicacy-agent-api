@@ -4,7 +4,7 @@
 # we use to fetch the private agent-kit-go module via the host's SSH agent
 # without baking the key into the image. Build invocation must pass
 # `--ssh default` (ansible playbook handles this).
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 WORKDIR /app
 RUN apk add --no-cache git openssh-client
 # Bypass the public proxy for our private GitHub org so go mod download
