@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,7 +18,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/rs/zerolog/log"
 )
 
 // JobState lifecycle.
@@ -72,34 +72,34 @@ const subscriberBuffer = 256
 // reliably so we skip parsing them — the raw log stream remains the
 // source of truth for those.
 type JobProgress struct {
-	Percent       float64   `json:"percent"`
-	Speed         string    `json:"speed,omitempty"`         // verbatim ("7.50MB/s") — running only
-	ETA           string    `json:"eta,omitempty"`           // verbatim ("03:12:54", "n/a", "0h 2m 30s")
-	LastChunk     int       `json:"last_chunk,omitempty"`    // chunk index from the latest line
-	UpdatedAt     time.Time `json:"updated_at"`
+	Percent   float64   `json:"percent"`
+	Speed     string    `json:"speed,omitempty"`      // verbatim ("7.50MB/s") — running only
+	ETA       string    `json:"eta,omitempty"`        // verbatim ("03:12:54", "n/a", "0h 2m 30s")
+	LastChunk int       `json:"last_chunk,omitempty"` // chunk index from the latest line
+	UpdatedAt time.Time `json:"updated_at"`
 	// Final-summary fields, populated from BACKUP_STATS lines on completion.
 	// Frontend swaps the running view (percent + speed + ETA) for the
 	// completed view (chunks + bytes + duration) using state == 'completed'.
-	TotalChunks   int    `json:"total_chunks,omitempty"`     // "All chunks: <N> total, …"
-	NewChunks     int    `json:"new_chunks,omitempty"`       // "; <N> new, …"
-	BytesUploaded string `json:"bytes_uploaded,omitempty"`   // verbatim "669K"
-	Duration      string `json:"duration,omitempty"`         // verbatim "00:00:02"
+	TotalChunks   int    `json:"total_chunks,omitempty"`   // "All chunks: <N> total, …"
+	NewChunks     int    `json:"new_chunks,omitempty"`     // "; <N> new, …"
+	BytesUploaded string `json:"bytes_uploaded,omitempty"` // verbatim "669K"
+	Duration      string `json:"duration,omitempty"`       // verbatim "00:00:02"
 }
 
 // Job is one CLI invocation tracked through its lifecycle.
 type Job struct {
-	ID          string    `json:"id"`
-	RepoID      string    `json:"repo_id"`
-	RepoPath    string    `json:"repo_path"`
-	Action      JobAction `json:"action"`
-	StorageName string    `json:"storage_name,omitempty"`
-	Args        []string  `json:"args"`
-	State       JobState  `json:"state"`
-	StartedAt   time.Time `json:"started_at"`
-	CompletedAt time.Time `json:"completed_at,omitempty"`
-	ExitCode    int       `json:"exit_code"`
-	ErrorMsg    string    `json:"error,omitempty"`
-	LineCount   int       `json:"line_count"`
+	ID          string       `json:"id"`
+	RepoID      string       `json:"repo_id"`
+	RepoPath    string       `json:"repo_path"`
+	Action      JobAction    `json:"action"`
+	StorageName string       `json:"storage_name,omitempty"`
+	Args        []string     `json:"args"`
+	State       JobState     `json:"state"`
+	StartedAt   time.Time    `json:"started_at"`
+	CompletedAt time.Time    `json:"completed_at,omitempty"`
+	ExitCode    int          `json:"exit_code"`
+	ErrorMsg    string       `json:"error,omitempty"`
+	LineCount   int          `json:"line_count"`
 	Progress    *JobProgress `json:"progress,omitempty"`
 
 	// Caller-set context for events
@@ -220,21 +220,25 @@ func (j *Job) parseProgressLine(line string) bool {
 
 // statsAllChunksRe matches duplicacy's final summary line, source format
 // (duplicacy_backupmanager.go:570):
-//   "All chunks: %d total, %s bytes; %d new, %s bytes, %s bytes uploaded"
+//
+//	"All chunks: %d total, %s bytes; %d new, %s bytes, %s bytes uploaded"
 //
 // Real example from /srv/containers/duplicacy/logs/backup-….log:
-//   INFO BACKUP_STATS All chunks: 1472 total, 8,353M bytes; 5 new, 7,984K bytes, 669K bytes uploaded
+//
+//	INFO BACKUP_STATS All chunks: 1472 total, 8,353M bytes; 5 new, 7,984K bytes, 669K bytes uploaded
 //
 // Captures: total_chunks, new_chunks, bytes_uploaded.
 // (Total bytes and new bytes are skipped — uploaded is the operator-relevant
-//  number for the dashboard; we can revisit if needed.)
+//
+//	number for the dashboard; we can revisit if needed.)
 var statsAllChunksRe = regexp.MustCompile(
 	`All chunks: (\d+) total, .+? bytes; (\d+) new, .+? bytes, (\S+) bytes uploaded`,
 )
 
 // statsRunTimeRe matches the wall-clock duration line that follows the
 // All chunks summary:
-//   "Total running time: 00:00:02"
+//
+//	"Total running time: 00:00:02"
 var statsRunTimeRe = regexp.MustCompile(`Total running time: (\S+)`)
 
 // parseStatsLine populates the final-summary fields on Job.Progress when
@@ -272,9 +276,10 @@ func (j *Job) parseStatsLine(line string) bool {
 // errorLineRe matches duplicacy's ERROR-level lines. The agent invokes
 // duplicacy without -log, so the format is bare "ERROR <TAG> <message>"
 // (no timestamp/level prefix). Examples seen in the wild:
-//   ERROR STORAGE_CREATE Failed to load the SFTP storage at sftp://…: Can't access the storage path /mnt/…
-//   ERROR UPLOAD_CHUNK Failed to upload the chunk …: RequestError: send request failed
-//   ERROR DOWNLOAD_OPEN Failed to open the file … for in-place writing
+//
+//	ERROR STORAGE_CREATE Failed to load the SFTP storage at sftp://…: Can't access the storage path /mnt/…
+//	ERROR UPLOAD_CHUNK Failed to upload the chunk …: RequestError: send request failed
+//	ERROR DOWNLOAD_OPEN Failed to open the file … for in-place writing
 var errorLineRe = regexp.MustCompile(`^ERROR (\S+) (.+)$`)
 
 // parseErrorLine checks for an ERROR-tag line and stores the LAST one as
@@ -460,7 +465,7 @@ func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo
 		default:
 			r.emit(j, EventFailed)
 		}
-		log.Info().Str("job", j.ID).Str("state", string(state)).Msg("job terminal")
+		slog.Info("job terminal", "job", j.ID, "state", string(state))
 	}()
 
 	return j, nil
@@ -495,7 +500,7 @@ func (r *jobRegistry) tail(j *Job, rdr io.Reader, source string) {
 		j.parseErrorLine(line)
 	}
 	if err := scanner.Err(); err != nil {
-		log.Warn().Err(err).Str("job", j.ID).Str("source", source).Msg("tail scanner error")
+		slog.Warn("tail scanner error", "error", err, "job", j.ID, "source", source)
 	}
 }
 
@@ -597,7 +602,7 @@ func (a *app) handleJobLogsWS(c *gin.Context) {
 	}
 	ws, err := wsUpgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		log.Warn().Err(err).Msg("ws upgrade failed")
+		slog.Warn("ws upgrade failed", "error", err)
 		return
 	}
 	defer ws.Close()
@@ -716,10 +721,10 @@ func (a *app) handleBackup(c *gin.Context) {
 }
 
 type restoreRequest struct {
-	Storage    string   `json:"storage"`
-	Revision   int      `json:"revision"`
-	Paths      []string `json:"paths"`
-	Overwrite  bool     `json:"overwrite"`
+	Storage   string   `json:"storage"`
+	Revision  int      `json:"revision"`
+	Paths     []string `json:"paths"`
+	Overwrite bool     `json:"overwrite"`
 	// Target controls where files land. Safe-by-default semantics — an unset
 	// or empty Target is treated as "scratch" so restores never overwrite
 	// the source unless the operator explicitly opts in:
@@ -730,8 +735,8 @@ type restoreRequest struct {
 	// For non-original targets, the agent symlinks .duplicacy into the
 	// target so duplicacy resolves storage config the same way it would in-
 	// place.
-	Target     string   `json:"target"`
-	TriggerKey string   `json:"trigger_key"`
+	Target     string `json:"target"`
+	TriggerKey string `json:"trigger_key"`
 }
 
 func (a *app) handleRestore(c *gin.Context) {

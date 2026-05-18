@@ -1,16 +1,15 @@
 package main
 
 import (
+	"log/slog"
 	"os"
 	"strings"
-
-	"github.com/rs/zerolog/log"
 )
 
 type Config struct {
-	NodeName         string   // hostname-short this agent runs on (e.g. "nuc02")
-	SiteID           string   // "kd" | "ng"
-	BackupRoots      []string // host paths to scan for .duplicacy repos (mirrored: host == container)
+	NodeName    string   // hostname-short this agent runs on (e.g. "nuc02")
+	SiteID      string   // "kd" | "ng"
+	BackupRoots []string // host paths to scan for .duplicacy repos (mirrored: host == container)
 	// LegacyBackuprootMap rewrites stale on-disk preferences that still say
 	// `repository=/backuproot/pathN/...` in memory at preferences-load time.
 	// Populated from LEGACY_BACKUPROOT_MAP env var (e.g.
@@ -19,18 +18,18 @@ type Config struct {
 	// at which point this field, the env var, and rewriteLegacyBackuproot can
 	// be deleted. No bearing on any other code path.
 	LegacyBackuprootMap map[string]string
-	ComposeScanRoots []string // bind-mounted (read-only) paths to scan for docker-compose project dirs
-	ConfigDir        string   // persistent state dir (events.sqlite, schedule cache, filter cache)
-	ControlCenterURL string   // The agent always reaches controller-api via the host's
-	                          // Traefik (or k3s Traefik on cluster nodes). Traefik handles
-	                          // mTLS at the boundary; this code does not load or present any
-	                          // client certificate. Per-node identity is conveyed via the
-	                          // BearerToken loaded below.
-	TraefikDockerDNS string   // Docker DNS name to resolve to local Traefik (default "traefik")
-	TraefikDialPort  string   // port to dial on the resolved Traefik IP (default "1443")
-	DuplicacyBinary  string   // path to duplicacy CLI (default /usr/local/bin/duplicacy)
-	BearerTokenFile  string   // path to file containing this node's bearer token (per-host)
-	BearerToken      string   // populated at startup from BearerTokenFile contents
+	ComposeScanRoots    []string // bind-mounted (read-only) paths to scan for docker-compose project dirs
+	ConfigDir           string   // persistent state dir (events.sqlite, schedule cache, filter cache)
+	ControlCenterURL    string   // The agent always reaches controller-api via the host's
+	// Traefik (or k3s Traefik on cluster nodes). Traefik handles
+	// mTLS at the boundary; this code does not load or present any
+	// client certificate. Per-node identity is conveyed via the
+	// BearerToken loaded below.
+	TraefikDockerDNS string // Docker DNS name to resolve to local Traefik (default "traefik")
+	TraefikDialPort  string // port to dial on the resolved Traefik IP (default "1443")
+	DuplicacyBinary  string // path to duplicacy CLI (default /usr/local/bin/duplicacy)
+	BearerTokenFile  string // path to file containing this node's bearer token (per-host)
+	BearerToken      string // populated at startup from BearerTokenFile contents
 	// RestoreScratchRoot is where target=scratch restores land — agent expands
 	// the sentinel to <root>/<snapshot_id>-r<rev>/ at handleRestore time. The
 	// directory is created at restore time (mode 0700) inside the agent
@@ -41,13 +40,13 @@ type Config struct {
 
 func loadConfig() Config {
 	cfg := Config{
-		NodeName:         requireEnv("NODE_NAME"),
-		SiteID:           requireEnv("SITE_ID"),
+		NodeName:            requireEnv("NODE_NAME"),
+		SiteID:              requireEnv("SITE_ID"),
 		BackupRoots:         splitCSV(requireEnv("BACKUP_ROOTS")),
 		LegacyBackuprootMap: parseMountMap(getEnv("LEGACY_BACKUPROOT_MAP", "")),
-		ComposeScanRoots: splitCSV(getEnv("COMPOSE_SCAN_ROOTS", "")),
-		ConfigDir:        getEnv("CONFIG_DIR", "/var/lib/duplicacy-agent-api"),
-		ControlCenterURL: requireEnv("CONTROL_CENTER_URL"),
+		ComposeScanRoots:    splitCSV(getEnv("COMPOSE_SCAN_ROOTS", "")),
+		ConfigDir:           getEnv("CONFIG_DIR", "/var/lib/duplicacy-agent-api"),
+		ControlCenterURL:    requireEnv("CONTROL_CENTER_URL"),
 		// Empty default — k3s nodes leave this unset and use direct mode
 		// (URL host resolved normally via Docker DNS, kube-proxy DNATs the
 		// cluster ClusterIP). NAS hosts must explicitly set this to
@@ -57,8 +56,8 @@ func loadConfig() Config {
 		// Earlier default of "traefik" silently broke k3s nodes — every
 		// agent → controller call landed on the local Traefik (which
 		// has no route for the cluster service hostname) and returned 404.
-		TraefikDockerDNS: getEnv("TRAEFIK_DOCKER_DNS", ""),
-		TraefikDialPort:  getEnv("TRAEFIK_DIAL_PORT", "1443"),
+		TraefikDockerDNS:   getEnv("TRAEFIK_DOCKER_DNS", ""),
+		TraefikDialPort:    getEnv("TRAEFIK_DIAL_PORT", "1443"),
 		DuplicacyBinary:    getEnv("DUPLICACY_BINARY", "/usr/local/bin/duplicacy"),
 		BearerTokenFile:    getEnv("BEARER_TOKEN_FILE", "/etc/duplicacy-agent-api/bearer-token"),
 		RestoreScratchRoot: getEnv("RESTORE_SCRATCH_ROOT", "/tmp/duplicacy-restore"),
@@ -67,7 +66,10 @@ func loadConfig() Config {
 	// fatal — without it the controller will reject every credential vend.
 	tok, err := readBearerToken(cfg.BearerTokenFile)
 	if err != nil {
-		log.Fatal().Err(err).Str("path", cfg.BearerTokenFile).Msg("bearer token unreadable — cannot authenticate to controller for credential vending")
+		slog.Error("bearer token unreadable — cannot authenticate to controller for credential vending",
+			"error", err,
+			"path", cfg.BearerTokenFile)
+		os.Exit(1)
 	}
 	cfg.BearerToken = tok
 	return cfg
@@ -97,7 +99,8 @@ func (e *emptyTokenErr) Error() string { return "bearer token file " + e.path + 
 func requireEnv(k string) string {
 	v := os.Getenv(k)
 	if v == "" {
-		log.Fatal().Str("var", k).Msg("required env var not set")
+		slog.Error("required env var not set", "var", k)
+		os.Exit(1)
 	}
 	return v
 }
@@ -130,7 +133,7 @@ func parseMountMap(s string) map[string]string {
 	for _, p := range splitCSV(s) {
 		host, container, ok := strings.Cut(p, ":")
 		if !ok || host == "" || container == "" {
-			log.Warn().Str("entry", p).Msg("BACKUP_ROOT_MOUNTS: skipping malformed entry (want host:container)")
+			slog.Warn("BACKUP_ROOT_MOUNTS: skipping malformed entry (want host:container)", "entry", p)
 			continue
 		}
 		out[host] = container

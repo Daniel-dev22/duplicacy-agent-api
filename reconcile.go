@@ -19,13 +19,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/rs/zerolog/log"
 )
 
 // reconcileTickInterval is how often the periodic loop runs. Five minutes is
@@ -87,7 +86,7 @@ func (a *app) reconcileOrphans(ctx context.Context) error {
 		return fmt.Errorf("fetch central repos: %w", err)
 	}
 	if len(central) == 0 {
-		log.Debug().Msg("reconcile: central returned 0 repos for this node — skipping (safety)")
+		slog.Debug("reconcile: central returned 0 repos for this node — skipping (safety)")
 		return nil
 	}
 	keep := make(map[string]bool, len(central))
@@ -109,7 +108,7 @@ func (a *app) reconcileOrphans(ctx context.Context) error {
 		}
 		clean := filepath.Clean(m.RepoPath)
 		if !pathInsideAny(clean, a.cfg.BackupRoots) {
-			log.Warn().Str("repo", m.RepoPath).Msg("reconcile: orphan path outside BACKUP_ROOTS — refusing to remove")
+			slog.Warn("reconcile: orphan path outside BACKUP_ROOTS — refusing to remove", "repo", m.RepoPath)
 			continue
 		}
 		repoID := repoIDFromPath(clean)
@@ -121,19 +120,19 @@ func (a *app) reconcileOrphans(ctx context.Context) error {
 			}
 		}
 		if skip {
-			log.Info().Str("repo", clean).Msg("reconcile: orphan but job running — will retry next tick")
+			slog.Info("reconcile: orphan but job running — will retry next tick", "repo", clean)
 			continue
 		}
 		target := filepath.Join(clean, ".duplicacy")
 		if err := os.RemoveAll(target); err != nil {
-			log.Error().Err(err).Str("repo", clean).Msg("reconcile: RemoveAll failed")
+			slog.Error("reconcile: RemoveAll failed", "error", err, "repo", clean)
 			continue
 		}
 		if err := a.mapping.delete(clean); err != nil {
-			log.Error().Err(err).Str("repo", clean).Msg("reconcile: mapping.delete failed")
+			slog.Error("reconcile: mapping.delete failed", "error", err, "repo", clean)
 			continue
 		}
-		log.Info().Str("repo", clean).Str("uuid", m.UUID).Msg("reconcile: wiped orphan .duplicacy/")
+		slog.Info("reconcile: wiped orphan .duplicacy/", "repo", clean, "uuid", m.UUID)
 		wiped++
 	}
 
@@ -146,7 +145,7 @@ func (a *app) reconcileOrphans(ctx context.Context) error {
 
 	if wiped > 0 {
 		if err := a.repos.ScanForce(); err != nil {
-			log.Warn().Err(err).Msg("reconcile: post-wipe ScanForce failed")
+			slog.Warn("reconcile: post-wipe ScanForce failed", "error", err)
 		}
 		a.fleet.Trigger()
 	}
@@ -164,7 +163,7 @@ func (a *app) reconcileOrphans(ctx context.Context) error {
 func (a *app) reconcileTombstones(ctx context.Context) int {
 	tombs, err := a.fetchTombstones(ctx)
 	if err != nil {
-		log.Warn().Err(err).Msg("reconcile-tombstone: fetch failed — skipping pass")
+		slog.Warn("reconcile-tombstone: fetch failed — skipping pass", "error", err)
 		return 0
 	}
 	if len(tombs) == 0 {
@@ -174,7 +173,7 @@ func (a *app) reconcileTombstones(ctx context.Context) int {
 	// Refresh the scan cache so we're comparing against what's currently on
 	// disk, not a stale snapshot from before a deploy.
 	if err := a.repos.scan(); err != nil {
-		log.Warn().Err(err).Msg("reconcile-tombstone: pre-sweep scan failed (continuing with cached state)")
+		slog.Warn("reconcile-tombstone: pre-sweep scan failed (continuing with cached state)", "error", err)
 	}
 
 	tombSet := make(map[string]string, len(tombs))
@@ -202,31 +201,31 @@ func (a *app) reconcileTombstones(ctx context.Context) int {
 			}
 		}
 		if skip {
-			log.Info().Str("repo", r.Path).Str("snapshot_id", r.SnapshotID).
-				Msg("reconcile-tombstone: tombstoned but job running — will retry next tick")
+			slog.Info("reconcile-tombstone: tombstoned but job running — will retry next tick",
+				"repo", r.Path,
+				"snapshot_id", r.SnapshotID)
 			continue
 		}
 		// Belt-and-suspenders: the agent's own scan already only adds repos
 		// found under a backup root, but defence in depth.
 		if !pathInsideAny(r.Path, a.cfg.BackupRoots) {
-			log.Warn().Str("repo", r.Path).Msg("reconcile-tombstone: path outside BACKUP_ROOTS — refusing")
+			slog.Warn("reconcile-tombstone: path outside BACKUP_ROOTS — refusing", "repo", r.Path)
 			continue
 		}
 		target := filepath.Join(r.Path, ".duplicacy")
 		if err := os.RemoveAll(target); err != nil {
-			log.Error().Err(err).Str("repo", r.Path).Msg("reconcile-tombstone: RemoveAll failed")
+			slog.Error("reconcile-tombstone: RemoveAll failed", "error", err, "repo", r.Path)
 			continue
 		}
 		// Drop any mapping entry keyed on this path (no-op when adopt
 		// didn't create one — the common case for these orphans).
 		if err := a.mapping.delete(r.Path); err != nil {
-			log.Warn().Err(err).Str("repo", r.Path).Msg("reconcile-tombstone: mapping.delete failed (non-fatal)")
+			slog.Warn("reconcile-tombstone: mapping.delete failed (non-fatal)", "error", err, "repo", r.Path)
 		}
-		log.Info().
-			Str("repo", r.Path).
-			Str("snapshot_id", r.SnapshotID).
-			Str("central_path", centralPath).
-			Msg("reconcile-tombstone: wiped orphan .duplicacy/")
+		slog.Info("reconcile-tombstone: wiped orphan .duplicacy/",
+			"repo", r.Path,
+			"snapshot_id", r.SnapshotID,
+			"central_path", centralPath)
 		wiped++
 	}
 	return wiped
@@ -281,7 +280,7 @@ func (a *app) fetchTombstones(ctx context.Context) ([]tombstoneDTO, error) {
 func (a *app) reconcileLoop(ctx context.Context) {
 	startCtx, startCancel := context.WithTimeout(ctx, reconcileFetchTimeout)
 	if err := a.reconcileOrphans(startCtx); err != nil {
-		log.Warn().Err(err).Msg("reconcile: startup pass failed (will retry on tick)")
+		slog.Warn("reconcile: startup pass failed (will retry on tick)", "error", err)
 	}
 	startCancel()
 
@@ -296,7 +295,7 @@ func (a *app) reconcileLoop(ctx context.Context) {
 		case <-t.C:
 			tickCtx, tickCancel := context.WithTimeout(ctx, reconcileFetchTimeout)
 			if err := a.reconcileOrphans(tickCtx); err != nil {
-				log.Warn().Err(err).Msg("reconcile: tick failed")
+				slog.Warn("reconcile: tick failed", "error", err)
 			}
 			tickCancel()
 		}

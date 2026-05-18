@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"os"
 	"runtime"
@@ -25,7 +26,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
-	"github.com/rs/zerolog/log"
 )
 
 type fleetEventType string
@@ -191,7 +191,7 @@ func (h *fleetHub) sendOne(c *fleetClient, ev fleetEvent) {
 	select {
 	case c.send <- ev:
 	default:
-		log.Warn().Msg("fleet ws: client send buffer full, dropping")
+		slog.Warn("fleet ws: client send buffer full, dropping")
 		go func() { h.unregister <- c }()
 	}
 }
@@ -203,7 +203,7 @@ func (a *app) handleFleetWS(c *gin.Context) {
 	}
 	conn, err := wsUpgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		log.Warn().Err(err).Msg("fleet ws upgrade failed")
+		slog.Warn("fleet ws upgrade failed", "error", err)
 		return
 	}
 	client := &fleetClient{conn: conn, send: make(chan fleetEvent, 16)}

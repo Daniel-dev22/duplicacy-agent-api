@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -30,7 +31,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/rs/zerolog/log"
 )
 
 // initStorageReq is one storage entry in the init body.
@@ -188,7 +188,7 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 
 	// Scrub the preferences file.
 	if err := scrubPreferences(req.RepoPath); err != nil {
-		log.Warn().Err(err).Str("repo", req.RepoPath).Msg("scrub preferences after init failed (continuing)")
+		slog.Warn("scrub preferences after init failed (continuing)", "error", err, "repo", req.RepoPath)
 	}
 
 	// Persist mapping.
@@ -200,14 +200,14 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 		RegisteredAt: time.Now().UTC(),
 	}
 	if err := a.mapping.upsert(mapping); err != nil {
-		log.Error().Err(err).Str("repo", req.RepoPath).Msg("persist repo mapping failed")
+		slog.Error("persist repo mapping failed", "error", err, "repo", req.RepoPath)
 	}
 
 	// Refresh the in-memory repo index so /repos returns the new repo.
 	// ScanForce bypasses the TTL cache — the just-created repo must be visible
 	// on the very next /repos poll.
 	if err := a.repos.ScanForce(); err != nil {
-		log.Warn().Err(err).Msg("post-init repo scan failed")
+		slog.Warn("post-init repo scan failed", "error", err)
 	}
 	// Push the new state to any connected fleet WS subscribers.
 	a.fleet.Trigger()
@@ -434,7 +434,7 @@ func (a *app) handleBindRepo(c *gin.Context) {
 	// Force a repo rescan so /repos picks up the now-bound state, and notify
 	// any WS subscribers.
 	if err := a.repos.ScanForce(); err != nil {
-		log.Warn().Err(err).Msg("post-bind repo scan failed")
+		slog.Warn("post-bind repo scan failed", "error", err)
 	}
 	a.fleet.Trigger()
 

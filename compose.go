@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -10,7 +11,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/rs/zerolog/log"
 )
 
 // ComposeProject is one docker-compose project root discovered under a
@@ -30,8 +30,8 @@ type ComposeProject struct {
 type composeIndex struct {
 	roots []string
 
-	mu       sync.RWMutex
-	projects []ComposeProject
+	mu        sync.RWMutex
+	projects  []ComposeProject
 	scannedAt time.Time
 }
 
@@ -62,7 +62,7 @@ func (ci *composeIndex) scan() {
 		rootClean := filepath.Clean(root)
 		err := filepath.WalkDir(rootClean, func(path string, d os.DirEntry, walkErr error) error {
 			if walkErr != nil {
-				log.Warn().Err(walkErr).Str("path", path).Msg("compose walk error (skipping)")
+				slog.Warn("compose walk error (skipping)", "error", walkErr, "path", path)
 				return nil
 			}
 			if !d.IsDir() {
@@ -94,7 +94,7 @@ func (ci *composeIndex) scan() {
 			return nil
 		})
 		if err != nil {
-			log.Warn().Err(err).Str("root", rootClean).Msg("compose root walk failed")
+			slog.Warn("compose root walk failed", "error", err, "root", rootClean)
 		}
 	}
 
@@ -105,7 +105,7 @@ func (ci *composeIndex) scan() {
 	ci.scannedAt = time.Now().UTC()
 	ci.mu.Unlock()
 
-	log.Info().Int("count", len(found)).Msg("compose scan complete")
+	slog.Info("compose scan complete", "count", len(found))
 }
 
 // matchComposeFile returns the matching filename if the directory contains one

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -9,27 +10,24 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 )
 
 func main() {
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 
 	cfg := loadConfig()
-	log.Info().
-		Str("node", cfg.NodeName).
-		Str("site", cfg.SiteID).
-		Strs("backup_roots", cfg.BackupRoots).
-		Msg("duplicacy-agent-api starting")
+	slog.Info("duplicacy-agent-api starting",
+		"node", cfg.NodeName,
+		"site", cfg.SiteID,
+		"backup_roots", cfg.BackupRoots)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	app, err := newApp(ctx, cfg)
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to initialize app")
+		slog.Error("failed to initialize app", "error", err)
+		os.Exit(1)
 	}
 	defer app.close()
 
@@ -43,9 +41,10 @@ func main() {
 	srv := &http.Server{Addr: ":8080", Handler: r}
 
 	go func() {
-		log.Info().Msg("HTTP server listening on :8080")
+		slog.Info("HTTP server listening on :8080")
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal().Err(err).Msg("HTTP server error")
+			slog.Error("HTTP server error", "error", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -54,13 +53,13 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	log.Info().Msg("shutting down")
+	slog.Info("shutting down")
 	cancel()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Error().Err(err).Msg("HTTP shutdown error")
+		slog.Error("HTTP shutdown error", "error", err)
 	}
 }
 
@@ -114,11 +113,10 @@ func ginZerologMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		c.Next()
-		log.Info().
-			Str("method", c.Request.Method).
-			Str("path", c.Request.URL.Path).
-			Int("status", c.Writer.Status()).
-			Dur("dur", time.Since(start)).
-			Msg("http")
+		slog.Info("http",
+			"method", c.Request.Method,
+			"path", c.Request.URL.Path,
+			"status", c.Writer.Status(),
+			"dur", time.Since(start))
 	}
 }

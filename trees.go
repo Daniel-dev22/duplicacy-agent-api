@@ -33,14 +33,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/rs/zerolog/log"
 )
 
 // -----------------------------------------------------------------------------
@@ -58,16 +57,16 @@ const (
 // Matches the set the post-revert server_metrics task uses plus a handful of
 // noise dirs we never want to surface in a filter picker.
 var excludeBasenames = map[string]struct{}{
-	"__pycache__":  {},
-	"node_modules": {},
-	".git":         {},
-	".cache":       {},
-	".npm":         {},
-	".venv":        {},
-	"venv":         {},
-	"logs":         {},
-	"tmp":          {},
-	".zfs":         {},
+	"__pycache__":     {},
+	"node_modules":    {},
+	".git":            {},
+	".cache":          {},
+	".npm":            {},
+	".venv":           {},
+	"venv":            {},
+	"logs":            {},
+	"tmp":             {},
+	".zfs":            {},
 	"ix-applications": {},
 }
 
@@ -144,10 +143,10 @@ func (w *treeWalker) loop(ctx context.Context) {
 
 func (w *treeWalker) tick(ctx context.Context) {
 	if err := w.pushRepoTrees(ctx); err != nil {
-		log.Warn().Err(err).Msg("repo trees push failed")
+		slog.Warn("repo trees push failed", "error", err)
 	}
 	if err := w.pushNodeTrees(ctx); err != nil {
-		log.Warn().Err(err).Msg("node trees push failed")
+		slog.Warn("node trees push failed", "error", err)
 	}
 }
 
@@ -159,7 +158,7 @@ func (w *treeWalker) tick(ctx context.Context) {
 func (w *treeWalker) walkRoot(root string) *treeNode {
 	st, err := os.Lstat(root)
 	if err != nil {
-		log.Warn().Err(err).Str("root", root).Msg("tree walk: root lstat failed")
+		slog.Warn("tree walk: root lstat failed", "error", err, "root", root)
 		return nil
 	}
 	if !st.IsDir() {

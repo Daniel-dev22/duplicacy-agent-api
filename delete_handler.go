@@ -26,13 +26,13 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/rs/zerolog/log"
 )
 
 type deleteRepoReq struct {
@@ -40,10 +40,10 @@ type deleteRepoReq struct {
 }
 
 type deleteRepoResp struct {
-	Removed       bool     `json:"removed"`
-	RepoPath      string   `json:"repo_path"`
-	WipedPaths    []string `json:"wiped_paths,omitempty"`     // every .duplicacy/ parent we removed
-	ResolvedVia   string   `json:"resolved_via,omitempty"`    // "literal" | "scan-cache" | "none"
+	Removed     bool     `json:"removed"`
+	RepoPath    string   `json:"repo_path"`
+	WipedPaths  []string `json:"wiped_paths,omitempty"`  // every .duplicacy/ parent we removed
+	ResolvedVia string   `json:"resolved_via,omitempty"` // "literal" | "scan-cache" | "none"
 }
 
 func (a *app) handleDeleteRepo(c *gin.Context) {
@@ -81,7 +81,7 @@ func (a *app) handleDeleteRepo(c *gin.Context) {
 	} else {
 		// Fall back to scan-cache lookup. Ensure cache is reasonably fresh.
 		if err := a.repos.scan(); err != nil {
-			log.Warn().Err(err).Msg("pre-delete scan failed (continuing with cached state)")
+			slog.Warn("pre-delete scan failed (continuing with cached state)", "error", err)
 		}
 		for _, r := range a.repos.list() {
 			if r.SourcePath == clean || r.SourceHostPath == clean {
@@ -121,7 +121,7 @@ func (a *app) handleDeleteRepo(c *gin.Context) {
 		// in depth: a path that escapes (e.g. via symlink walk) must not
 		// trigger RemoveAll.
 		if !pathInsideAny(parent, a.cfg.BackupRoots) {
-			log.Warn().Str("resolved", parent).Msg("resolved .duplicacy/ parent outside BACKUP_ROOTS — refusing")
+			slog.Warn("resolved .duplicacy/ parent outside BACKUP_ROOTS — refusing", "resolved", parent)
 			continue
 		}
 		target := filepath.Join(parent, ".duplicacy")
@@ -134,23 +134,20 @@ func (a *app) handleDeleteRepo(c *gin.Context) {
 		// init/bind flow would have stored it). The original `clean` may
 		// not match any mapping id when we resolved via the source path.
 		if err := a.mapping.delete(parent); err != nil {
-			log.Warn().Err(err).Str("repo", parent).Msg("mapping delete failed (non-fatal)")
+			slog.Warn("mapping delete failed (non-fatal)", "error", err, "repo", parent)
 		}
 	}
 	// Also try the literal `clean` against the mapping — covers the legacy
 	// case where the mapping happened to be keyed on the source path.
 	if err := a.mapping.delete(clean); err != nil {
-		log.Warn().Err(err).Str("repo", clean).Msg("mapping delete (literal) failed (non-fatal)")
+		slog.Warn("mapping delete (literal) failed (non-fatal)", "error", err, "repo", clean)
 	}
 	if err := a.repos.ScanForce(); err != nil {
-		log.Warn().Err(err).Msg("post-delete repo scan failed")
+		slog.Warn("post-delete repo scan failed", "error", err)
 	}
 	a.fleet.Trigger()
 
-	log.Info().Str("repo", clean).
-		Str("resolved_via", resolvedVia).
-		Strs("wiped", wiped).
-		Msg("repo deleted on-disk")
+	slog.Info("repo deleted on-disk", "repo", clean, "resolved_via", resolvedVia, "wiped", wiped)
 	c.JSON(http.StatusOK, deleteRepoResp{
 		Removed:     len(wiped) > 0,
 		RepoPath:    clean,

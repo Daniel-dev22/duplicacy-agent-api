@@ -21,11 +21,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 
 	"github.com/gin-gonic/gin"
-	"github.com/rs/zerolog/log"
 
 	kitsched "github.com/Daniel-dev22/agent-kit-go/scheduler"
 )
@@ -75,7 +75,7 @@ func makeDuplicacyFire(cfg Config, jobs *jobRegistry, repos *repoIndex, prepareE
 		// this bug too (calling generic get() which only indexes by hash).
 		repo, ok := repos.getBySnapshotID(sch.RepoID)
 		if !ok {
-			log.Warn().Str("schedule", sch.ID).Str("repo", sch.RepoID).Msg("schedule fire: repo not found, skipping")
+			slog.Warn("schedule fire: repo not found, skipping", "schedule", sch.ID, "repo", sch.RepoID)
 			return nil
 		}
 
@@ -92,7 +92,7 @@ func makeDuplicacyFire(cfg Config, jobs *jobRegistry, repos *repoIndex, prepareE
 			inv = invocationForPrune(repo, sch.Storage, kitsched.ParamStrings(sch.Params, "keep_rules"),
 				kitsched.ParamBool(sch.Params, "exclusive"), kitsched.ParamBool(sch.Params, "exhaustive"))
 		default:
-			log.Warn().Str("action", sch.Action).Str("schedule", sch.ID).Msg("schedule fire: unsupported action")
+			slog.Warn("schedule fire: unsupported action", "action", sch.Action, "schedule", sch.ID)
 			return nil
 		}
 
@@ -104,7 +104,7 @@ func makeDuplicacyFire(cfg Config, jobs *jobRegistry, repos *repoIndex, prepareE
 			var err error
 			env, _, cleanup, err = prepareEnv(ctx, repo)
 			if err != nil {
-				log.Error().Err(err).Str("schedule", sch.ID).Msg("schedule fire: vend secrets failed; skipping")
+				slog.Error("schedule fire: vend secrets failed; skipping", "error", err, "schedule", sch.ID)
 				return err
 			}
 		}
@@ -115,16 +115,15 @@ func makeDuplicacyFire(cfg Config, jobs *jobRegistry, repos *repoIndex, prepareE
 
 		j, err := jobs.start(ctx, cfg.DuplicacyBinary, repo, action, sch.Storage, inv, sch.ID, triggerKey, cleanup)
 		if err != nil {
-			log.Error().Err(err).Str("schedule", sch.ID).Msg("schedule fire failed to start job")
+			slog.Error("schedule fire failed to start job", "error", err, "schedule", sch.ID)
 			return err
 		}
-		log.Info().
-			Str("schedule", sch.ID).
-			Str("job", j.ID).
-			Str("action", sch.Action).
-			Str("repo", sch.RepoID).
-			Bool("missed_recovery", missedRecovery).
-			Msg("duplicacy schedule fired")
+		slog.Info("duplicacy schedule fired",
+			"schedule", sch.ID,
+			"job", j.ID,
+			"action", sch.Action,
+			"repo", sch.RepoID,
+			"missed_recovery", missedRecovery)
 		return nil
 	}
 }

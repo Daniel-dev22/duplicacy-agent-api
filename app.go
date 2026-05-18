@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"github.com/rs/zerolog/log"
 )
 
 // app holds wiring for all subsystems. Constructed once in main(), passed to handlers.
@@ -53,7 +53,7 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 	// blocked from starting just because we couldn't prep a file it'll
 	// never need.
 	if err := ensureKnownHostsSetup(cfg); err != nil {
-		log.Warn().Err(err).Msg("known_hosts setup failed (SFTP storages will fail until resolved)")
+		slog.Warn("known_hosts setup failed (SFTP storages will fail until resolved)", "error", err)
 	}
 
 	filters, err := newFilterCache(cfg, cc, repos)
@@ -107,7 +107,7 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 	// job event happened to land.
 	go func() {
 		if err := a.repos.scan(); err != nil {
-			log.Warn().Err(err).Msg("initial repo scan failed (will retry on first /repos call)")
+			slog.Warn("initial repo scan failed (will retry on first /repos call)", "error", err)
 		}
 		a.fleet.Trigger()
 	}()
@@ -138,7 +138,7 @@ func (a *app) startBackgroundWorkers(ctx context.Context) {
 	go a.fleet.Run(ctx)
 	go a.reconcileLoop(ctx)
 	a.trees.Start(ctx)
-	log.Info().Msg("background workers started")
+	slog.Info("background workers started")
 }
 
 // --- placeholder handlers; real implementations replace these in subsequent tasks ---

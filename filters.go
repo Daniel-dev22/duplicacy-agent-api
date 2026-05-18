@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,14 +15,13 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/rs/zerolog/log"
 )
 
 // FilterRule corresponds to one line in a `.duplicacy/filters` file:
 // "include" → "+pattern", "exclude" → "-pattern".
 type FilterRule struct {
 	Position int    `json:"position"`
-	Action   string `json:"action"`  // "include" | "exclude"
+	Action   string `json:"action"` // "include" | "exclude"
 	Pattern  string `json:"pattern"`
 }
 
@@ -57,11 +57,11 @@ type filterCache struct {
 	client *http.Client
 	repos  *repoIndex
 
-	mu              sync.RWMutex
-	sets            []FilterSet // org + site sets
-	lastFetched     time.Time
-	cachePath       string
-	perRepoDir      string
+	mu          sync.RWMutex
+	sets        []FilterSet // org + site sets
+	lastFetched time.Time
+	cachePath   string
+	perRepoDir  string
 }
 
 func newFilterCache(cfg Config, client *http.Client, repos *repoIndex) (*filterCache, error) {
@@ -77,7 +77,7 @@ func newFilterCache(cfg Config, client *http.Client, repos *repoIndex) (*filterC
 		perRepoDir: perRepoDir,
 	}
 	if err := fc.loadCache(); err != nil {
-		log.Warn().Err(err).Msg("filter cache load failed (starting empty)")
+		slog.Warn("filter cache load failed (starting empty)", "error", err)
 	}
 	return fc, nil
 }
@@ -98,7 +98,7 @@ func (f *filterCache) loadCache() error {
 	f.sets = c.Sets
 	f.lastFetched = c.LastFetchedAt
 	f.mu.Unlock()
-	log.Info().Int("sets", len(c.Sets)).Msg("loaded filter cache from disk")
+	slog.Info("loaded filter cache from disk", "sets", len(c.Sets))
 	return nil
 }
 
@@ -145,13 +145,13 @@ func (f *filterCache) pull(ctx context.Context) error {
 	f.lastFetched = time.Now().UTC()
 	f.mu.Unlock()
 	if err := f.saveCache(); err != nil {
-		log.Warn().Err(err).Msg("save filter cache failed")
+		slog.Warn("save filter cache failed", "error", err)
 	}
-	log.Info().Int("sets", len(body.Sets)).Msg("filter pull complete")
+	slog.Info("filter pull complete", "sets", len(body.Sets))
 
 	// Re-render every discovered repo's .duplicacy/filters since the global rules changed.
 	if err := f.renderAll(); err != nil {
-		log.Warn().Err(err).Msg("render-all after pull failed")
+		slog.Warn("render-all after pull failed", "error", err)
 	}
 	return nil
 }
@@ -170,7 +170,7 @@ func (f *filterCache) reconcileLoop(ctx context.Context, stop <-chan struct{}) {
 			return
 		case <-t.C:
 			if err := f.pull(ctx); err != nil {
-				log.Warn().Err(err).Msg("filter reconcile pull failed")
+				slog.Warn("filter reconcile pull failed", "error", err)
 			}
 		}
 	}
@@ -257,7 +257,7 @@ func (f *filterCache) computeMerged(repoID string) string {
 
 	pr, _, err := f.loadPerRepo(repoID)
 	if err != nil {
-		log.Warn().Err(err).Str("repo", repoID).Msg("load per-repo filters failed; rendering without")
+		slog.Warn("load per-repo filters failed; rendering without", "error", err, "repo", repoID)
 	} else if len(pr.Rules) > 0 {
 		b.WriteString("# === REPO: per-repo overrides ===\n")
 		writeRules(&b, pr.Rules)
@@ -301,7 +301,7 @@ func writeRules(b *strings.Builder, rules []FilterRule) {
 func (f *filterCache) renderAll() error {
 	for _, repo := range f.repos.list() {
 		if err := f.renderForRepo(repo); err != nil {
-			log.Warn().Err(err).Str("repo", repo.ID).Msg("render filters failed")
+			slog.Warn("render filters failed", "error", err, "repo", repo.ID)
 		}
 	}
 	return nil
@@ -321,10 +321,10 @@ func (a *app) handleGetFilters(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"repo_id":   repo.ID,
-		"exists":    exists,
-		"rules":     pr.Rules,
-		"updated":   pr.UpdatedAt,
+		"repo_id": repo.ID,
+		"exists":  exists,
+		"rules":   pr.Rules,
+		"updated": pr.UpdatedAt,
 	})
 }
 

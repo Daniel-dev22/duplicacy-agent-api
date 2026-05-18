@@ -72,21 +72,21 @@ type buildEnvResult struct {
 //
 //   - encryption_password         → DUPLICACY_PASSWORD              (or DUPLICACY_<ALIAS>_PASSWORD)
 //   - storage_type b2:
-//       backend.b2_id             → DUPLICACY_B2_ID                 (or DUPLICACY_<ALIAS>_B2_ID)
-//       backend.b2_key            → DUPLICACY_B2_KEY                (or DUPLICACY_<ALIAS>_B2_KEY)
+//     backend.b2_id             → DUPLICACY_B2_ID                 (or DUPLICACY_<ALIAS>_B2_ID)
+//     backend.b2_key            → DUPLICACY_B2_KEY                (or DUPLICACY_<ALIAS>_B2_KEY)
 //   - storage_type s3:
-//       backend.s3_id             → DUPLICACY_S3_ID
-//       backend.s3_secret         → DUPLICACY_S3_SECRET
-//       backend.s3_token          → DUPLICACY_S3_TOKEN              (optional)
+//     backend.s3_id             → DUPLICACY_S3_ID
+//     backend.s3_secret         → DUPLICACY_S3_SECRET
+//     backend.s3_token          → DUPLICACY_S3_TOKEN              (optional)
 //   - storage_type sftp:
-//       if backend.ssh_key set    → write to /dev/shm tmp + DUPLICACY_SSH_KEY_FILE
-//       backend.ssh_key_passphrase→ DUPLICACY_SSH_KEY_PASSPHRASE
-//       backend.ssh_password      → DUPLICACY_SSH_PASSWORD
+//     if backend.ssh_key set    → write to /dev/shm tmp + DUPLICACY_SSH_KEY_FILE
+//     backend.ssh_key_passphrase→ DUPLICACY_SSH_KEY_PASSPHRASE
+//     backend.ssh_password      → DUPLICACY_SSH_PASSWORD
 //   - storage_type gcs:
-//       backend.gcs_service_account_json → write to /dev/shm tmp + DUPLICACY_GCS_TOKEN_FILE
+//     backend.gcs_service_account_json → write to /dev/shm tmp + DUPLICACY_GCS_TOKEN_FILE
 //   - storage_type azure:
-//       backend.azure_account     → DUPLICACY_AZURE_ACCOUNT
-//       backend.azure_key         → DUPLICACY_AZURE_KEY
+//     backend.azure_account     → DUPLICACY_AZURE_ACCOUNT
+//     backend.azure_key         → DUPLICACY_AZURE_KEY
 //   - storage_type local:         no backend env — only the encryption password.
 //
 // RSA asymmetric encryption (orthogonal to storage_type — any backend can opt
@@ -287,8 +287,8 @@ func cleanupTmpfiles(paths []string) {
 const secretCacheTTL = 60 * time.Second
 
 type cachedSecret struct {
-	bundle    SecretsBundle
-	cachedAt  time.Time
+	bundle   SecretsBundle
+	cachedAt time.Time
 }
 
 type secretCache struct {

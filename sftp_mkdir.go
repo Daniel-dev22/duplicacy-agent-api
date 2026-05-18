@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
@@ -23,7 +24,6 @@ import (
 	"time"
 
 	"github.com/pkg/sftp"
-	"github.com/rs/zerolog/log"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -113,7 +113,7 @@ func ensureSFTPStorageDir(ctx context.Context, storageURL, keyFile, passphrase s
 		if !info.IsDir() {
 			return fmt.Errorf("remote path %s exists but is not a directory", remotePath)
 		}
-		log.Info().Str("host", host).Str("path", remotePath).Msg("sftp storage dir already exists; skipping mkdir")
+		slog.Info("sftp storage dir already exists; skipping mkdir", "host", host, "path", remotePath)
 		return nil
 	} else if !os.IsNotExist(err) {
 		// Some non-"missing" error — auth/permission/network. Surface it
@@ -125,6 +125,6 @@ func ensureSFTPStorageDir(ctx context.Context, storageURL, keyFile, passphrase s
 	if err := sftpClient.MkdirAll(remotePath); err != nil {
 		return fmt.Errorf("sftp MkdirAll %s: %w", remotePath, err)
 	}
-	log.Info().Str("host", host).Str("path", remotePath).Msg("created sftp storage dir")
+	slog.Info("created sftp storage dir", "host", host, "path", remotePath)
 	return nil
 }

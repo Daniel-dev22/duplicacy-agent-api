@@ -7,13 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/rs/zerolog/log"
 	_ "modernc.org/sqlite" // pure-Go sqlite driver, works with CGO_ENABLED=0
 )
 
@@ -121,7 +121,7 @@ func (e *eventBuffer) handleJobEvent(j *Job, evt JobEvent) {
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		log.Error().Err(err).Str("job", snap.ID).Msg("marshal event payload failed")
+		slog.Error("marshal event payload failed", "error", err, "job", snap.ID)
 		return
 	}
 
@@ -130,7 +130,7 @@ func (e *eventBuffer) handleJobEvent(j *Job, evt JobEvent) {
 		snap.ID, string(evt), body,
 	)
 	if err != nil {
-		log.Error().Err(err).Str("job", snap.ID).Msg("enqueue event failed; event lost")
+		slog.Error("enqueue event failed; event lost", "error", err, "job", snap.ID)
 		return
 	}
 	rowID, _ := res.LastInsertId()
@@ -159,7 +159,7 @@ func (e *eventBuffer) tryPush(rowID int64, jobID string, body []byte) {
 	defer resp.Body.Close()
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		if _, err := e.db.Exec(`DELETE FROM pending_events WHERE id = ?`, rowID); err != nil {
-			log.Warn().Err(err).Int64("row", rowID).Msg("failed to delete pushed event row")
+			slog.Warn("failed to delete pushed event row", "error", err, "row", rowID)
 		}
 		return
 	}
@@ -172,7 +172,7 @@ func (e *eventBuffer) recordFailure(rowID int64, msg string) {
 		`UPDATE pending_events SET attempts = attempts + 1, last_error = ? WHERE id = ?`,
 		msg, rowID,
 	); err != nil {
-		log.Warn().Err(err).Int64("row", rowID).Msg("failed to record push failure")
+		slog.Warn("failed to record push failure", "error", err, "row", rowID)
 	}
 }
 
@@ -205,7 +205,7 @@ func (e *eventBuffer) drainOnce(ctx context.Context) {
 	rows, err := e.db.QueryContext(ctx,
 		`SELECT id, job_id, payload FROM pending_events ORDER BY id ASC LIMIT 100`)
 	if err != nil {
-		log.Warn().Err(err).Msg("drain query failed")
+		slog.Warn("drain query failed", "error", err)
 		return
 	}
 	type pending struct {
@@ -217,7 +217,7 @@ func (e *eventBuffer) drainOnce(ctx context.Context) {
 	for rows.Next() {
 		var p pending
 		if err := rows.Scan(&p.id, &p.jobID, &p.payload); err != nil {
-			log.Warn().Err(err).Msg("scan failed")
+			slog.Warn("scan failed", "error", err)
 			continue
 		}
 		batch = append(batch, p)
@@ -243,7 +243,7 @@ func (e *eventBuffer) drainOnce(ctx context.Context) {
 		pushed++
 	}
 	if pushed > 0 {
-		log.Info().Int("pushed", pushed).Int("remaining", len(batch)-pushed).Msg("drained events")
+		slog.Info("drained events", "pushed", pushed, "remaining", len(batch)-pushed)
 	}
 }
 
@@ -268,7 +268,7 @@ func (e *eventBuffer) pushBlocking(ctx context.Context, rowID int64, jobID strin
 	defer resp.Body.Close()
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		if _, err := e.db.Exec(`DELETE FROM pending_events WHERE id = ?`, rowID); err != nil {
-			log.Warn().Err(err).Int64("row", rowID).Msg("failed to delete pushed event row")
+			slog.Warn("failed to delete pushed event row", "error", err, "row", rowID)
 		}
 		return true
 	}

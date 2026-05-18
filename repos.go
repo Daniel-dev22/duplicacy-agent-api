@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,7 +15,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/rs/zerolog/log"
 )
 
 // Storage describes one configured backup destination on a repo.
@@ -40,10 +40,10 @@ type Storage struct {
 // stored host paths). With mirrored mounts that match is trivial because the
 // paths are identical, but the field stays so older controllers don't break.
 type Repo struct {
-	ID            string    `json:"id"`   // stable hash of Path
-	Path          string    `json:"path"` // absolute path to repo root (host == container)
+	ID            string    `json:"id"`                  // stable hash of Path
+	Path          string    `json:"path"`                // absolute path to repo root (host == container)
 	HostPath      string    `json:"host_path,omitempty"` // always == Path on mirrored mounts
-	SnapshotID    string    `json:"snapshot_id"` // duplicacy snapshot id (typically same across storages)
+	SnapshotID    string    `json:"snapshot_id"`         // duplicacy snapshot id (typically same across storages)
 	Storages      []Storage `json:"storages"`
 	HasFilters    bool      `json:"has_filters"`
 	LastScannedAt time.Time `json:"last_scanned_at"`
@@ -162,7 +162,7 @@ func (r *repoIndex) scanLocked() error {
 		rootClean := filepath.Clean(root)
 		err := filepath.WalkDir(rootClean, func(path string, d os.DirEntry, walkErr error) error {
 			if walkErr != nil {
-				log.Warn().Err(walkErr).Str("path", path).Msg("walk error (skipping)")
+				slog.Warn("walk error (skipping)", "error", walkErr, "path", path)
 				return nil
 			}
 			depth := walkDepth(rootClean, path)
@@ -178,7 +178,7 @@ func (r *repoIndex) scanLocked() error {
 			repoRoot := filepath.Dir(path)
 			repo, err := r.loadRepo(repoRoot)
 			if err != nil {
-				log.Warn().Err(err).Str("repo", repoRoot).Msg("failed to load repo (skipping)")
+				slog.Warn("failed to load repo (skipping)", "error", err, "repo", repoRoot)
 				return filepath.SkipDir
 			}
 			found[repo.ID] = repo
@@ -194,7 +194,7 @@ func (r *repoIndex) scanLocked() error {
 	r.lastScanned = time.Now()
 	r.mu.Unlock()
 
-	log.Info().Int("count", len(found)).Msg("repo scan complete")
+	slog.Info("repo scan complete", "count", len(found))
 	return nil
 }
 

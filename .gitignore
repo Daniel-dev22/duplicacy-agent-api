@@ -1,4 +1,12 @@
-duplicacy-agent-api
-*.log
-*.tmp
-.DS_Store
+# Ansible-deploy runtime artifacts (root-owned, per-host secrets)
+bearer-token
+app
+docker-compose.yml
+docker-compose.yml.*~
+
+# Build output
+/build/
+
+# State
+state/
+known_hosts

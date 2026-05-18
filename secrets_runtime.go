@@ -17,9 +17,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
-
-	"github.com/rs/zerolog/log"
 )
 
 // prepareEnvForRepo gathers env vars + tmpfile cleanup for every storage of
@@ -33,9 +32,9 @@ import (
 //
 // Usage:
 //
-//   env, rsaPriv, cleanup, err := a.prepareEnvForRepo(ctx, repo)
-//   if err != nil { ... }
-//   defer cleanup()  // safe — cleanup is no-op on err
+//	env, rsaPriv, cleanup, err := a.prepareEnvForRepo(ctx, repo)
+//	if err != nil { ... }
+//	defer cleanup()  // safe — cleanup is no-op on err
 //
 // The cleanup closure unlinks all /dev/shm tmpfiles created for this run
 // (env materialised PEMs + RSA pub/priv PEMs).
@@ -90,7 +89,7 @@ func (a *app) prepareEnvForRepo(ctx context.Context, repo *Repo) ([]string, map[
 		if s.StorageType == "sftp" {
 			if host, ok := sftpHostFromURL(bundle.StorageURL); ok {
 				if err := ensureHostKey(a.cfg, host); err != nil {
-					log.Warn().Err(err).Str("host", host).Msg("ensure SFTP host key failed; duplicacy may reject the handshake")
+					slog.Warn("ensure SFTP host key failed; duplicacy may reject the handshake", "error", err, "host", host)
 				}
 			}
 		}
