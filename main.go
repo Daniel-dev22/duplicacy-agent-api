@@ -9,11 +9,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Daniel-dev22/agent-kit-go/logging"
 	"github.com/gin-gonic/gin"
 )
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	logging.Setup(os.Getenv("LOG_LEVEL"))
 
 	cfg := loadConfig()
 	slog.Info("duplicacy-agent-api starting",
