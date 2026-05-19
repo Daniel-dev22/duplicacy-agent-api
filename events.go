@@ -176,12 +176,17 @@ func (e *eventBuffer) recordFailure(rowID int64, msg string) {
 	}
 }
 
-// drainLoop runs every 30s, retrying any pending events oldest-first.
-// Started via app.startBackgroundWorkers.
-func (e *eventBuffer) drainLoop(ctx context.Context) {
-	e.wg.Add(1)
-	defer e.wg.Done()
+// Start runs the drain loop in a tracked goroutine. The previous pattern
+// (caller `go e.drainLoop(ctx)` + Add(1) inside the goroutine) raced with
+// e.wg.Wait(); wg.Go does the Add atomically before the goroutine is
+// scheduled, eliminating that race.
+func (e *eventBuffer) Start(ctx context.Context) {
+	e.wg.Go(func() { e.drainLoop(ctx) })
+}
 
+// drainLoop runs every 30s, retrying any pending events oldest-first.
+// Started via eventBuffer.Start.
+func (e *eventBuffer) drainLoop(ctx context.Context) {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
 

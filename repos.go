@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -9,7 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -231,7 +232,7 @@ func (r *repoIndex) loadRepo(repoRoot string) (*Repo, error) {
 		for k := range p.Keys {
 			keys = append(keys, k)
 		}
-		sort.Strings(keys)
+		slices.Sort(keys)
 		storages = append(storages, Storage{
 			Name:           p.Name,
 			URL:            p.StorageURL,
@@ -292,7 +293,7 @@ func (r *repoIndex) list() []*Repo {
 	for _, rp := range r.repos {
 		out = append(out, rp)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	slices.SortFunc(out, func(a, b *Repo) int { return cmp.Compare(a.Path, b.Path) })
 	return out
 }
 

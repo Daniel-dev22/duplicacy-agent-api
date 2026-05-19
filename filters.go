@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,7 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -235,11 +236,11 @@ func (f *filterCache) computeMerged(repoID string) string {
 	b.WriteString("\n")
 
 	// Sort sets so org first, then site, deterministic by name within each.
-	sort.SliceStable(sets, func(i, j int) bool {
-		if sets[i].Scope != sets[j].Scope {
-			return scopeOrder(sets[i].Scope) < scopeOrder(sets[j].Scope)
-		}
-		return sets[i].Name < sets[j].Name
+	slices.SortStableFunc(sets, func(a, b FilterSet) int {
+		return cmp.Or(
+			cmp.Compare(scopeOrder(a.Scope), scopeOrder(b.Scope)),
+			cmp.Compare(a.Name, b.Name),
+		)
 	})
 
 	for _, s := range sets {
@@ -285,7 +286,7 @@ func scopeValueDisplay(v string) string {
 
 func writeRules(b *strings.Builder, rules []FilterRule) {
 	sorted := append([]FilterRule(nil), rules...)
-	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Position < sorted[j].Position })
+	slices.SortStableFunc(sorted, func(a, b FilterRule) int { return cmp.Compare(a.Position, b.Position) })
 	for _, r := range sorted {
 		prefix := "-"
 		if r.Action == "include" {

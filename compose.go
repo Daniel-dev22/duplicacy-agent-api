@@ -1,11 +1,12 @@
 package main
 
 import (
+	"cmp"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -98,7 +99,7 @@ func (ci *composeIndex) scan() {
 		}
 	}
 
-	sort.Slice(found, func(i, j int) bool { return found[i].WorkingDir < found[j].WorkingDir })
+	slices.SortFunc(found, func(a, b ComposeProject) int { return cmp.Compare(a.WorkingDir, b.WorkingDir) })
 
 	ci.mu.Lock()
 	ci.projects = found

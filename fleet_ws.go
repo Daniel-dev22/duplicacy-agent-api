@@ -68,7 +68,7 @@ func newHostInfo() *HostInfo {
 type fleetSnapshot struct {
 	Host  *HostInfo `json:"host,omitempty"`
 	Repos []*Repo   `json:"repos"`
-	Jobs  []Job     `json:"jobs"`
+	Jobs  []jobPublic `json:"jobs"`
 }
 
 type fleetEvent struct {

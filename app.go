@@ -132,7 +132,7 @@ func (a *app) close() {
 }
 
 func (a *app) startBackgroundWorkers(ctx context.Context) {
-	go a.events.drainLoop(ctx)
+	a.events.Start(ctx)
 	a.scheduler.Start(ctx)
 	go a.filters.reconcileLoop(ctx, a.stop)
 	go a.fleet.Run(ctx)

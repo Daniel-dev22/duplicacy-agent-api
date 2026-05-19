@@ -86,8 +86,11 @@ type JobProgress struct {
 	Duration      string `json:"duration,omitempty"`       // verbatim "00:00:02"
 }
 
-// Job is one CLI invocation tracked through its lifecycle.
-type Job struct {
+// jobPublic carries the JSON-serializable fields of a Job. It is split out
+// from Job so snapshot() can return a lock-free copy — copying the Job value
+// directly would copy the sync.Mutex, which the vet copylocks analyzer
+// (rightly) flags as unsafe.
+type jobPublic struct {
 	ID          string       `json:"id"`
 	RepoID      string       `json:"repo_id"`
 	RepoPath    string       `json:"repo_path"`
@@ -105,8 +108,13 @@ type Job struct {
 	// Caller-set context for events
 	ScheduleID string `json:"schedule_id,omitempty"`
 	TriggerKey string `json:"trigger_key,omitempty"` // "manual" | "schedule" | "ui"
+}
 
-	// Internal
+// Job is one CLI invocation tracked through its lifecycle.
+type Job struct {
+	jobPublic
+
+	// Internal — never serialized, never copied.
 	mu          sync.Mutex
 	cancel      context.CancelFunc
 	ringBuffer  []string
@@ -114,15 +122,11 @@ type Job struct {
 	cleanup     func() // unlink tmpfs cred files after cmd.Wait() returns
 }
 
-// snapshot returns a goroutine-safe copy of the JSON-serializable fields.
-func (j *Job) snapshot() Job {
+// snapshot returns a lock-free copy of the JSON-serializable fields.
+func (j *Job) snapshot() jobPublic {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	out := *j
-	out.ringBuffer = nil
-	out.subscribers = nil
-	out.cancel = nil
-	return out
+	return j.jobPublic
 }
 
 func (j *Job) appendLine(line string) {
@@ -359,15 +363,17 @@ func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo
 	jobCtx, cancel := context.WithCancel(parentCtx)
 
 	j := &Job{
-		ID:          uuid.NewString(),
-		RepoID:      repo.ID,
-		RepoPath:    repo.Path,
-		Action:      action,
-		StorageName: storage,
-		Args:        inv.Args,
-		State:       JobPending,
-		ScheduleID:  scheduleID,
-		TriggerKey:  triggerKey,
+		jobPublic: jobPublic{
+			ID:          uuid.NewString(),
+			RepoID:      repo.ID,
+			RepoPath:    repo.Path,
+			Action:      action,
+			StorageName: storage,
+			Args:        inv.Args,
+			State:       JobPending,
+			ScheduleID:  scheduleID,
+			TriggerKey:  triggerKey,
+		},
 		cancel:      cancel,
 		subscribers: map[chan string]struct{}{},
 		cleanup:     cleanup,
@@ -523,10 +529,10 @@ func (r *jobRegistry) get(id string) (*Job, bool) {
 	return j, ok
 }
 
-func (r *jobRegistry) list() []Job {
+func (r *jobRegistry) list() []jobPublic {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := make([]Job, 0, len(r.jobs))
+	out := make([]jobPublic, 0, len(r.jobs))
 	for _, j := range r.jobs {
 		out = append(out, j.snapshot())
 	}

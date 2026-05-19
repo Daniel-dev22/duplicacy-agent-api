@@ -5,6 +5,10 @@
 # without baking the key into the image. Build invocation must pass
 # `--ssh default` (ansible playbook handles this).
 FROM golang:1.26-alpine AS builder
+# Target Intel Haswell+ / AMD Excavator+ for FMA/AVX2 wins. Override
+# with --build-arg GOAMD64=v1 for older CPUs. No-op for arm64 builds.
+ARG GOAMD64=v3
+ENV GOAMD64=${GOAMD64}
 WORKDIR /app
 RUN apk add --no-cache git openssh-client
 # Bypass the public proxy for our private GitHub org so go mod download
