@@ -83,6 +83,10 @@ type treeNode struct {
 	// FileCount is only set on "truncated" markers so the UI can show
 	// "<N> files (too many to list)" without sampling.
 	FileCount int `json:"file_count,omitempty"`
+	// Size is the recursive subtree byte total for a directory node, filled in
+	// from the dirSizeCache by annotateSizes at push time (NOT computed during
+	// the structural walk). Omitted when the gatherer hasn't sized this dir yet.
+	Size int64 `json:"size,omitempty"`
 }
 
 // -----------------------------------------------------------------------------
@@ -299,6 +303,26 @@ func (w *treeWalker) walkDir(containerDir string, mtime time.Time, depth int) []
 	return children
 }
 
+// annotateSizes walks an in-memory tree (depth-capped, small) and stamps each
+// directory node's Size from the dirSizeCache. Decoupled from the structural
+// walk so it stays correct even when walkDir serves a node from its mtime cache:
+// sizes are applied fresh on every push, picking up whatever the background
+// gatherer has filled in since. A pure map lookup per node — no I/O. Directories
+// the gatherer hasn't sized yet keep Size==0 (omitted by json:omitempty).
+func (w *treeWalker) annotateSizes(n *treeNode) {
+	if n == nil || w.app.sizes == nil {
+		return
+	}
+	if n.Type == "directory" {
+		if b, ok := w.app.sizes.Size(n.Path); ok {
+			n.Size = b
+		}
+	}
+	for _, c := range n.Children {
+		w.annotateSizes(c)
+	}
+}
+
 // toHost is intentionally removed. Mirrored mounts mean container path
 // equals host path; the walker emits paths as-is.
 
@@ -348,6 +372,7 @@ func (w *treeWalker) pushRepoTrees(ctx context.Context) error {
 		if root == nil {
 			continue
 		}
+		w.annotateSizes(root)
 		sourcePath := source
 		// Repo identity on the central side is the snapshot id (HostPath-derived
 		// resource), not the agent's short hash — match what the controller's
@@ -397,6 +422,7 @@ func (w *treeWalker) pushNodeTrees(ctx context.Context) error {
 		if root == nil {
 			continue
 		}
+		w.annotateSizes(root)
 		out = append(out, nodeTreeOut{
 			Node:     w.cfg.NodeName,
 			Site:     w.cfg.SiteID,

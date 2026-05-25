@@ -3,7 +3,9 @@ package main
 import (
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -43,6 +45,19 @@ type Config struct {
 	// container; operator may bind-mount this path read-write to a host dir
 	// to inspect restored files outside the container.
 	RestoreScratchRoot string
+
+	// --- Directory-size gatherer (tree_sizes.go) ---
+	// The gatherer is a self-paced background loop, fully decoupled from the
+	// 5-min tree push: it fills a persisted per-directory size cache "as it
+	// can", and the push only reads whatever sizes already exist (omitting the
+	// rest). See tree_sizes.go for the scheduler/cadence semantics.
+	TreeSizeEnabled            bool          // master switch
+	TreeSizeLargeFileThreshold int64         // subtree file count above which a dir uses the daily cadence
+	TreeSizeSlowWalk           time.Duration // last-walk duration above which a dir auto-demotes to daily
+	TreeSizeLargeRefresh       time.Duration // cadence for large/slow dirs (≈1×/day)
+	TreeSizeSmallRefresh       time.Duration // cadence for normal dirs (≈4×/day)
+	TreeSizeWalkTimeout        time.Duration // per-root walk ceiling (resumes progressively next cadence)
+	TreeSizeStepSleep          time.Duration // gentle pause per directory to avoid hammering slow disks
 }
 
 func loadConfig() Config {
@@ -69,6 +84,14 @@ func loadConfig() Config {
 		DuplicacyBinary:    getEnv("DUPLICACY_BINARY", "/usr/local/bin/duplicacy"),
 		BearerTokenFile:    getEnv("BEARER_TOKEN_FILE", "/etc/duplicacy-agent-api/bearer-token"),
 		RestoreScratchRoot: getEnv("RESTORE_SCRATCH_ROOT", "/tmp/duplicacy-restore"),
+
+		TreeSizeEnabled:            getEnvBool("TREE_SIZE_ENABLED", true),
+		TreeSizeLargeFileThreshold: int64(getEnvInt("TREE_SIZE_LARGE_FILE_THRESHOLD", 50000)),
+		TreeSizeSlowWalk:           getEnvDuration("TREE_SIZE_SLOW_WALK", 30*time.Second),
+		TreeSizeLargeRefresh:       getEnvDuration("TREE_SIZE_LARGE_REFRESH", 24*time.Hour),
+		TreeSizeSmallRefresh:       getEnvDuration("TREE_SIZE_SMALL_REFRESH", 6*time.Hour),
+		TreeSizeWalkTimeout:        getEnvDuration("TREE_SIZE_WALK_TIMEOUT", 30*time.Minute),
+		TreeSizeStepSleep:          getEnvDuration("TREE_SIZE_STEP_SLEEP", 2*time.Millisecond),
 	}
 	// Load bearer token from file once at startup. Missing/empty token is
 	// fatal — without it the controller will reject every credential vend.
@@ -118,6 +141,45 @@ func getEnv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func getEnvInt(k string, def int) int {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		slog.Warn("invalid int env var, using default", "var", k, "value", v, "default", def)
+		return def
+	}
+	return n
+}
+
+func getEnvBool(k string, def bool) bool {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		slog.Warn("invalid bool env var, using default", "var", k, "value", v, "default", def)
+		return def
+	}
+	return b
+}
+
+func getEnvDuration(k string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		slog.Warn("invalid duration env var, using default", "var", k, "value", v, "default", def)
+		return def
+	}
+	return d
 }
 
 func splitCSV(s string) []string {
