@@ -20,7 +20,9 @@ package main
 //   8. Return success/failure + last lines of stderr
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -161,22 +163,61 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 		}
 	}
 
-	// Run init for the primary.
+	// Run init for the primary. duplicacy init refuses ("has already been
+	// initialized") when .duplicacy/preferences already exists — which happens
+	// on a re-register, or when the self-init sweep races the first init. Rather
+	// than fail, adopt the existing repo IF its on-disk preferences match the
+	// requested storages; if a different repo lives here (e.g. a Duplicacy Web
+	// repo) we refuse rather than hijack it.
 	primaryStaged := stagedFor(staged, primary.StorageAlias)
 	initInv := invocationForInit(req.RepoPath, req.RepoID, primary.StorageURL, true /*encrypted*/, primaryStaged.rsaPubPath)
 	initInv.EnvAdds = append(initInv.EnvAdds, primaryStaged.env...)
+	adopt := false
 	if out, err := runSync(ctx, a.cfg.DuplicacyBinary, initInv, 4*time.Minute); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error":  "duplicacy init failed: " + err.Error(),
-			"output": tailString(string(out), 4096),
-		})
-		return
+		if !isAlreadyInitialized(out) {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":  "duplicacy init failed: " + err.Error(),
+				"output": tailString(string(out), 4096),
+			})
+			return
+		}
+		adopt = true
 	}
 
-	// Run add for each secondary, in caller-supplied order.
+	// When adopting, load existing preferences to verify the primary matches and
+	// to skip secondaries that are already present.
+	var existing map[string]string // storage_alias -> storage URL
+	if adopt {
+		var perr error
+		existing, perr = readPreferenceURLs(req.RepoPath)
+		if perr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "read existing preferences: " + perr.Error()})
+			return
+		}
+		if got := existing[primary.StorageAlias]; got != primary.StorageURL {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": fmt.Sprintf("repo at %s is already initialized with a different primary storage (have %q, want %q) — refusing to adopt", req.RepoPath, got, primary.StorageURL),
+			})
+			return
+		}
+	}
+
+	// Run add for each secondary, in caller-supplied order. When adopting, skip
+	// any storage already present with a matching URL; conflict on a mismatch.
 	for _, s := range staged {
 		if s.req.IsPrimary {
 			continue
+		}
+		if adopt {
+			if got, ok := existing[s.req.StorageAlias]; ok {
+				if got != s.req.StorageURL {
+					c.JSON(http.StatusConflict, gin.H{
+						"error": fmt.Sprintf("storage %q already initialized with a different URL (have %q, want %q)", s.req.StorageAlias, got, s.req.StorageURL),
+					})
+					return
+				}
+				continue // already configured with the same URL — idempotent skip
+			}
 		}
 		addInv := invocationForAdd(req.RepoPath, s.req.StorageAlias, req.RepoID, s.req.StorageURL, true, s.rsaPubPath)
 		// duplicacy add reads env vars for BOTH the primary (so it can re-init
@@ -210,20 +251,60 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 		slog.Error("persist repo mapping failed", "error", err, "repo", req.RepoPath)
 	}
 
-	// Refresh the in-memory repo index so /repos returns the new repo.
-	// ScanForce bypasses the TTL cache — the just-created repo must be visible
-	// on the very next /repos poll.
-	if err := a.repos.ScanForce(); err != nil {
-		slog.Warn("post-init repo scan failed", "error", err)
-	}
-	// Push the new state to any connected fleet WS subscribers.
-	a.fleet.Trigger()
+	// Refresh the in-memory repo index in the BACKGROUND, then notify fleet WS
+	// subscribers. A full ScanForce walks all of BACKUP_ROOTS, which on a large
+	// host (e.g. a NAS with BACKUP_ROOTS=/mnt) can take minutes — running it
+	// inline made init time out and falsely report 'failed' even though
+	// preferences+mapping were already persisted. Detach it from the request.
+	a.rescanAsync()
 
+	status := "initialized"
+	if adopt {
+		status = "adopted"
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"status":    "initialized",
+		"status":    status,
 		"repo_path": req.RepoPath,
 		"repo_id":   req.RepoID,
 	})
+}
+
+// rescanAsync refreshes the repo index off the request path and notifies fleet
+// WS subscribers. Mutating handlers (init/bind/delete) use this so a slow
+// full-filesystem scan can't make the operation time out after its real work
+// (preferences + mapping) is already durably persisted.
+func (a *app) rescanAsync() {
+	go func() {
+		if err := a.repos.ScanForce(); err != nil {
+			slog.Warn("background repo rescan failed", "error", err)
+		}
+		a.fleet.Trigger()
+	}()
+}
+
+// isAlreadyInitialized reports whether `duplicacy init` failed only because the
+// directory already has a .duplicacy/preferences file.
+func isAlreadyInitialized(out []byte) bool {
+	return bytes.Contains(out, []byte("has already been initialized"))
+}
+
+// readPreferenceURLs parses <repo>/.duplicacy/preferences into a
+// storage_alias -> storage URL map, used to safely adopt an already-initialized
+// repo (verify it matches the requested storages before binding to it).
+func readPreferenceURLs(repoPath string) (map[string]string, error) {
+	data, err := os.ReadFile(filepath.Join(repoPath, ".duplicacy", "preferences"))
+	if err != nil {
+		return nil, err
+	}
+	var raws []rawPreference
+	if err := json.Unmarshal(data, &raws); err != nil {
+		return nil, fmt.Errorf("parse preferences: %w", err)
+	}
+	m := make(map[string]string, len(raws))
+	for _, p := range raws {
+		m[p.Name] = p.StorageURL
+	}
+	return m, nil
 }
 
 func (a *app) validateInitReq(req *initRepoReq) error {
@@ -425,6 +506,27 @@ func (a *app) handleBindRepo(c *gin.Context) {
 		return
 	}
 
+	// Safety: only bind if the on-disk preferences match the requested storages.
+	// Binding maps the central UUID to whatever repo is on disk; if a DIFFERENT
+	// repo lives here (different storage URL for an alias), mapping it would make
+	// the controller vend credentials for storages that aren't actually here.
+	existing, perr := readPreferenceURLs(req.RepoPath)
+	if perr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read existing preferences: " + perr.Error()})
+		return
+	}
+	for _, s := range req.Storages {
+		got, ok := existing[s.StorageAlias]
+		if !ok {
+			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("storage %q is not in the on-disk preferences at %s — refusing to bind", s.StorageAlias, req.RepoPath)})
+			return
+		}
+		if got != s.StorageURL {
+			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("storage %q on disk has a different URL (have %q, want %q) — refusing to bind", s.StorageAlias, got, s.StorageURL)})
+			return
+		}
+	}
+
 	// Persist mapping. Same shape as /repos/init.
 	mapping := RepoMapping{
 		RepoPath:     req.RepoPath,
@@ -445,12 +547,9 @@ func (a *app) handleBindRepo(c *gin.Context) {
 		a.secrets.invalidate(s.CredentialID)
 	}
 
-	// Force a repo rescan so /repos picks up the now-bound state, and notify
-	// any WS subscribers.
-	if err := a.repos.ScanForce(); err != nil {
-		slog.Warn("post-bind repo scan failed", "error", err)
-	}
-	a.fleet.Trigger()
+	// Refresh the repo index in the background (a full scan can take minutes on
+	// large hosts; don't block the bind response on it) and notify WS subscribers.
+	a.rescanAsync()
 
 	c.JSON(http.StatusOK, gin.H{
 		"status":    "bound",

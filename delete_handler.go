@@ -142,10 +142,9 @@ func (a *app) handleDeleteRepo(c *gin.Context) {
 	if err := a.mapping.delete(clean); err != nil {
 		slog.Warn("mapping delete (literal) failed (non-fatal)", "error", err, "repo", clean)
 	}
-	if err := a.repos.ScanForce(); err != nil {
-		slog.Warn("post-delete repo scan failed", "error", err)
-	}
-	a.fleet.Trigger()
+	// Background rescan (a full scan can take minutes on large hosts; don't block
+	// the delete response) + notify WS subscribers.
+	a.rescanAsync()
 
 	slog.Info("repo deleted on-disk", "repo", clean, "resolved_via", resolvedVia, "wiped", wiped)
 	c.JSON(http.StatusOK, deleteRepoResp{
