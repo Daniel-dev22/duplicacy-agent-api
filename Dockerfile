@@ -27,11 +27,25 @@ FROM alpine:3.21
 ARG DUPLICACY_VERSION=3.2.5
 ARG TARGETARCH=amd64
 RUN apk add --no-cache ca-certificates curl tzdata
-RUN ARCH=$(case "$TARGETARCH" in amd64) echo "x64";; arm64) echo "arm64";; *) echo "x64";; esac) && \
+# Fetch the duplicacy CLI for the TARGET arch and HARD-ASSERT the ELF arch
+# matches. buildx's registry buildcache previously served a stale amd64
+# duplicacy layer into the arm64 image — the old `duplicacy | head -1` check
+# ran fine under qemu at build time but the binary exec-format-errored on real
+# arm64 Pis. We now read the ELF e_machine byte (no exec, so qemu can't mask a
+# mismatch) and fail the build on any mismatch; the new RUN text also
+# invalidates the poisoned cache layer. e_machine: x86-64=0x3e, aarch64=0xb7.
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) DARCH=x64;   EXPECT=3e ;; \
+      arm64) DARCH=arm64; EXPECT=b7 ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH"; exit 1 ;; \
+    esac; \
     curl -fsSL -o /usr/local/bin/duplicacy \
-      "https://github.com/gilbertchen/duplicacy/releases/download/v${DUPLICACY_VERSION}/duplicacy_linux_${ARCH}_${DUPLICACY_VERSION}" && \
-    chmod +x /usr/local/bin/duplicacy && \
-    /usr/local/bin/duplicacy | head -1
+      "https://github.com/gilbertchen/duplicacy/releases/download/v${DUPLICACY_VERSION}/duplicacy_linux_${DARCH}_${DUPLICACY_VERSION}"; \
+    chmod +x /usr/local/bin/duplicacy; \
+    GOT=$(dd if=/usr/local/bin/duplicacy bs=1 skip=18 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n'); \
+    echo "duplicacy ELF e_machine=0x${GOT} expect=0x${EXPECT} (TARGETARCH=${TARGETARCH}, DARCH=${DARCH})"; \
+    [ "$GOT" = "$EXPECT" ] || { echo "FATAL: duplicacy CLI arch mismatch for ${TARGETARCH}"; exit 1; }
 COPY --from=builder /app/duplicacy-agent-api /usr/local/bin/duplicacy-agent-api
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
