@@ -58,6 +58,11 @@ type Config struct {
 	TreeSizeSmallRefresh       time.Duration // cadence for normal dirs (≈4×/day)
 	TreeSizeWalkTimeout        time.Duration // per-root walk ceiling (resumes progressively next cadence)
 	TreeSizeStepSleep          time.Duration // gentle pause per directory to avoid hammering slow disks
+	// TreeSizeExcludePaths are path prefixes the size gatherer skips entirely.
+	// Size-only: these still appear in the tree picker and are still backed up;
+	// they're just not walked for a recursive size. Use for large/churny mounts
+	// where sizing is wasteful — e.g. /var/lib/rancher/k3s on k3s nodes.
+	TreeSizeExcludePaths []string
 }
 
 func loadConfig() Config {
@@ -92,6 +97,7 @@ func loadConfig() Config {
 		TreeSizeSmallRefresh:       getEnvDuration("TREE_SIZE_SMALL_REFRESH", 6*time.Hour),
 		TreeSizeWalkTimeout:        getEnvDuration("TREE_SIZE_WALK_TIMEOUT", 30*time.Minute),
 		TreeSizeStepSleep:          getEnvDuration("TREE_SIZE_STEP_SLEEP", 2*time.Millisecond),
+		TreeSizeExcludePaths:       splitCSV(getEnv("TREE_SIZE_EXCLUDE_PATHS", "")),
 	}
 	// Load bearer token from file once at startup. Missing/empty token is
 	// fatal — without it the controller will reject every credential vend.

@@ -99,6 +99,25 @@ func (c *dirSizeCache) put(path string, e dirSize) {
 	c.mu.Unlock()
 }
 
+// prune removes cache entries at or under any of the given path prefixes.
+// Returns the count removed. Used to drop size-excluded mounts left over in the
+// cache from before they were excluded (e.g. /var/lib/rancher/k3s).
+func (c *dirSizeCache) prune(excludes []string) int {
+	if len(excludes) == 0 {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var n int
+	for p := range c.m {
+		if pathUnderAny(p, excludes) {
+			delete(c.m, p)
+			n++
+		}
+	}
+	return n
+}
+
 // load reads the on-disk cache. Missing/empty/corrupt file is non-fatal — we
 // just start cold and the gatherer refills it (a corrupt cache is never worse
 // than no cache here, unlike repos.json which is authoritative).
@@ -188,6 +207,9 @@ func (g *sizeGatherer) roots() []string {
 		if _, ok := seen[r]; ok {
 			continue
 		}
+		if pathUnderAny(r, g.cfg.TreeSizeExcludePaths) {
+			continue // size-excluded mount (e.g. /var/lib/rancher/k3s)
+		}
 		seen[r] = struct{}{}
 		out = append(out, r)
 	}
@@ -219,12 +241,21 @@ func (g *sizeGatherer) Start(ctx context.Context) {
 		return
 	}
 	g.cache.load()
+	// Drop any cached entries for now-excluded mounts (e.g. k3s sized before the
+	// exclude was added) so the picker stops showing their stale sizes.
+	if pruned := g.cache.prune(g.cfg.TreeSizeExcludePaths); pruned > 0 {
+		slog.Info("dir size cache: pruned size-excluded entries", "count", pruned, "excludes", g.cfg.TreeSizeExcludePaths)
+		if err := g.cache.save(); err != nil {
+			slog.Warn("dir size cache save after prune failed", "error", err)
+		}
+	}
 	go g.loop(ctx)
 }
 
 func (g *sizeGatherer) loop(ctx context.Context) {
 	slog.Info("dir size gatherer started",
-		"roots", g.cfg.BackupRoots,
+		"roots", g.roots(),
+		"exclude_paths", g.cfg.TreeSizeExcludePaths,
 		"small_refresh", g.cfg.TreeSizeSmallRefresh,
 		"large_refresh", g.cfg.TreeSizeLargeRefresh,
 		"large_file_threshold", g.cfg.TreeSizeLargeFileThreshold)
@@ -353,7 +384,7 @@ func (g *sizeGatherer) walk(ctx context.Context, dir string) (int64, int64, erro
 			continue // never follow symlinks (cycles / double-walks), like the tree walk
 		}
 		child := filepath.Join(dir, name)
-		if isDuplicacyWebCache(child) || pathUnderAny(child, g.cfg.BackupExcludePaths) {
+		if isDuplicacyWebCache(child) || pathUnderAny(child, g.cfg.BackupExcludePaths) || pathUnderAny(child, g.cfg.TreeSizeExcludePaths) {
 			continue
 		}
 		if e.IsDir() {

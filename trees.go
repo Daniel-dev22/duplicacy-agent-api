@@ -231,7 +231,7 @@ func (w *treeWalker) walkDir(containerDir string, mtime time.Time, depth int) []
 	}
 
 	dirs := make([]*treeNode, 0, len(entries))
-	files := make([]*treeNode, 0, len(entries))
+	fileEntries := make([]fs.DirEntry, 0, len(entries))
 
 	for _, e := range entries {
 		name := e.Name()
@@ -268,11 +268,9 @@ func (w *treeWalker) walkDir(containerDir string, mtime time.Time, depth int) []
 				Children: w.walkDir(childPath, info.ModTime(), depth+1),
 			})
 		} else if typ.IsRegular() {
-			files = append(files, &treeNode{
-				Name: name,
-				Path: childPath,
-				Type: "file",
-			})
+			// Defer the size stat until after the file cap is known so a
+			// truncated directory stats nothing.
+			fileEntries = append(fileEntries, e)
 		}
 		// Anything else (devices, sockets, pipes) is silently dropped.
 	}
@@ -281,19 +279,33 @@ func (w *treeWalker) walkDir(containerDir string, mtime time.Time, depth int) []
 	// so the UI can show "N files (too many to list)" rather than imply
 	// sampling. Subdirectory walks are unaffected.
 	var children []*treeNode
-	if len(files) > treeMaxFilesPerDir {
+	if len(fileEntries) > treeMaxFilesPerDir {
 		children = make([]*treeNode, 0, len(dirs)+1)
 		children = append(children, dirs...)
 		children = append(children, &treeNode{
-			Name:      fmt.Sprintf("%d files (too many to list)", len(files)),
+			Name:      fmt.Sprintf("%d files (too many to list)", len(fileEntries)),
 			Path:      containerDir,
 			Type:      "truncated",
-			FileCount: len(files),
+			FileCount: len(fileEntries),
 		})
 	} else {
-		children = make([]*treeNode, 0, len(dirs)+len(files))
+		children = make([]*treeNode, 0, len(dirs)+len(fileEntries))
 		children = append(children, dirs...)
-		children = append(children, files...)
+		// Per-file size: one Lstat per file, ONLY in the non-truncated branch,
+		// so this adds at most treeMaxFilesPerDir stats per directory and is
+		// memoised by the mtime cache exactly like the rest of the subtree.
+		for _, fe := range fileEntries {
+			var size int64
+			if info, err := fe.Info(); err == nil {
+				size = info.Size()
+			}
+			children = append(children, &treeNode{
+				Name: fe.Name(),
+				Path: filepath.Join(containerDir, fe.Name()),
+				Type: "file",
+				Size: size,
+			})
+		}
 	}
 
 	w.mu.Lock()

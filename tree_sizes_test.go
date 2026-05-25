@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -180,6 +181,118 @@ func TestDirSizeCachePersistRoundTrip(t *testing.T) {
 		if got.Bytes != want.Bytes || got.FileCount != want.FileCount || !got.ComputedAt.Equal(want.ComputedAt) {
 			t.Errorf("%s round-trip mismatch: got %+v want %+v", p, got, want)
 		}
+	}
+}
+
+func TestSizeGathererExcludePaths(t *testing.T) {
+	dir := t.TempDir()
+	keep := filepath.Join(dir, "keep")
+	excl := filepath.Join(dir, "excluded")
+	if err := os.MkdirAll(filepath.Join(keep, "k"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(excl, "e"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeFileN(t, filepath.Join(keep, "kf"), 10)
+	writeFileN(t, filepath.Join(excl, "ef"), 999) // must be excluded from the sum
+
+	cfg := testSizeConfig(dir)
+	cfg.BackupRoots = []string{keep, excl}
+	cfg.TreeSizeExcludePaths = []string{excl}
+	cache := newDirSizeCache(dir)
+	g := newSizeGatherer(cfg, cache, nil)
+
+	// roots() drops the excluded backup root entirely.
+	roots := g.roots()
+	if len(roots) != 1 || roots[0] != keep {
+		t.Fatalf("roots() = %v, want [%s]", roots, keep)
+	}
+
+	// Walking the parent must skip the excluded subtree (size + count).
+	b, c, err := g.walk(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b != 10 || c != 1 {
+		t.Errorf("walk = (%d bytes, %d files), want (10,1) — excluded subtree must be skipped", b, c)
+	}
+	if _, ok := cache.get(excl); ok {
+		t.Error("excluded path should not be cached")
+	}
+}
+
+func TestDirSizeCachePrune(t *testing.T) {
+	c := newDirSizeCache(t.TempDir())
+	c.put("/keep/a", dirSize{Bytes: 1})
+	c.put("/var/lib/rancher/k3s", dirSize{Bytes: 2})
+	c.put("/var/lib/rancher/k3s/agent/x", dirSize{Bytes: 3})
+
+	if n := c.prune([]string{"/var/lib/rancher/k3s"}); n != 2 {
+		t.Errorf("prune removed %d, want 2", n)
+	}
+	if _, ok := c.get("/keep/a"); !ok {
+		t.Error("/keep/a should remain")
+	}
+	if _, ok := c.get("/var/lib/rancher/k3s"); ok {
+		t.Error("k3s root should be pruned")
+	}
+	if _, ok := c.get("/var/lib/rancher/k3s/agent/x"); ok {
+		t.Error("k3s child should be pruned")
+	}
+	if n := c.prune(nil); n != 0 {
+		t.Errorf("prune(nil) = %d, want 0", n)
+	}
+}
+
+func TestWalkDirFileSizes(t *testing.T) {
+	dir := t.TempDir()
+	writeFileN(t, filepath.Join(dir, "a.txt"), 10)
+	writeFileN(t, filepath.Join(dir, "b.bin"), 250)
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	w := newTreeWalker(Config{}, nil, nil)
+	st, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	children := w.walkDir(dir, st.ModTime(), 0)
+
+	got := map[string]*treeNode{}
+	for _, c := range children {
+		got[c.Name] = c
+	}
+	if got["a.txt"] == nil || got["a.txt"].Size != 10 {
+		t.Errorf("a.txt size = %v, want 10", got["a.txt"])
+	}
+	if got["b.bin"] == nil || got["b.bin"].Size != 250 {
+		t.Errorf("b.bin size = %v, want 250", got["b.bin"])
+	}
+	// Directory nodes get Size from annotateSizes (the gatherer cache), NOT from
+	// walkDir — so the structural walk leaves dir Size at 0.
+	if got["sub"] == nil || got["sub"].Type != "directory" || got["sub"].Size != 0 {
+		t.Errorf("sub dir from walkDir = %v, want directory with Size 0", got["sub"])
+	}
+}
+
+func TestWalkDirTruncatedSkipsFileStats(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < treeMaxFilesPerDir+5; i++ {
+		writeFileN(t, filepath.Join(dir, fmt.Sprintf("f%04d", i)), 1)
+	}
+	w := newTreeWalker(Config{}, nil, nil)
+	st, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	children := w.walkDir(dir, st.ModTime(), 0)
+	if len(children) != 1 || children[0].Type != "truncated" {
+		t.Fatalf("want single truncated marker, got %d children", len(children))
+	}
+	if children[0].FileCount != treeMaxFilesPerDir+5 {
+		t.Errorf("truncated FileCount = %d, want %d", children[0].FileCount, treeMaxFilesPerDir+5)
 	}
 }
 
