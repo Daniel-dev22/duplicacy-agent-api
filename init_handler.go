@@ -79,6 +79,13 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("storages[%d].storage_url: %v", i, err)})
 			return
 		}
+		// Authoritative region guard: the URL is now fully expanded, so an empty
+		// S3 region with a custom endpoint here would make duplicacy fail with a
+		// cryptic "MissingRegion". Fail loud before any side effects instead.
+		if s3URLMissingRegion(req.Storages[i].StorageType, expanded) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("storages[%d].storage_url: %s", i, errMissingS3Region)})
+			return
+		}
 		req.Storages[i].StorageURL = expanded
 	}
 
@@ -396,6 +403,13 @@ func (a *app) handleBindRepo(c *gin.Context) {
 		expanded, err := expandStorageURL(req.Storages[i].StorageURL, tctx, req.Storages[i].ServerOverride)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("storages[%d].storage_url: %v", i, err)})
+			return
+		}
+		// Authoritative region guard: the URL is now fully expanded, so an empty
+		// S3 region with a custom endpoint here would make duplicacy fail with a
+		// cryptic "MissingRegion". Fail loud before any side effects instead.
+		if s3URLMissingRegion(req.Storages[i].StorageType, expanded) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("storages[%d].storage_url: %s", i, errMissingS3Region)})
 			return
 		}
 		req.Storages[i].StorageURL = expanded
