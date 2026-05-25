@@ -23,6 +23,8 @@ type app struct {
 	compose             *composeIndex     // bounded scan of mounted COMPOSE_SCAN_ROOTS for compose project dirs
 	fleet               *fleetHub         // /ws/fleet broadcaster — pushes snapshot on init / job state change
 	trees               *treeWalker       // 5-min push of repo + node filesystem trees to controller
+	sizes               *dirSizeCache     // persisted per-directory subtree byte totals (read by the tree push)
+	sizeGatherer        *sizeGatherer     // self-paced background loop that fills `sizes`
 	stop                chan struct{}     // closed in close(); subsystems range on it for shutdown
 }
 
@@ -93,6 +95,12 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 
 	a.trees = newTreeWalker(cfg, repos, a)
 
+	// Per-directory size cache + its self-paced background gatherer. The cache
+	// is read by the tree push (annotateSizes); the gatherer fills it on its own
+	// cadence, fully decoupled from the 5-min push. See tree_sizes.go.
+	a.sizes = newDirSizeCache(cfg.ConfigDir)
+	a.sizeGatherer = newSizeGatherer(cfg, a.sizes, a)
+
 	// Best-effort initial repo scan so /repos returns something on first call.
 	// Run asynchronously so it doesn't block newApp returning — otherwise
 	// startup is gated on walking every backup root (on pi-class hosts with
@@ -138,6 +146,7 @@ func (a *app) startBackgroundWorkers(ctx context.Context) {
 	go a.fleet.Run(ctx)
 	go a.reconcileLoop(ctx)
 	a.trees.Start(ctx)
+	a.sizeGatherer.Start(ctx)
 	slog.Info("background workers started")
 }
 
