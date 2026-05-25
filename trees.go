@@ -244,6 +244,13 @@ func (w *treeWalker) walkDir(containerDir string, mtime time.Time, depth int) []
 
 		childPath := filepath.Join(containerDir, name)
 
+		// Skip the Duplicacy Web cache tree and operator-excluded prefixes —
+		// the same rules the repo scanner applies (repos.go), so the tree push
+		// never surfaces duplicacy-web app machinery either.
+		if isDuplicacyWebCache(childPath) || pathUnderAny(childPath, w.cfg.BackupExcludePaths) {
+			continue
+		}
+
 		if e.IsDir() {
 			// Lstat for mtime — one extra syscall but lets the cache work.
 			info, err := e.Info()

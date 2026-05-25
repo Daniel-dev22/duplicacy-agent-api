@@ -92,6 +92,11 @@ type repoIndex struct {
 	// preferences-load time — no other code path consults it.
 	legacyBackuprootMap map[string]string
 
+	// excludePaths are operator-configured path prefixes the scan skips
+	// entirely (from BACKUP_EXCLUDE_PATHS). The duplicacy-web cache layout is
+	// excluded automatically via isDuplicacyWebCache regardless of this list.
+	excludePaths []string
+
 	mu          sync.RWMutex
 	repos       map[string]*Repo // keyed by Repo.ID
 	lastScanned time.Time
@@ -99,11 +104,12 @@ type repoIndex struct {
 
 const repoScanTTL = 30 * time.Second
 
-func newRepoIndex(roots []string, binary string, legacyBackuprootMap map[string]string) *repoIndex {
+func newRepoIndex(roots []string, binary string, legacyBackuprootMap map[string]string, excludePaths []string) *repoIndex {
 	return &repoIndex{
 		roots:               roots,
 		binary:              binary,
 		legacyBackuprootMap: legacyBackuprootMap,
+		excludePaths:        excludePaths,
 		repos:               map[string]*Repo{},
 	}
 }
@@ -148,12 +154,18 @@ func (r *repoIndex) scan() error {
 func (r *repoIndex) ScanForce() error { return r.scanLocked() }
 
 // scanLocked walks each backup root looking for .duplicacy/preferences files.
-// maxDepth=8 covers both shallow init'd repos and duplicacy-web migrated
-// layouts where preferences lives at .../duplicacy/cache/localhost/N/.duplicacy/
-// (depth 5 under /backuproot/pathN). We SkipDir once .duplicacy is found, so
-// the cap only bounds the wasted walk in dirs that contain no repo at all
-// (most of /var/lib/rancher/k3s, big media trees, etc.) — keeping it generous
-// here costs little because excludeBasenames already prunes the noisy ones.
+// maxDepth=8 bounds the wasted walk in deep trees that contain no repo at all
+// (most of /var/lib/rancher/k3s, big media trees, etc.); we SkipDir as soon as
+// a .duplicacy is found so real repos at any reachable depth still register.
+//
+// Exclusions (the pruning the old comment claimed but never actually applied):
+//   - excludeBasenames (shared with trees.go) — .git, node_modules, caches, …
+//   - r.excludePaths — operator-configured prefixes (BACKUP_EXCLUDE_PATHS)
+//   - isDuplicacyWebCache — Duplicacy Web Edition's working/cache tree
+//     (…/cache/localhost/N/.duplicacy). Those carry a preferences file but are
+//     NOT user-managed repos: duplicacy-web regenerates them continuously, so
+//     surfacing them produced undeletable "phantom" repos (a delete just gets
+//     recreated). We skip the whole subtree so they never appear.
 func (r *repoIndex) scanLocked() error {
 	const maxDepth = 8
 
@@ -173,7 +185,17 @@ func (r *repoIndex) scanLocked() error {
 				}
 				return nil
 			}
-			if !d.IsDir() || d.Name() != ".duplicacy" {
+			if !d.IsDir() {
+				return nil
+			}
+			// Prune excluded directories before treating them — or anything
+			// beneath them — as repos. This catches both the duplicacy-web
+			// cache tree and operator-excluded prefixes (and the .duplicacy
+			// inside them, since its path inherits the excluded ancestor).
+			if r.shouldSkipDir(path, d.Name()) {
+				return filepath.SkipDir
+			}
+			if d.Name() != ".duplicacy" {
 				return nil
 			}
 			repoRoot := filepath.Dir(path)
@@ -197,6 +219,39 @@ func (r *repoIndex) scanLocked() error {
 
 	slog.Info("repo scan complete", "count", len(found))
 	return nil
+}
+
+// shouldSkipDir reports whether the walker must skip (not descend into, and not
+// treat as a repo) the directory at path with basename name.
+func (r *repoIndex) shouldSkipDir(path, name string) bool {
+	if _, ok := excludeBasenames[name]; ok {
+		return true
+	}
+	if isDuplicacyWebCache(path) {
+		return true
+	}
+	return pathUnderAny(path, r.excludePaths)
+}
+
+// isDuplicacyWebCache reports whether path is inside Duplicacy Web Edition's
+// working/cache tree (…/cache/localhost/…). Those dirs hold a
+// .duplicacy/preferences that is app machinery, not a user-managed repo, and is
+// regenerated continuously — surfacing it creates undeletable phantom repos.
+func isDuplicacyWebCache(path string) bool {
+	sep := string(filepath.Separator)
+	marker := sep + "cache" + sep + "localhost"
+	return strings.HasSuffix(path, marker) || strings.Contains(path, marker+sep)
+}
+
+// pathUnderAny reports whether path equals or is nested under any prefix.
+func pathUnderAny(path string, prefixes []string) bool {
+	for _, p := range prefixes {
+		pc := filepath.Clean(p)
+		if path == pc || strings.HasPrefix(path, pc+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func walkDepth(root, path string) int {

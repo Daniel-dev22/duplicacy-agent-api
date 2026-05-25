@@ -10,6 +10,13 @@ type Config struct {
 	NodeName    string   // hostname-short this agent runs on (e.g. "nuc02")
 	SiteID      string   // "kd" | "ng"
 	BackupRoots []string // host paths to scan for .duplicacy repos (mirrored: host == container)
+	// BackupExcludePaths are path prefixes the repo scanner and tree walker
+	// skip entirely. Use to suppress dirs that contain a .duplicacy/ but are
+	// not user-managed repos — e.g. the Duplicacy Web Edition data dir
+	// (/srv/containers/duplicacy). The duplicacy-web cache layout
+	// (…/cache/localhost/N/.duplicacy) is excluded automatically regardless,
+	// so this is only needed to prune additional host-specific paths.
+	BackupExcludePaths []string
 	// LegacyBackuprootMap rewrites stale on-disk preferences that still say
 	// `repository=/backuproot/pathN/...` in memory at preferences-load time.
 	// Populated from LEGACY_BACKUPROOT_MAP env var (e.g.
@@ -43,6 +50,7 @@ func loadConfig() Config {
 		NodeName:            requireEnv("NODE_NAME"),
 		SiteID:              requireEnv("SITE_ID"),
 		BackupRoots:         splitCSV(requireEnv("BACKUP_ROOTS")),
+		BackupExcludePaths:  splitCSV(getEnv("BACKUP_EXCLUDE_PATHS", "")),
 		LegacyBackuprootMap: parseMountMap(getEnv("LEGACY_BACKUPROOT_MAP", "")),
 		ComposeScanRoots:    splitCSV(getEnv("COMPOSE_SCAN_ROOTS", "")),
 		ConfigDir:           getEnv("CONFIG_DIR", "/var/lib/duplicacy-agent-api"),

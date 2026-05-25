@@ -40,7 +40,7 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 	jobs := newJobRegistry()
 	jobs.RegisterHook(events.handleJobEvent)
 
-	repos := newRepoIndex(cfg.BackupRoots, cfg.DuplicacyBinary, cfg.LegacyBackuprootMap)
+	repos := newRepoIndex(cfg.BackupRoots, cfg.DuplicacyBinary, cfg.LegacyBackuprootMap, cfg.BackupExcludePaths)
 
 	mapping := newRepoMappingStore(cfg.ConfigDir)
 	if err := mapping.load(); err != nil {
