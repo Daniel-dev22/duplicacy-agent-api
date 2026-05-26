@@ -91,10 +91,22 @@ func makeDuplicacyFire(cfg Config, jobs *jobRegistry, repos *repoIndex, prepareE
 			tag := kitsched.ParamString(sch.Params, "tag")
 			inv = invocationForBackup(repo, sch.Storage, tag, threads)
 		case ActionCheck:
-			inv = invocationForCheck(repo, sch.Storage, kitsched.ParamString(sch.Params, "revisions"), kitsched.ParamBool(sch.Params, "all"))
+			inv = invocationForCheck(repo, sch.Storage,
+				kitsched.ParamString(sch.Params, "revisions"),
+				kitsched.ParamBool(sch.Params, "all"),
+				kitsched.ParamString(sch.Params, "snapshot_id"))
 		case ActionPrune:
 			inv = invocationForPrune(repo, sch.Storage, kitsched.ParamStrings(sch.Params, "keep_rules"),
-				kitsched.ParamBool(sch.Params, "exclusive"), kitsched.ParamBool(sch.Params, "exhaustive"))
+				kitsched.ParamBool(sch.Params, "exclusive"), kitsched.ParamBool(sch.Params, "exhaustive"),
+				kitsched.ParamString(sch.Params, "snapshot_id"))
+		case ActionCopy:
+			// sch.Storage is the destination alias; params.copy_from is the
+			// source (the relay's "default" / nas-primary view). params.copy_id
+			// scopes to one source repo's snapshots in the shared chunk pool.
+			from := kitsched.ParamString(sch.Params, "copy_from")
+			snapID := kitsched.ParamString(sch.Params, "copy_id")
+			threads := kitsched.ParamInt(sch.Params, "threads")
+			inv = invocationForCopy(repo, from, sch.Storage, threads, snapID)
 		default:
 			slog.Warn("schedule fire: unsupported action", "action", sch.Action, "schedule", sch.ID)
 			return nil

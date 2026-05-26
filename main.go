@@ -80,6 +80,7 @@ func registerRoutes(r *gin.Engine, app *app) {
 	r.POST("/repos/:id/restore", app.handleRestore)
 	r.POST("/repos/:id/check", app.handleCheck)
 	r.POST("/repos/:id/prune", app.handlePrune)
+	r.POST("/repos/:id/copy", app.handleCopy)
 
 	r.GET("/repos/:id/preferences", app.handleGetPreferences)
 	r.PUT("/repos/:id/preferences", app.handlePutPreferences)

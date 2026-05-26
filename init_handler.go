@@ -219,7 +219,13 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 				continue // already configured with the same URL — idempotent skip
 			}
 		}
-		addInv := invocationForAdd(req.RepoPath, s.req.StorageAlias, req.RepoID, s.req.StorageURL, true, s.rsaPubPath)
+		// Make secondaries copy-compatible with the primary so `duplicacy copy`
+		// can ship chunks without re-chunking. `-bit-identical` additionally lets
+		// copy skip re-encryption, but only when the secondary uses the same
+		// encryption key as the primary — gate on encryption_password match.
+		bitIdentical := s.req.Secrets.EncryptionPassword != "" &&
+			s.req.Secrets.EncryptionPassword == primary.Secrets.EncryptionPassword
+		addInv := invocationForAdd(req.RepoPath, s.req.StorageAlias, req.RepoID, s.req.StorageURL, true, s.rsaPubPath, primary.StorageAlias, bitIdentical)
 		// duplicacy add reads env vars for BOTH the primary (so it can re-init
 		// the metadata layer) and the new alias. Pass primary + this storage.
 		addInv.EnvAdds = append(addInv.EnvAdds, primaryStaged.env...)

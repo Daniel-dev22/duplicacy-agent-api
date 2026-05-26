@@ -40,6 +40,7 @@ const (
 	ActionRestore JobAction = "restore"
 	ActionCheck   JobAction = "check"
 	ActionPrune   JobAction = "prune"
+	ActionCopy    JobAction = "copy"
 )
 
 // JobEvent is what we emit to the events subsystem on lifecycle transitions.
@@ -483,8 +484,8 @@ func (r *jobRegistry) tail(j *Job, rdr io.Reader, source string) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		j.appendLine(line)
-		// Progress parse — backup AND restore both emit "Uploaded/Downloaded chunk …".
-		if j.Action == ActionBackup || j.Action == ActionRestore {
+		// Progress parse — backup, restore, and copy all emit "Uploaded/Downloaded chunk …".
+		if j.Action == ActionBackup || j.Action == ActionRestore || j.Action == ActionCopy {
 			if updated := j.parseProgressLine(line); updated {
 				r.emitProgress(j)
 			}
@@ -865,8 +866,9 @@ func (a *app) prepareRestoreTarget(repo *Repo, target string, revision int) (str
 
 type checkRequest struct {
 	Storage    string `json:"storage"`
-	Revisions  string `json:"revisions"` // optional: e.g., "1,3,5" or "1-10"
+	Revisions  string `json:"revisions"`   // optional: e.g., "1,3,5" or "1-10"
 	All        bool   `json:"all"`
+	SnapshotID string `json:"snapshot_id"` // optional: scope to one snapshot id via -id (hub relay)
 	TriggerKey string `json:"trigger_key"`
 }
 
@@ -886,7 +888,7 @@ func (a *app) handleCheck(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
 		return
 	}
-	inv := invocationForCheck(repo, req.Storage, req.Revisions, req.All)
+	inv := invocationForCheck(repo, req.Storage, req.Revisions, req.All, req.SnapshotID)
 	inv.EnvAdds = append(inv.EnvAdds, env...)
 	// Detached context — see handleBackup comment.
 	j, err := a.jobs.start(context.Background(), a.cfg.DuplicacyBinary, repo, ActionCheck, req.Storage, inv, "", req.TriggerKey, cleanup)
@@ -899,9 +901,10 @@ func (a *app) handleCheck(c *gin.Context) {
 
 type pruneRequest struct {
 	Storage    string   `json:"storage"`
-	KeepRules  []string `json:"keep_rules"` // e.g., ["1:7", "7:30", "30:180"]
+	KeepRules  []string `json:"keep_rules"`  // e.g., ["1:7", "7:30", "30:180"]
 	Exclusive  bool     `json:"exclusive"`
 	Exhaustive bool     `json:"exhaustive"`
+	SnapshotID string   `json:"snapshot_id"` // optional: scope to one snapshot id via -id (hub relay)
 	TriggerKey string   `json:"trigger_key"`
 }
 
@@ -921,10 +924,58 @@ func (a *app) handlePrune(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
 		return
 	}
-	inv := invocationForPrune(repo, req.Storage, req.KeepRules, req.Exclusive, req.Exhaustive)
+	inv := invocationForPrune(repo, req.Storage, req.KeepRules, req.Exclusive, req.Exhaustive, req.SnapshotID)
 	inv.EnvAdds = append(inv.EnvAdds, env...)
 	// Detached context — see handleBackup comment.
 	j, err := a.jobs.start(context.Background(), a.cfg.DuplicacyBinary, repo, ActionPrune, req.Storage, inv, "", req.TriggerKey, cleanup)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "job_id": j.ID})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"job_id": j.ID})
+}
+
+// copyRequest drives `duplicacy copy -from <a> -to <b> -id <snap>`. From and To
+// are the storage aliases inside the relay repo's .duplicacy/preferences (e.g.
+// From="default" To="b2"). SnapshotID scopes the copy to a single source repo's
+// snapshots in the shared chunk pool — required when many source repos share
+// one storage.
+type copyRequest struct {
+	From       string `json:"from"`
+	To         string `json:"to"`
+	Threads    int    `json:"threads"`
+	SnapshotID string `json:"snapshot_id"`
+	TriggerKey string `json:"trigger_key"`
+}
+
+func (a *app) handleCopy(c *gin.Context) {
+	repo, ok := a.repos.get(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "repo not found"})
+		return
+	}
+	var req copyRequest
+	_ = c.ShouldBindJSON(&req)
+	if req.TriggerKey == "" {
+		req.TriggerKey = "manual"
+	}
+	if req.From == "" || req.To == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "from and to storage aliases are required"})
+		return
+	}
+	// prepareEnvForRepo vends env for ALL of the repo's storages, so both
+	// -from and -to credentials are available without per-call selection.
+	env, _, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
+		return
+	}
+	inv := invocationForCopy(repo, req.From, req.To, req.Threads, req.SnapshotID)
+	inv.EnvAdds = append(inv.EnvAdds, env...)
+	// Detached context — see handleBackup comment. StorageName on the job is
+	// the destination alias so the fleet WS shows "copy to b2" rather than the
+	// source.
+	j, err := a.jobs.start(context.Background(), a.cfg.DuplicacyBinary, repo, ActionCopy, req.To, inv, "", req.TriggerKey, cleanup)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "job_id": j.ID})
 		return
