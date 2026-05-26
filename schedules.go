@@ -94,11 +94,17 @@ func makeDuplicacyFire(cfg Config, jobs *jobRegistry, repos *repoIndex, prepareE
 			inv = invocationForCheck(repo, sch.Storage,
 				kitsched.ParamString(sch.Params, "revisions"),
 				kitsched.ParamBool(sch.Params, "all"),
-				kitsched.ParamString(sch.Params, "snapshot_id"))
+				resolveScheduleSnapshotID(sch))
 		case ActionPrune:
+			// Hard rule (hub-pool safety): prune always carries -id. The
+			// materializer sets params.snapshot_id when scoping a per-source
+			// prune against the relay repo; manual prune rows on a source
+			// repo fall back to sch.RepoID (= that repo's own snapshot id in
+			// preferences). Solo-storage repos get -id with their only id,
+			// which is a no-op constraint.
 			inv = invocationForPrune(repo, sch.Storage, kitsched.ParamStrings(sch.Params, "keep_rules"),
 				kitsched.ParamBool(sch.Params, "exclusive"), kitsched.ParamBool(sch.Params, "exhaustive"),
-				kitsched.ParamString(sch.Params, "snapshot_id"))
+				resolveScheduleSnapshotID(sch))
 		case ActionCopy:
 			// sch.Storage is the destination alias; params.copy_from is the
 			// source (the relay's "default" / nas-primary view). params.copy_id
@@ -142,6 +148,20 @@ func makeDuplicacyFire(cfg Config, jobs *jobRegistry, repos *repoIndex, prepareE
 			"missed_recovery", missedRecovery)
 		return nil
 	}
+}
+
+// resolveScheduleSnapshotID returns the -id value to pass for a check/prune
+// fire. Prefers params.snapshot_id (set by the central materializer when
+// scoping a per-source prune against the relay repo); falls back to
+// sch.RepoID which equals the schedule's repo's snapshot id in preferences
+// — the right scope for manual one-off check/prune rows on a source repo.
+// Always returns a non-empty string for any well-formed schedule row, which
+// satisfies the hub-pool safety contract (prune never runs unscoped).
+func resolveScheduleSnapshotID(sch kitsched.LocalSchedule) string {
+	if s := kitsched.ParamString(sch.Params, "snapshot_id"); s != "" {
+		return s
+	}
+	return sch.RepoID
 }
 
 // --- HTTP handlers (delegate to the kit) ---

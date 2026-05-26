@@ -919,6 +919,17 @@ func (a *app) handlePrune(c *gin.Context) {
 	if req.TriggerKey == "" {
 		req.TriggerKey = "manual"
 	}
+	// Hard rule: prune MUST carry a snapshot_id. The hub topology has many
+	// snapshot_ids in one shared NAS chunk pool; an unscoped prune would
+	// consider snapshots from every host when computing chunk reachability
+	// and could orphan another host's chunks (especially with -exclusive).
+	// The materializer always emits snapshot_id; manual prune callers must
+	// pass it explicitly. Solo-storage repos lose nothing — passing the
+	// repo's only snapshot_id is a no-op constraint there.
+	if strings.TrimSpace(req.SnapshotID) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "snapshot_id is required (hub-pool safety: unscoped prune can orphan another host's chunks)"})
+		return
+	}
 	env, _, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
