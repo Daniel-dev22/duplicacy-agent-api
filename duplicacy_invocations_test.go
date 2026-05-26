@@ -120,6 +120,47 @@ func TestInvocationForCheckSnapshotID(t *testing.T) {
 	}
 }
 
+// TestInvocationForInitChunkSize pins the chunk-size flag emission. Once a
+// chunk pool is initialized these flags can never change, so the behaviour
+// here is load-bearing for every -copy-compatible secondary that inherits
+// the pool's chunk parameters (notably Storj).
+func TestInvocationForInitChunkSize(t *testing.T) {
+	t.Run("cloudOptimizedChunks emits -c 16M -min 4M -max 64M before positional args", func(t *testing.T) {
+		inv := invocationForInit("/repo", "snap-x", "sftp://host/path", true, "", cloudOptimizedChunks)
+		joined := strings.Join(inv.Args, " ")
+		for _, pair := range [][2]string{
+			{"-c", "16M"},
+			{"-min", "4M"},
+			{"-max", "64M"},
+		} {
+			flag, value := pair[0], pair[1]
+			idx := slices.Index(inv.Args, flag)
+			if idx < 0 {
+				t.Errorf("missing %s in args: %s", flag, joined)
+				continue
+			}
+			if idx+1 >= len(inv.Args) || inv.Args[idx+1] != value {
+				t.Errorf("%s = %q, want %q", flag, inv.Args[idx+1], value)
+			}
+			// Chunk flags MUST precede the positional snapshot-id; duplicacy
+			// rejects flags after positional args.
+			snapIdx := slices.Index(inv.Args, "snap-x")
+			if snapIdx >= 0 && idx > snapIdx {
+				t.Errorf("%s came AFTER positional snapshot-id (idx %d > %d)", flag, idx, snapIdx)
+			}
+		}
+	})
+
+	t.Run("zero chunkSizing omits flags (back-compat with old pools)", func(t *testing.T) {
+		inv := invocationForInit("/repo", "snap-x", "sftp://host/path", false, "", chunkSizing{})
+		for _, flag := range []string{"-c", "-min", "-max"} {
+			if slices.Contains(inv.Args, flag) {
+				t.Errorf("zero chunkSizing should omit %s, got: %v", flag, inv.Args)
+			}
+		}
+	})
+}
+
 func TestInvocationForPruneSnapshotID(t *testing.T) {
 	repo := &Repo{Path: "/repo"}
 	inv := invocationForPrune(repo, "b2", []string{"1:7", "7:30"}, false, false, "pi-home")
