@@ -276,10 +276,16 @@ func invocationForRestore(repo *Repo, storageName string, revision int, paths []
 }
 
 // invocationForCheck builds args for `duplicacy check`.
-func invocationForCheck(repo *Repo, storageName string, revisions string, all bool) cliInvocation {
+// snapshotID, when non-empty, scopes the check to a single snapshot id via -id;
+// the hub-and-spoke relay repo uses this so a single check schedule row targets
+// one source repo's snapshots inside the shared chunk pool.
+func invocationForCheck(repo *Repo, storageName string, revisions string, all bool, snapshotID string) cliInvocation {
 	args := []string{"check"}
 	if storageName != "" {
 		args = append(args, "-storage", storageName)
+	}
+	if snapshotID != "" {
+		args = append(args, "-id", snapshotID)
 	}
 	if revisions != "" {
 		args = append(args, "-r", revisions)
@@ -291,10 +297,15 @@ func invocationForCheck(repo *Repo, storageName string, revisions string, all bo
 }
 
 // invocationForPrune builds args for `duplicacy prune`.
-func invocationForPrune(repo *Repo, storageName string, keepRules []string, exclusive, exhaustive bool) cliInvocation {
+// snapshotID, when non-empty, scopes the prune to a single snapshot id via -id;
+// used by the hub relay repo to apply per-source-repo retention.
+func invocationForPrune(repo *Repo, storageName string, keepRules []string, exclusive, exhaustive bool, snapshotID string) cliInvocation {
 	args := []string{"prune"}
 	if storageName != "" {
 		args = append(args, "-storage", storageName)
+	}
+	if snapshotID != "" {
+		args = append(args, "-id", snapshotID)
 	}
 	for _, k := range keepRules {
 		args = append(args, "-keep", k)
@@ -305,6 +316,29 @@ func invocationForPrune(repo *Repo, storageName string, keepRules []string, excl
 	if exhaustive {
 		args = append(args, "-exhaustive")
 	}
+	return cliInvocation{RepoRoot: repo.Path, Args: args}
+}
+
+// invocationForCopy builds args for `duplicacy copy -from <a> -to <b>`. Used by
+// the NAS relay repo to ship chunks from the shared NAS chunk pool (alias
+// "default") to a secondary (remote-NAS, B2, Storj, …). snapshotID scopes the
+// copy to one source repo's snapshots via -id; required for per-policy
+// granularity in the hub-and-spoke topology.
+func invocationForCopy(repo *Repo, fromStorage, toStorage string, threads int, snapshotID string) cliInvocation {
+	args := []string{"copy"}
+	if fromStorage != "" {
+		args = append(args, "-from", fromStorage)
+	}
+	if toStorage != "" {
+		args = append(args, "-to", toStorage)
+	}
+	if snapshotID != "" {
+		args = append(args, "-id", snapshotID)
+	}
+	if threads <= 0 {
+		threads = autoThreads()
+	}
+	args = append(args, "-threads", strconv.Itoa(threads))
 	return cliInvocation{RepoRoot: repo.Path, Args: args}
 }
 
@@ -336,7 +370,14 @@ func invocationForInit(repoRoot, snapshotID, storageURL string, encrypted bool, 
 // Same -no-save-password rationale as invocationForInit.
 // rsaPubKeyPath is the /dev/shm path to the rsa_public_key PEM when this
 // secondary storage uses RSA asymmetric encryption; empty string otherwise.
-func invocationForAdd(repoRoot, storageName, snapshotID, storageURL string, encrypted bool, rsaPubKeyPath string) cliInvocation {
+// copyFrom, when non-empty, emits `-copy <copyFrom>` so the new storage is
+// copy-compatible with that existing alias (shared chunk-splitting config) —
+// required for `duplicacy copy` to ship chunks without re-chunking. bitIdentical
+// additionally emits `-bit-identical` so chunks are byte-identical (no
+// re-encrypt during copy); requires the new storage to share the source's
+// encryption key. Callers should only set bitIdentical when the secondary uses
+// the same encryption_password as the primary.
+func invocationForAdd(repoRoot, storageName, snapshotID, storageURL string, encrypted bool, rsaPubKeyPath, copyFrom string, bitIdentical bool) cliInvocation {
 	// duplicacy 3.2.5 has no -no-save-password flag — see invocationForInit.
 	args := []string{"add"}
 	if encrypted {
@@ -344,6 +385,12 @@ func invocationForAdd(repoRoot, storageName, snapshotID, storageURL string, encr
 	}
 	if rsaPubKeyPath != "" {
 		args = append(args, "-key", rsaPubKeyPath)
+	}
+	if copyFrom != "" {
+		args = append(args, "-copy", copyFrom)
+		if bitIdentical {
+			args = append(args, "-bit-identical")
+		}
 	}
 	args = append(args, storageName, snapshotID, storageURL)
 	return cliInvocation{RepoRoot: repoRoot, Args: args}
