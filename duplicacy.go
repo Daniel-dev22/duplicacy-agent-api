@@ -342,13 +342,35 @@ func invocationForCopy(repo *Repo, fromStorage, toStorage string, threads int, s
 	return cliInvocation{RepoRoot: repo.Path, Args: args}
 }
 
+// chunkSizing carries the duplicacy chunk-size flags (-c / -min / -max) applied
+// at chunk-pool creation. Once a pool exists these settings are immutable —
+// every -copy-compatible secondary inherits them — so the value we pass on
+// the first init of `default` IS the chunk size used by every storage backend
+// the relay later adds, including cloud (Storj, B2, …).
+//
+// Sizes are duplicacy-CLI strings ("16M", "4M", …); empty fields omit the
+// flag (letting duplicacy pick its 4MB default).
+type chunkSizing struct {
+	Avg string // -c
+	Min string // -min-chunk-size
+	Max string // -max-chunk-size
+}
+
+// cloudOptimizedChunks is the canonical chunk size for new pools. 16MB average
+// is ~4× larger than duplicacy's default (4MB), giving 4× fewer Storj segments
+// (Storj charges per-segment) while preserving reasonable small-file dedup —
+// the duplicacy forum's 32MB recommendation is more aggressive but harms dedup
+// on frequently-edited small files. Min/Max bracket the average at 4MB..64MB.
+var cloudOptimizedChunks = chunkSizing{Avg: "16M", Min: "4M", Max: "64M"}
+
 // invocationForInit builds args for `duplicacy init <snapshot-id> <storage-url>`.
-// Always passes -no-save-password so duplicacy does not write credentials into
-// .duplicacy/preferences. The agent supplies all secrets via env vars at run
-// time and post-scrubs the preferences file as defense-in-depth.
 // rsaPubKeyPath is the /dev/shm path to the rsa_public_key PEM when this
 // storage uses RSA asymmetric encryption; empty string otherwise.
-func invocationForInit(repoRoot, snapshotID, storageURL string, encrypted bool, rsaPubKeyPath string) cliInvocation {
+//
+// chunks controls duplicacy's chunk parameters (-c / -min / -max). For new pool
+// creations callers pass cloudOptimizedChunks; the zero value lets duplicacy
+// pick its 4MB default (used by pools created before this change).
+func invocationForInit(repoRoot, snapshotID, storageURL string, encrypted bool, rsaPubKeyPath string, chunks chunkSizing) cliInvocation {
 	// Note: duplicacy 3.2.5 does not have a -no-save-password flag (neither
 	// global nor on init). The "do not save the password" intent is
 	// realised by the post-init scrub step that rewrites
@@ -360,6 +382,15 @@ func invocationForInit(repoRoot, snapshotID, storageURL string, encrypted bool, 
 	}
 	if rsaPubKeyPath != "" {
 		args = append(args, "-key", rsaPubKeyPath)
+	}
+	if chunks.Avg != "" {
+		args = append(args, "-c", chunks.Avg)
+	}
+	if chunks.Min != "" {
+		args = append(args, "-min", chunks.Min)
+	}
+	if chunks.Max != "" {
+		args = append(args, "-max", chunks.Max)
 	}
 	args = append(args, snapshotID, storageURL)
 	return cliInvocation{RepoRoot: repoRoot, Args: args}

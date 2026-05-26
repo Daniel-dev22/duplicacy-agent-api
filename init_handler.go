@@ -170,7 +170,7 @@ func (a *app) handleInitRepoNew(c *gin.Context) {
 	// requested storages; if a different repo lives here (e.g. a Duplicacy Web
 	// repo) we refuse rather than hijack it.
 	primaryStaged := stagedFor(staged, primary.StorageAlias)
-	initInv := invocationForInit(req.RepoPath, req.RepoID, primary.StorageURL, true /*encrypted*/, primaryStaged.rsaPubPath)
+	initInv := invocationForInit(req.RepoPath, req.RepoID, primary.StorageURL, true /*encrypted*/, primaryStaged.rsaPubPath, cloudOptimizedChunks)
 	initInv.EnvAdds = append(initInv.EnvAdds, primaryStaged.env...)
 	adopt := false
 	if out, err := runSync(ctx, a.cfg.DuplicacyBinary, initInv, 4*time.Minute); err != nil {
