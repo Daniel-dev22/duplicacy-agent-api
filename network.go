@@ -199,5 +199,13 @@ func fetchSecretsOnce(ctx context.Context, client *http.Client, url, credentialI
 	if b.StorageType == "" {
 		return SecretsBundle{}, false, fmt.Errorf("vend response missing storage_type")
 	}
+	// Validate the URL shape before handing the bundle to the caller.
+	// Misconfigured storages (missing Storj region, single-slash SFTP path,
+	// templated placeholders not resolved) surface here with a clear,
+	// non-retryable error instead of as cryptic duplicacy CLI failures
+	// minutes later inside a schedule fire.
+	if err := ValidateStorageURL(b.StorageType, b.StorageURL); err != nil {
+		return SecretsBundle{}, false, fmt.Errorf("vend response storage_url invalid: %w", err)
+	}
 	return b, false, nil
 }
