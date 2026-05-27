@@ -15,6 +15,10 @@ import (
 
 func main() {
 	logging.Setup(os.Getenv("LOG_LEVEL"))
+	// When LOG_DIR is set, augment with a rotating file sink (lumberjack)
+	// alongside stderr. See logging_setup.go for the rotation policy. No-op
+	// otherwise — stderr-only path is preserved for legacy deploys.
+	attachRotatingLogFile(os.Getenv("LOG_LEVEL"))
 
 	cfg := loadConfig()
 	slog.Info("duplicacy-agent-api starting",
@@ -100,6 +104,10 @@ func registerRoutes(r *gin.Engine, app *app) {
 
 	r.GET("/jobs", app.handleListJobs)
 	r.GET("/jobs/:id", app.handleGetJob)
+	// Durable per-job log retrieval. Prefers ${CONFIG_DIR}/job-logs/<id>.log
+	// (survives container restart); falls back to the in-memory ring
+	// buffer for currently-running jobs. See job_logs.go.
+	r.GET("/jobs/:id/log", app.handleGetJobLog)
 	r.POST("/jobs/:id/cancel", app.handleCancelJob)
 	r.GET("/ws/jobs/:id/logs", app.handleJobLogsWS)
 	r.GET("/ws/fleet", app.handleFleetWS)
