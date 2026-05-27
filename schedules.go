@@ -109,10 +109,11 @@ func makeDuplicacyFire(cfg Config, jobs *jobRegistry, repos *repoIndex, prepareE
 			// sch.Storage is the destination alias; params.copy_from is the
 			// source (the relay's "default" / nas-primary view). params.copy_id
 			// scopes to one source repo's snapshots in the shared chunk pool.
+			// RSA priv key (-key) is filled in below after prepareEnv runs.
 			from := kitsched.ParamString(sch.Params, "copy_from")
 			snapID := kitsched.ParamString(sch.Params, "copy_id")
 			threads := kitsched.ParamInt(sch.Params, "threads")
-			inv = invocationForCopy(repo, from, sch.Storage, threads, snapID)
+			inv = invocationForCopy(repo, from, sch.Storage, threads, snapID, "", "")
 		default:
 			slog.Warn("schedule fire: unsupported action", "action", sch.Action, "schedule", sch.ID)
 			return nil
@@ -120,11 +121,12 @@ func makeDuplicacyFire(cfg Config, jobs *jobRegistry, repos *repoIndex, prepareE
 
 		var (
 			env     []string
+			rsaPriv map[string]string
 			cleanup func()
 		)
 		if prepareEnv != nil {
 			var err error
-			env, _, cleanup, err = prepareEnv(ctx, repo)
+			env, rsaPriv, cleanup, err = prepareEnv(ctx, repo)
 			if err != nil {
 				slog.Error("schedule fire: vend secrets failed; skipping", "error", err, "schedule", sch.ID)
 				return err
@@ -134,6 +136,18 @@ func makeDuplicacyFire(cfg Config, jobs *jobRegistry, repos *repoIndex, prepareE
 			cleanup = func() {}
 		}
 		inv.EnvAdds = append(inv.EnvAdds, env...)
+
+		// For copy: now that prepareEnv has materialised the source's RSA
+		// priv key to /dev/shm, rebuild the inv with -key so duplicacy can
+		// read RSA-encrypted source snapshot indices. Without this every
+		// nightly copy aborts with "An RSA private key is required to
+		// decrypt the chunk".
+		if action == ActionCopy && rsaPriv != nil {
+			from := kitsched.ParamString(sch.Params, "copy_from")
+			if path := rsaPriv[from]; path != "" {
+				inv.Args = append(inv.Args, "-key", path)
+			}
+		}
 
 		j, err := jobs.start(ctx, cfg.DuplicacyBinary, repo, action, sch.Storage, inv, sch.ID, triggerKey, cleanup)
 		if err != nil {

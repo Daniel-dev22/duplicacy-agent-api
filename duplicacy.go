@@ -324,7 +324,18 @@ func invocationForPrune(repo *Repo, storageName string, keepRules []string, excl
 // "default") to a secondary (remote-NAS, B2, Storj, …). snapshotID scopes the
 // copy to one source repo's snapshots via -id; required for per-policy
 // granularity in the hub-and-spoke topology.
-func invocationForCopy(repo *Repo, fromStorage, toStorage string, threads int, snapshotID string) cliInvocation {
+//
+// sourceRSAPrivKeyPath, when non-empty, is the /dev/shm path to the SOURCE
+// storage's RSA private key. `duplicacy copy` needs it to read the source's
+// RSA-encrypted snapshot index even when the destination shares the same
+// chunk encryption (bit-identical applies to chunks, not the index). Witness:
+// 2026-05-27 overnight — destinations were rebuilt RSA-compatible but copies
+// still failed with "An RSA private key is required to decrypt the chunk"
+// because this -key flag wasn't being passed.
+//
+// sourceRSAPassphrase is the matching passphrase if the priv key is
+// encrypted; empty otherwise.
+func invocationForCopy(repo *Repo, fromStorage, toStorage string, threads int, snapshotID, sourceRSAPrivKeyPath, sourceRSAPassphrase string) cliInvocation {
 	args := []string{"copy"}
 	if fromStorage != "" {
 		args = append(args, "-from", fromStorage)
@@ -339,6 +350,12 @@ func invocationForCopy(repo *Repo, fromStorage, toStorage string, threads int, s
 		threads = autoThreads()
 	}
 	args = append(args, "-threads", strconv.Itoa(threads))
+	if sourceRSAPrivKeyPath != "" {
+		args = append(args, "-key", sourceRSAPrivKeyPath)
+		if sourceRSAPassphrase != "" {
+			args = append(args, "-key-passphrase", sourceRSAPassphrase)
+		}
+	}
 	return cliInvocation{RepoRoot: repo.Path, Args: args}
 }
 

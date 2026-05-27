@@ -19,6 +19,9 @@ package main
 //     UpdatedAt than what we cached.
 
 import (
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
@@ -26,6 +29,35 @@ import (
 	"sync"
 	"time"
 )
+
+// convertRSAPrivKeyToPKCS1 normalises an RSA private key PEM to PKCS#1
+// ("BEGIN RSA PRIVATE KEY"), which is the only format duplicacy 3.2.5
+// supports. Unencrypted PKCS#8 keys ("BEGIN PRIVATE KEY") are converted
+// in-memory; PKCS#1 input is returned as-is. Encrypted PKCS#8
+// ("BEGIN ENCRYPTED PRIVATE KEY") is left alone — duplicacy's
+// -key-passphrase handles those itself.
+//
+// Witness: 2026-05-27 first-night copy attempts failed with "Unsupported
+// private key type PRIVATE KEY" because Bitwarden/operator-stored keys are
+// PKCS#8 by default and we never normalised before materialising.
+func convertRSAPrivKeyToPKCS1(input []byte) []byte {
+	block, _ := pem.Decode(input)
+	if block == nil || block.Type != "PRIVATE KEY" {
+		return input
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return input
+	}
+	rsaKey, ok := parsed.(*rsa.PrivateKey)
+	if !ok {
+		return input
+	}
+	return pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(rsaKey),
+	})
+}
 
 // SecretsBundle mirrors the JSON returned by controller's
 // GET /api/duplicacy/credentials/:id/secrets-for-node/:node endpoint.
@@ -221,7 +253,7 @@ func buildEnv(storageType, storageAlias string, isPrimary bool, b SecretsBundle)
 		mark("rsa_public_key")
 	}
 	if v, ok := b.Backend["rsa_private_key"]; ok && v != "" {
-		tmp, err := writeShmTmp("duplicacy-rsa-priv-", []byte(v))
+		tmp, err := writeShmTmp("duplicacy-rsa-priv-", convertRSAPrivKeyToPKCS1([]byte(v)))
 		if err != nil {
 			cleanupTmpfiles(res.Tmpfiles)
 			return buildEnvResult{}, fmt.Errorf("materialize rsa_private_key: %w", err)
