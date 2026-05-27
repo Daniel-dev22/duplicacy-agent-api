@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -100,9 +101,27 @@ type repoIndex struct {
 	mu          sync.RWMutex
 	repos       map[string]*Repo // keyed by Repo.ID
 	lastScanned time.Time
+
+	// loggedStaleRepos tracks repoRoots already logged as missing
+	// .duplicacy/preferences so we don't spam the agent log every 5 min on
+	// the scan tick. INFO-once-per-session is enough — the operator
+	// either fixes the stale directory or accepts it.
+	loggedStaleRepos sync.Map // map[string]struct{}
 }
 
 const repoScanTTL = 30 * time.Second
+
+// markStalePreferences logs once per repoRoot per agent lifetime when a
+// .duplicacy dir is found without a preferences file. Quiets the every-5-min
+// "failed to load repo (skipping)" WARN that was specifically witnessed for
+// frigate's docker-managed .duplicacy/cache sibling on 2026-05-27.
+func (r *repoIndex) markStalePreferences(repoRoot string) {
+	if _, loaded := r.loggedStaleRepos.LoadOrStore(repoRoot, struct{}{}); loaded {
+		return
+	}
+	slog.Info("repo has .duplicacy dir but no preferences (skipping — likely stale or third-party cache)",
+		"repo", repoRoot)
+}
 
 func newRepoIndex(roots []string, binary string, legacyBackuprootMap map[string]string, excludePaths []string) *repoIndex {
 	return &repoIndex{
@@ -201,7 +220,19 @@ func (r *repoIndex) scanLocked() error {
 			repoRoot := filepath.Dir(path)
 			repo, err := r.loadRepo(repoRoot)
 			if err != nil {
-				slog.Warn("failed to load repo (skipping)", "error", err, "repo", repoRoot)
+				// ENOENT on .duplicacy/preferences = the directory exists but
+				// the marker file's gone (uninitialised partial duplicacy
+				// dir, e.g. the operator removed the repo but left the
+				// chunks/cache tree, OR a third-party app dropped a
+				// .duplicacy/cache sibling without preferences). Log once at
+				// INFO with the path; quiet thereafter — this is the noise
+				// witnessed every 5 min for /mnt/storage/srv/containers/frigate
+				// on 2026-05-27.
+				if errors.Is(err, os.ErrNotExist) {
+					r.markStalePreferences(repoRoot)
+				} else {
+					slog.Warn("failed to load repo (skipping)", "error", err, "repo", repoRoot)
+				}
 				return filepath.SkipDir
 			}
 			found[repo.ID] = repo

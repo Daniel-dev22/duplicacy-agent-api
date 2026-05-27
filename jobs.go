@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -506,7 +508,14 @@ func (r *jobRegistry) tail(j *Job, rdr io.Reader, source string) {
 		// action so check/prune/restore failures also get clean messages.
 		j.parseErrorLine(line)
 	}
-	if err := scanner.Err(); err != nil {
+	// scanner.Err() is normal at process exit — duplicacy closes the pipe
+	// from its side and our blocked Read returns fs.ErrClosed (wrapped by
+	// bufio.Scanner). That's pipe end-of-life, not an error to surface.
+	// Anything else still gets the WARN.
+	if err := scanner.Err(); err != nil &&
+		!errors.Is(err, os.ErrClosed) &&
+		!errors.Is(err, fs.ErrClosed) &&
+		!strings.Contains(err.Error(), "file already closed") {
 		slog.Warn("tail scanner error", "error", err, "job", j.ID, "source", source)
 	}
 }
