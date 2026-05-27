@@ -29,12 +29,22 @@ type cliInvocation struct {
 
 // command builds an *exec.Cmd ready to run. Caller is responsible for stdout/stderr piping
 // and Start/Wait — we don't run it here so the jobs registry can wire up streaming first.
+//
+// Stdin is set to a newline buffer so duplicacy's interactive prompts —
+// specifically the "Enter the passphrase for <key>" the RSA priv-key
+// loader emits BEFORE checking whether the key is encrypted — read an
+// empty passphrase instead of hitting EOF. Witnessed 2026-05-27: every
+// copy with -key against an unencrypted PKCS#1 priv key failed with
+// "Failed to read the password: EOF" because exec.Cmd's default Stdin
+// is nil (immediate EOF), even though the key carried no passphrase.
+// The newline is harmless when no prompt fires; required when one does.
 func (i cliInvocation) command(ctx context.Context, binary string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, binary, i.Args...)
 	cmd.Dir = i.RepoRoot
 	if len(i.EnvAdds) > 0 {
 		cmd.Env = append(os.Environ(), i.EnvAdds...)
 	}
+	cmd.Stdin = strings.NewReader("\n")
 	return cmd
 }
 
