@@ -120,6 +120,32 @@ func TestInvocationForCheckSnapshotID(t *testing.T) {
 	}
 }
 
+// TestInvocationForCheckAlwaysTabular pins the always-on -tabular flag. The
+// storage-dashboard's per-snapshot dedup column depends on the tabular table
+// being emitted by every check run (manual + scheduled). If this regresses,
+// the snapshots list and the rollup chart go cold for newly-checked repos
+// even though the job still "succeeds".
+func TestInvocationForCheckAlwaysTabular(t *testing.T) {
+	repo := &Repo{Path: "/repo"}
+	cases := []cliInvocation{
+		invocationForCheck(repo, "", "", false, ""),
+		invocationForCheck(repo, "default", "", false, ""),
+		invocationForCheck(repo, "default", "1-10", true, "pi-home"),
+		invocationForCheck(repo, "b2", "", false, "host-x"),
+	}
+	for i, inv := range cases {
+		if !slices.Contains(inv.Args, "-tabular") {
+			t.Errorf("case %d: -tabular missing from %v", i, inv.Args)
+		}
+		// -tabular must come AFTER -storage/-id/-r/-all (duplicacy rejects
+		// flags after positional args, but check has none — still keep the
+		// stable trailing position to match the order tests above).
+		if inv.Args[len(inv.Args)-1] != "-tabular" {
+			t.Errorf("case %d: -tabular should be the last arg, got %v", i, inv.Args)
+		}
+	}
+}
+
 // TestInvocationForInitChunkSize pins the chunk-size flag emission. Once a
 // chunk pool is initialized these flags can never change, so the behaviour
 // here is load-bearing for every -copy-compatible secondary that inherits

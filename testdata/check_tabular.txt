@@ -1,0 +1,12 @@
+INFO STORAGE_SET Storage set to sftp://backup@nas.example.com/mnt/backups/repo
+INFO SNAPSHOT_CHECK Listing all chunks
+INFO SNAPSHOT_CHECK 1 snapshots and 3 revisions
+INFO SNAPSHOT_CHECK Total chunk size is 1.2G in 305 chunks
+                                       snap |     rev |                       |      files |    bytes | chunks |    bytes |   uniq |   bytes |    new |    bytes |
+                                    host01 |       1 | @ 2026-05-25 03:00 -tab |       4440 |   361.4M |    100 |   400.0M |    100 |  400.0M |    100 |   400.0M |
+                                    host01 |       2 | @ 2026-05-26 03:00 -tab |       4445 |   362.1M |    102 |   408.0M |      2 |    8.0M |      2 |     8.0M |
+                                    host01 |       3 | @ 2026-05-27 03:00 -tab |       4450 |   362.9M |    103 |   412.0M |      1 |    4.0M |      1 |     4.0M |
+                                    host01 |     all |                       |            |          |    103 |   412.0M |    103 |  412.0M |        |          |
+INFO SNAPSHOT_CHECK All chunks referenced by snapshot host01 at revision 1 exist
+INFO SNAPSHOT_CHECK All chunks referenced by snapshot host01 at revision 2 exist
+INFO SNAPSHOT_CHECK All chunks referenced by snapshot host01 at revision 3 exist

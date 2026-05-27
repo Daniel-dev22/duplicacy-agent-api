@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 // Verifies parseProgressLine against verbatim duplicacy 3.2.5 output. The
 // regex is the load-bearing piece of the live-progress feature — if its
@@ -152,6 +155,109 @@ func TestParseStatsLine(t *testing.T) {
 			t.Errorf("should not match Files: line — only All chunks:")
 		}
 	})
+}
+
+// TestParseCheckLine covers the SNAPSHOT_CHECK total + per-revision lines.
+// Percent is derived as verified/total*100; the bar should reach exactly
+// 100.0 after the last revision regardless of float rounding.
+func TestParseCheckLine(t *testing.T) {
+	t.Run("total_then_three_revisions", func(t *testing.T) {
+		j := &Job{}
+		if !j.parseCheckLine("INFO SNAPSHOT_CHECK 3 snapshots and 3 revisions") {
+			t.Fatalf("expected total line to match")
+		}
+		if j.Progress.CheckRevisionsTotal != 3 {
+			t.Fatalf("CheckRevisionsTotal=%d want 3", j.Progress.CheckRevisionsTotal)
+		}
+		if j.Progress.Percent != 0 {
+			t.Errorf("Percent should still be 0 (no revisions verified yet), got %v", j.Progress.Percent)
+		}
+
+		want := []float64{100.0 / 3, 200.0 / 3, 100.0}
+		lines := []string{
+			"INFO SNAPSHOT_CHECK All chunks referenced by snapshot host01 at revision 1 exist",
+			"INFO SNAPSHOT_CHECK All chunks referenced by snapshot host01 at revision 2 exist",
+			"INFO SNAPSHOT_CHECK All chunks referenced by snapshot host02 at revision 5 exist",
+		}
+		for i, line := range lines {
+			if !j.parseCheckLine(line) {
+				t.Fatalf("expected revision line %d to match", i+1)
+			}
+			if j.Progress.CheckRevisionsVerified != i+1 {
+				t.Errorf("after line %d, verified=%d want %d", i+1, j.Progress.CheckRevisionsVerified, i+1)
+			}
+			if math.Abs(j.Progress.Percent-want[i]) > 1e-9 {
+				t.Errorf("after line %d, Percent=%v want %v", i+1, j.Progress.Percent, want[i])
+			}
+		}
+		// Final assertion: bar reaches exactly 100.0 at the end (the integer
+		// case avoids float rounding, so an exact compare is fine here).
+		if j.Progress.Percent != 100.0 {
+			t.Errorf("final Percent=%v want 100", j.Progress.Percent)
+		}
+	})
+	t.Run("misses_unrelated_lines", func(t *testing.T) {
+		j := &Job{}
+		if j.parseCheckLine("INFO SNAPSHOT_CHECK Listing all chunks") {
+			t.Errorf("listing line should not match")
+		}
+		if j.parseCheckLine("Uploaded chunk 1 size 4194304, 7.50MB/s 03:00:00 1.4%") {
+			t.Errorf("backup line should not match check parser")
+		}
+		if j.Progress != nil {
+			t.Errorf("Progress should remain nil on miss-only input, got %+v", j.Progress)
+		}
+	})
+}
+
+// TestParsePruneLine covers the three counter lines and ensures unrelated
+// SNAPSHOT_DELETE / FOSSIL_* variants (e.g. "would be removed" dry-run
+// lines) are NOT counted.
+func TestParsePruneLine(t *testing.T) {
+	j := &Job{}
+
+	if !j.parsePruneLine("INFO SNAPSHOT_DELETE The snapshot host01 at revision 7 has been removed") {
+		t.Fatalf("snapshot-removed line should match")
+	}
+	if !j.parsePruneLine("INFO CHUNK_DELETE The chunk abc123 has been permanently removed") {
+		t.Fatalf("chunk-deleted line should match")
+	}
+	if !j.parsePruneLine("INFO CHUNK_DELETE The chunk def456 has been permanently removed") {
+		t.Fatalf("second chunk-deleted line should match")
+	}
+	if !j.parsePruneLine("INFO FOSSIL_COLLECT Fossil collection 4 saved") {
+		t.Fatalf("fossil-collect line should match")
+	}
+
+	if j.Progress.PruneSnapshotsRemoved != 1 {
+		t.Errorf("PruneSnapshotsRemoved=%d want 1", j.Progress.PruneSnapshotsRemoved)
+	}
+	if j.Progress.PruneChunksDeleted != 2 {
+		t.Errorf("PruneChunksDeleted=%d want 2", j.Progress.PruneChunksDeleted)
+	}
+	if j.Progress.PruneFossilsProcessed != 1 {
+		t.Errorf("PruneFossilsProcessed=%d want 1", j.Progress.PruneFossilsProcessed)
+	}
+	if j.Progress.Percent != 0 {
+		t.Errorf("Prune Percent should stay 0, got %v", j.Progress.Percent)
+	}
+
+	// Dry-run "would be" lines must not increment counters; they're future-
+	// tense and don't represent completed work.
+	startSnaps := j.Progress.PruneSnapshotsRemoved
+	startChunks := j.Progress.PruneChunksDeleted
+	if j.parsePruneLine("INFO FOSSIL_DELETE The chunk xyz would be permanently removed") {
+		t.Errorf("would-be-removed (dry run) line should NOT match")
+	}
+	if j.parsePruneLine("INFO FOSSIL_RESURRECT Fossil xyz would be resurrected") {
+		t.Errorf("would-resurrect line should NOT match")
+	}
+	if j.parsePruneLine("INFO FOSSIL_NONE No fossil collection found") {
+		t.Errorf("no-fossil line should NOT match")
+	}
+	if j.Progress.PruneSnapshotsRemoved != startSnaps || j.Progress.PruneChunksDeleted != startChunks {
+		t.Errorf("counters changed on dry-run lines")
+	}
 }
 
 // parseErrorLine should overwrite ErrorMsg only when the line has the

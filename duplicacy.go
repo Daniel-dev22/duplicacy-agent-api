@@ -289,6 +289,11 @@ func invocationForRestore(repo *Repo, storageName string, revision int, paths []
 // snapshotID, when non-empty, scopes the check to a single snapshot id via -id;
 // the hub-and-spoke relay repo uses this so a single check schedule row targets
 // one source repo's snapshots inside the shared chunk pool.
+//
+// -tabular is always appended: it emits the per-revision dedup table
+// (total / unique / new bytes) the storage dashboard needs, and the
+// check_tabular parser only triggers on the table form so manual runs
+// stay consistent with scheduled runs.
 func invocationForCheck(repo *Repo, storageName string, revisions string, all bool, snapshotID string) cliInvocation {
 	args := []string{"check"}
 	if storageName != "" {
@@ -303,6 +308,7 @@ func invocationForCheck(repo *Repo, storageName string, revisions string, all bo
 	if all {
 		args = append(args, "-all")
 	}
+	args = append(args, "-tabular")
 	return cliInvocation{RepoRoot: repo.Path, Args: args}
 }
 

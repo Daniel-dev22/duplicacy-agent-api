@@ -72,6 +72,35 @@ func newEventBuffer(cfg Config, client *http.Client) (*eventBuffer, error) {
 			last_error  TEXT
 		);
 		CREATE INDEX IF NOT EXISTS idx_pending_events_id ON pending_events(id);
+
+		CREATE TABLE IF NOT EXISTS snapshot_stats (
+			snapshot_id        TEXT    NOT NULL,
+			revision           INTEGER NOT NULL,
+			repo_id            TEXT    NOT NULL,
+			storage_name       TEXT    NOT NULL,
+			destination_key    TEXT    NOT NULL,
+			destination_label  TEXT    NOT NULL,
+			files              INTEGER,
+			bytes              INTEGER,
+			bytes_pretty       TEXT,
+			total_chunks       INTEGER,
+			total_bytes        INTEGER,
+			total_bytes_pretty TEXT,
+			uniq_chunks        INTEGER,
+			uniq_bytes         INTEGER,
+			uniq_bytes_pretty  TEXT,
+			new_chunks         INTEGER,
+			new_bytes          INTEGER,
+			new_bytes_pretty   TEXT,
+			captured_at        TIMESTAMP NOT NULL,
+			PRIMARY KEY (snapshot_id, revision, storage_name)
+		);
+		CREATE INDEX IF NOT EXISTS idx_snapshot_stats_dest_time
+			ON snapshot_stats (destination_key, captured_at);
+		CREATE INDEX IF NOT EXISTS idx_snapshot_stats_captured
+			ON snapshot_stats (captured_at);
+		CREATE INDEX IF NOT EXISTS idx_snapshot_stats_repo
+			ON snapshot_stats (repo_id);
 	`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
@@ -83,6 +112,16 @@ func newEventBuffer(cfg Config, client *http.Client) (*eventBuffer, error) {
 		db:     db,
 		stop:   make(chan struct{}),
 	}, nil
+}
+
+// DB returns the shared SQLite handle so other subsystems (snapshot_stats)
+// can use the same Open/WAL pair. Returns nil if the buffer hasn't been
+// initialised — callers should still construct.
+func (e *eventBuffer) DB() *sql.DB {
+	if e == nil {
+		return nil
+	}
+	return e.db
 }
 
 func (e *eventBuffer) close() {
