@@ -108,6 +108,11 @@ func buildControlCenterClient(cfg Config) (*http.Client, error) {
 // automatically; controller hashes the token, looks up the row in
 // duplicacy_node_tokens, and asserts the stored node matches :node.
 //
+// Transient failures (network error, 5xx) are retried with exponential
+// backoff inside the caller's ctx budget. Permanent failures (401, 403, 404)
+// short-circuit immediately — there is no value in retrying an auth or
+// provisioning mismatch.
+//
 // On HTTP error, the agent must NOT fall back to on-disk creds — the caller
 // should fail the duplicacy invocation outright.
 func fetchSecrets(ctx context.Context, client *http.Client, controlCenterURL, node, credentialID string) (SecretsBundle, error) {
@@ -120,14 +125,49 @@ func fetchSecrets(ctx context.Context, client *http.Client, controlCenterURL, no
 	url := fmt.Sprintf("%s/api/duplicacy/credentials/%s/secrets-for-node/%s",
 		controlCenterURL, credentialID, node)
 
+	// Bounded retry on transient failures. 4 attempts × backoff (0, 500ms, 1s,
+	// 2s) = ~3.5s worst case, fits inside prepareEnvForRepo's 30s ctx with
+	// plenty of room for the actual request. Witness for this retry: the
+	// 2026-05-27 02:07 controller DB pressure window — the agent saw transient
+	// 503 on bearer-token lookup and dropped the schedule entirely; with retry,
+	// the recovery 5s later would have picked it up.
+	const maxAttempts = 4
+	backoff := 500 * time.Millisecond
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return SecretsBundle{}, fmt.Errorf("vend ctx done before retry: %w", ctx.Err())
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+
+		b, transient, err := fetchSecretsOnce(ctx, client, url, credentialID, node)
+		if err == nil {
+			return b, nil
+		}
+		if !transient {
+			return SecretsBundle{}, err
+		}
+		lastErr = err
+	}
+	return SecretsBundle{}, fmt.Errorf("vend transient failure after %d attempts: %w", maxAttempts, lastErr)
+}
+
+// fetchSecretsOnce is a single attempt at the vend HTTP call. Returns
+// (bundle, transient, error). When transient=true the caller may retry.
+func fetchSecretsOnce(ctx context.Context, client *http.Client, url, credentialID, node string) (SecretsBundle, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return SecretsBundle{}, fmt.Errorf("build vend request: %w", err)
+		return SecretsBundle{}, false, fmt.Errorf("build vend request: %w", err)
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return SecretsBundle{}, fmt.Errorf("call controller: %w", err)
+		// Network-layer errors (dial / TLS / read) are transient.
+		return SecretsBundle{}, true, fmt.Errorf("call controller: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -135,25 +175,29 @@ func fetchSecrets(ctx context.Context, client *http.Client, controlCenterURL, no
 	case http.StatusOK:
 		// fall through
 	case http.StatusUnauthorized:
-		return SecretsBundle{}, fmt.Errorf("controller rejected bearer token (provisioning issue?): %s", readErrorBody(resp.Body))
+		return SecretsBundle{}, false, fmt.Errorf("controller rejected bearer token (provisioning issue?): %s", readErrorBody(resp.Body))
 	case http.StatusForbidden:
-		return SecretsBundle{}, fmt.Errorf("controller denied secrets for credential %s on node %s (no repo↔credential link or token/node mismatch)",
+		return SecretsBundle{}, false, fmt.Errorf("controller denied secrets for credential %s on node %s (no repo↔credential link or token/node mismatch)",
 			credentialID, node)
 	case http.StatusNotFound:
-		return SecretsBundle{}, fmt.Errorf("credential %s not found on controller", credentialID)
+		return SecretsBundle{}, false, fmt.Errorf("credential %s not found on controller", credentialID)
+	case http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout, http.StatusInternalServerError:
+		// Controller side hiccup (DB pressure, traefik upstream timeout,
+		// rolling restart). Retry.
+		return SecretsBundle{}, true, fmt.Errorf("controller transient %d: %s", resp.StatusCode, readErrorBody(resp.Body))
 	default:
-		return SecretsBundle{}, fmt.Errorf("controller returned %d: %s", resp.StatusCode, readErrorBody(resp.Body))
+		return SecretsBundle{}, false, fmt.Errorf("controller returned %d: %s", resp.StatusCode, readErrorBody(resp.Body))
 	}
 
 	var b SecretsBundle
 	if err := decodeJSONBody(resp.Body, &b); err != nil {
-		return SecretsBundle{}, fmt.Errorf("decode vend response: %w", err)
+		return SecretsBundle{}, false, fmt.Errorf("decode vend response: %w", err)
 	}
 	if b.EncryptionPassword == "" {
-		return SecretsBundle{}, fmt.Errorf("vend response missing encryption_password")
+		return SecretsBundle{}, false, fmt.Errorf("vend response missing encryption_password")
 	}
 	if b.StorageType == "" {
-		return SecretsBundle{}, fmt.Errorf("vend response missing storage_type")
+		return SecretsBundle{}, false, fmt.Errorf("vend response missing storage_type")
 	}
-	return b, nil
+	return b, false, nil
 }
