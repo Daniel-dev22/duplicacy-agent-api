@@ -32,6 +32,12 @@ func main() {
 	}
 	defer app.close()
 
+	// Orphan-job sweep — recover controller rows stuck in running/pending
+	// from a prior container exit before the HTTP listener opens. Bounded
+	// 15s timeout inside; non-fatal on failure so a slow controller doesn't
+	// block boot.
+	sweepOrphanJobs(ctx, cfg, app.controlCenterClient, app.events)
+
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
