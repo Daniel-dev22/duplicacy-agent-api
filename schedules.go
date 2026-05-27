@@ -21,14 +21,33 @@ package main
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	kitsched "github.com/Daniel-dev22/agent-kit-go/scheduler"
 )
+
+// fireJitter returns a deterministic delay in [0, cap) for a given (node,
+// scheduleID) pair. Same pair always yields the same offset so reconcile
+// pulls and event posts stay aligned with the chosen fire window across
+// agent restarts — only the WHOLE-FLEET burst is smeared, not individual
+// schedules' cadence.
+func fireJitter(node, scheduleID string, cap time.Duration) time.Duration {
+	if cap <= 0 {
+		return 0
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(node))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(scheduleID))
+	return time.Duration(h.Sum64()%uint64(cap.Nanoseconds())) * time.Nanosecond
+}
 
 // prepareEnvFn returns env vars + per-alias RSA private key paths + cleanup
 // func for one duplicacy invocation against the given repo. Implemented by
@@ -73,6 +92,27 @@ func newScheduler(cfg Config, client *http.Client, jobs *jobRegistry, repos *rep
 // boundary).
 func makeDuplicacyFire(cfg Config, jobs *jobRegistry, repos *repoIndex, prepareEnv prepareEnvFn) kitsched.FireFunc {
 	return func(ctx context.Context, sch kitsched.LocalSchedule, triggerKey string, missedRecovery bool) error {
+		// Per-agent + per-schedule fire jitter: deterministically delay the
+		// fire by 0–60s based on hash(node + schedule_id). Without this,
+		// every agent on the fleet fires at the SAME second (02:00:00 etc.)
+		// and the resulting reconcile-pull + event-ingest burst overwhelms
+		// the controller's pgxpool (MaxConns=8 on the 512Mi CNPG pod).
+		// Witnessed 2026-05-27 02:07 when the router returned HTTP 502 to
+		// multiple agents for ~90s. Jitter spreads the load across a
+		// minute; the bearer-token / vend retry handles any residual.
+		//
+		// Manual triggers (triggerKey == "manual" or "manual-*") skip the
+		// jitter — operator-initiated runs should fire immediately.
+		if !strings.HasPrefix(triggerKey, "manual") {
+			jitter := fireJitter(cfg.NodeName, sch.ID, 60*time.Second)
+			if jitter > 0 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(jitter):
+				}
+			}
+		}
 		// sch.RepoID is the duplicacy snapshot_id (matches controller's
 		// duplicacy_repos.repo_id column), NOT the agent's 12-char path-hash
 		// Repo.ID. Use getBySnapshotID — the original implementation hit
