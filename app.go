@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 
 	"github.com/gin-gonic/gin"
 )
@@ -41,6 +42,13 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 
 	jobs := newJobRegistry()
 	jobs.RegisterHook(events.handleJobEvent)
+
+	// Persist per-job ring buffers under ${CONFIG_DIR}/job-logs on terminal.
+	// Prune oldest beyond jobLogRetainN at boot so we don't carry history
+	// forever across restarts.
+	jobLogDir := filepath.Join(cfg.ConfigDir, "job-logs")
+	jobs.setJobLogDir(jobLogDir)
+	pruneJobLogs(jobLogDir, jobLogRetainN)
 
 	repos := newRepoIndex(cfg.BackupRoots, cfg.DuplicacyBinary, cfg.LegacyBackuprootMap, cfg.BackupExcludePaths)
 

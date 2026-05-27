@@ -311,6 +311,12 @@ type jobRegistry struct {
 	terminal      []string // ring of terminated job IDs in terminate-order; bounded by recentJobsRetained
 	hooks         []JobEventHook
 	progressHooks []func(*Job) // lighter-weight than JobEventHook; called on progress line parse
+
+	// jobLogDir, when non-empty, is where ring buffers are flushed on job
+	// terminal. Set via setJobLogDir() once the agent's CONFIG_DIR is known.
+	// Without it, the registry just falls back to the in-memory ring buffer
+	// (legacy behaviour). See flushJobLog() for the on-disk format.
+	jobLogDir string
 }
 
 func newJobRegistry() *jobRegistry {
@@ -319,6 +325,9 @@ func newJobRegistry() *jobRegistry {
 		terminal: make([]string, 0, recentJobsRetained+1),
 	}
 }
+
+// setJobLogDir wires the on-disk job-log directory. Idempotent.
+func (r *jobRegistry) setJobLogDir(dir string) { r.jobLogDir = dir }
 
 func (r *jobRegistry) RegisterHook(h JobEventHook) {
 	r.mu.Lock()
@@ -463,6 +472,16 @@ func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo
 
 		if cleanup != nil {
 			cleanup()
+		}
+
+		// Flush the ring buffer to disk so failed jobs can be diagnosed
+		// post-mortem (after the agent restarts or the ring buffer rolls).
+		// Best-effort: a write error is non-fatal — operator still has the
+		// agent stdout + DB row to work from. See flushJobLog.
+		if r.jobLogDir != "" {
+			if err := flushJobLog(r.jobLogDir, j); err != nil {
+				slog.Warn("job-log flush failed (non-fatal)", "job", j.ID, "error", err)
+			}
 		}
 
 		r.markTerminated(j)
