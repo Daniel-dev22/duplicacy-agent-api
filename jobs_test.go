@@ -41,6 +41,26 @@ func TestParseProgressLine(t *testing.T) {
 			wantETA:   "03:12:54",
 			wantPct:   0.7,
 		},
+		// Copy variant — different shape than backup/restore. Hash instead
+		// of bare idx, parenthesized (idx/total), no "size N," segment.
+		// Witness 2026-05-27: every cross-site copy ran without progress
+		// because the original regex didn't match these lines.
+		{
+			line:      "Copied chunk 4ac96c2e6b3f06f9dbb860a8bee48947e3a1ba18fadf78b0029268e791f719d3 (2/1274) 4.15MB/s 00:19:32 0.2%",
+			wantMatch: true,
+			wantChunk: 2,
+			wantSpeed: "4.15MB/s",
+			wantETA:   "00:19:32",
+			wantPct:   0.2,
+		},
+		{
+			line:      "Copied chunk abc (1274/1274) 10.5MB/s 0h 0m 0s 100.0%",
+			wantMatch: true,
+			wantChunk: 1274,
+			wantSpeed: "10.5MB/s",
+			wantETA:   "0h 0m 0s",
+			wantPct:   100.0,
+		},
 		// Non-progress lines should be ignored
 		{line: "Listing all chunks", wantMatch: false},
 		{line: "INFO BACKUP_START Last backup at revision 28956 found", wantMatch: false},
