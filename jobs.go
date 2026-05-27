@@ -194,33 +194,63 @@ var progressLineRe = regexp.MustCompile(
 	`^(Uploaded|Downloaded) chunk (\d+) size (\d+), (\S+) (.+?) ([\d.]+)%$`,
 )
 
+// copyProgressLineRe matches the COPY action's progress lines, which use a
+// different shape than backup/restore — see
+// reference_duplicacy_copy_progress_format memory entry. Format
+// (duplicacy 3.2.5):
+//
+//	Copied chunk <hash> (<idx>/<total>) <speed>MB/s <ETA> <pct>%
+//
+// e.g.:
+//	Copied chunk 4ac96c2e...d3 (2/1274) 4.15MB/s 00:19:32 0.2%
+//
+// Groups: chunk_hash, idx, total, speed, eta, percent.
+//
+// ETA is captured non-greedily for the same reason as the backup regex
+// (PrettyTime can emit space-separated tokens like "0h 2m 30s").
+var copyProgressLineRe = regexp.MustCompile(
+	`^Copied chunk (\S+) \((\d+)/(\d+)\) (\S+) (.+?) ([\d.]+)%$`,
+)
+
 // parseProgressLine updates Job.Progress from a duplicacy stdout line.
 // Returns true if the line was a recognised progress line. Cheap regex
-// match run for every backup/restore-action line.
+// match run for every backup/restore/copy-action line.
 func (j *Job) parseProgressLine(line string) bool {
-	m := progressLineRe.FindStringSubmatch(line)
-	if m == nil {
-		return false
+	if m := progressLineRe.FindStringSubmatch(line); m != nil {
+		return j.applyProgress(m[4], m[5], m[6], m[2], "")
 	}
-	chunkIdx, _ := strconv.Atoi(m[2])
-	pct, err := strconv.ParseFloat(m[6], 64)
+	if m := copyProgressLineRe.FindStringSubmatch(line); m != nil {
+		// Copy lines: m[2]=idx, m[3]=total, m[4]=speed, m[5]=eta, m[6]=pct
+		return j.applyProgress(m[4], m[5], m[6], m[2], m[3])
+	}
+	return false
+}
+
+// applyProgress updates Job.Progress from parsed regex groups. totalStr
+// is empty for backup/restore (no per-line total) and "<N>" for copy.
+func (j *Job) applyProgress(speed, eta, pctStr, idxStr, totalStr string) bool {
+	pct, err := strconv.ParseFloat(pctStr, 64)
 	if err != nil {
 		return false
 	}
-	// Cap percent at 100 — duplicacy's restore counter divides by 10 and
-	// can exceed 100% on incremental snapshots that re-touch chunks.
 	if pct > 100 {
 		pct = 100
 	}
+	chunkIdx, _ := strconv.Atoi(idxStr)
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.Progress == nil {
 		j.Progress = &JobProgress{}
 	}
 	j.Progress.Percent = pct
-	j.Progress.Speed = m[4]
-	j.Progress.ETA = m[5]
+	j.Progress.Speed = speed
+	j.Progress.ETA = eta
 	j.Progress.LastChunk = chunkIdx
+	if totalStr != "" {
+		if n, err := strconv.Atoi(totalStr); err == nil {
+			j.Progress.TotalChunks = n
+		}
+	}
 	j.Progress.UpdatedAt = time.Now().UTC()
 	return true
 }
