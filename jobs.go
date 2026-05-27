@@ -68,12 +68,15 @@ const recentJobsRetained = 50
 // subscriberBuffer: lines a slow subscriber can lag before we drop oldest from its channel.
 const subscriberBuffer = 256
 
-// JobProgress is the structured form of duplicacy's backup-time
-// "Uploaded chunk N size X, Y/s ETA HH:MM:SS Z%" lines. Populated as the
-// agent tails stdout; cleared (nil) before backup starts and after it
-// completes. Other actions (restore, check, prune) don't emit a percent
-// reliably so we skip parsing them — the raw log stream remains the
-// source of truth for those.
+// JobProgress is the structured form of duplicacy progress lines, populated
+// as the agent tails stdout. Field set varies by action:
+//
+//   - backup / restore / copy: Percent + Speed + ETA + LastChunk (chunk lines).
+//     Backup also fills the BACKUP_STATS summary group (TotalChunks, NewChunks,
+//     BytesUploaded, Duration) on completion.
+//   - check: Percent is derived as CheckRevisionsVerified/CheckRevisionsTotal*100
+//     (no native percent emitted; counters drive the bar).
+//   - prune: no Percent (total work unknown up-front); counters only.
 type JobProgress struct {
 	Percent   float64   `json:"percent"`
 	Speed     string    `json:"speed,omitempty"`      // verbatim ("7.50MB/s") — running only
@@ -87,6 +90,15 @@ type JobProgress struct {
 	NewChunks     int    `json:"new_chunks,omitempty"`     // "; <N> new, …"
 	BytesUploaded string `json:"bytes_uploaded,omitempty"` // verbatim "669K"
 	Duration      string `json:"duration,omitempty"`       // verbatim "00:00:02"
+
+	// Check counters — Percent is derived as verified/total*100.
+	CheckRevisionsTotal    int `json:"check_revisions_total,omitempty"`
+	CheckRevisionsVerified int `json:"check_revisions_verified,omitempty"`
+
+	// Prune counters — no percent; total work is unknown until done.
+	PruneSnapshotsRemoved int `json:"prune_snapshots_removed,omitempty"`
+	PruneChunksDeleted    int `json:"prune_chunks_deleted,omitempty"`
+	PruneFossilsProcessed int `json:"prune_fossils_processed,omitempty"`
 }
 
 // jobPublic carries the JSON-serializable fields of a Job. It is split out
@@ -123,6 +135,25 @@ type Job struct {
 	ringBuffer  []string
 	subscribers map[chan string]struct{}
 	cleanup     func() // unlink tmpfs cred files after cmd.Wait() returns
+
+	// tabular parser state (check jobs only). Populated under j.mu by tail()
+	// when Action == ActionCheck; drained by takeTabularRows() on the
+	// completion hook path, which UPSERTs into snapshot_stats.
+	tabular     *checkTabularParser
+	tabularRows []*snapshotStatRow
+}
+
+// takeTabularRows returns and clears the rows collected during a check job's
+// tabular parse. Returns nil if no rows were collected (e.g. for non-check
+// actions, or check that failed before emitting the table). Safe to call
+// from the completion-hook goroutine — it locks j.mu.
+func (j *Job) takeTabularRows() []*snapshotStatRow {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	rows := j.tabularRows
+	j.tabularRows = nil
+	j.tabular = nil
+	return rows
 }
 
 // snapshot returns a lock-free copy of the JSON-serializable fields.
@@ -252,6 +283,109 @@ func (j *Job) applyProgress(speed, eta, pctStr, idxStr, totalStr string) bool {
 		}
 	}
 	j.Progress.UpdatedAt = time.Now().UTC()
+	return true
+}
+
+// checkRevisionsTotalRe captures the "<N> snapshots and <M> revisions" line
+// duplicacy emits early in `check`. M is the work-total we divide against
+// when deriving Percent. Source: duplicacy_snapshotmanager.go (SNAPSHOT_CHECK).
+var checkRevisionsTotalRe = regexp.MustCompile(
+	`^INFO SNAPSHOT_CHECK \d+ snapshots and (\d+) revisions$`,
+)
+
+// checkRevisionDoneRe fires once per verified revision; increments the
+// verified-counter on every match.
+var checkRevisionDoneRe = regexp.MustCompile(
+	`^INFO SNAPSHOT_CHECK All chunks referenced by snapshot \S+ at revision \d+ exist$`,
+)
+
+// parseCheckLine bumps CheckRevisions{Total,Verified} from `check` stdout
+// and recomputes Percent. Returns true on any match so the caller can fire
+// the progress hook.
+func (j *Job) parseCheckLine(line string) bool {
+	if m := checkRevisionsTotalRe.FindStringSubmatch(line); m != nil {
+		total, err := strconv.Atoi(m[1])
+		if err != nil {
+			return false
+		}
+		j.mu.Lock()
+		if j.Progress == nil {
+			j.Progress = &JobProgress{}
+		}
+		j.Progress.CheckRevisionsTotal = total
+		if total > 0 {
+			j.Progress.Percent = float64(j.Progress.CheckRevisionsVerified) / float64(total) * 100
+		}
+		j.Progress.UpdatedAt = time.Now().UTC()
+		j.mu.Unlock()
+		return true
+	}
+	if checkRevisionDoneRe.MatchString(line) {
+		j.mu.Lock()
+		if j.Progress == nil {
+			j.Progress = &JobProgress{}
+		}
+		j.Progress.CheckRevisionsVerified++
+		if j.Progress.CheckRevisionsTotal > 0 {
+			pct := float64(j.Progress.CheckRevisionsVerified) / float64(j.Progress.CheckRevisionsTotal) * 100
+			if pct > 100 {
+				pct = 100
+			}
+			j.Progress.Percent = pct
+		}
+		j.Progress.UpdatedAt = time.Now().UTC()
+		j.mu.Unlock()
+		return true
+	}
+	return false
+}
+
+// pruneSnapshotRemovedRe / pruneChunkDeletedRe / pruneFossilCollectedRe
+// match duplicacy's per-action log lines during `prune`. We have no total to
+// divide against, so Percent stays at 0 and the UI shows an indeterminate
+// bar + the live counters. Source: duplicacy_snapshotmanager.go +
+// duplicacy_chunkoperator.go.
+var (
+	pruneSnapshotRemovedRe = regexp.MustCompile(
+		`^INFO SNAPSHOT_DELETE The snapshot \S+ at revision \d+ has been removed$`,
+	)
+	pruneChunkDeletedRe = regexp.MustCompile(
+		`^INFO CHUNK_DELETE The chunk \S+ has been permanently removed$`,
+	)
+	pruneFossilCollectedRe = regexp.MustCompile(
+		`^INFO FOSSIL_COLLECT Fossil collection \d+ saved$`,
+	)
+)
+
+// parsePruneLine bumps one of the three prune counters per matching line.
+// Returns true on any match.
+func (j *Job) parsePruneLine(line string) bool {
+	var field *int
+	switch {
+	case pruneSnapshotRemovedRe.MatchString(line):
+		j.mu.Lock()
+		if j.Progress == nil {
+			j.Progress = &JobProgress{}
+		}
+		field = &j.Progress.PruneSnapshotsRemoved
+	case pruneChunkDeletedRe.MatchString(line):
+		j.mu.Lock()
+		if j.Progress == nil {
+			j.Progress = &JobProgress{}
+		}
+		field = &j.Progress.PruneChunksDeleted
+	case pruneFossilCollectedRe.MatchString(line):
+		j.mu.Lock()
+		if j.Progress == nil {
+			j.Progress = &JobProgress{}
+		}
+		field = &j.Progress.PruneFossilsProcessed
+	default:
+		return false
+	}
+	*field++
+	j.Progress.UpdatedAt = time.Now().UTC()
+	j.mu.Unlock()
 	return true
 }
 
@@ -535,9 +669,35 @@ func (r *jobRegistry) tail(j *Job, rdr io.Reader, source string) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		j.appendLine(line)
-		// Progress parse — backup, restore, and copy all emit "Uploaded/Downloaded chunk …".
-		if j.Action == ActionBackup || j.Action == ActionRestore || j.Action == ActionCopy {
-			if updated := j.parseProgressLine(line); updated {
+		// Progress parse — shape depends on action. Backup/restore/copy use the
+		// chunk progress lines; check derives percent from revision counters;
+		// prune just counts (no percent). One match → one fleet snapshot push.
+		switch j.Action {
+		case ActionBackup, ActionRestore, ActionCopy:
+			if j.parseProgressLine(line) {
+				r.emitProgress(j)
+			}
+		case ActionCheck:
+			if j.parseCheckLine(line) {
+				r.emitProgress(j)
+			}
+			// Tabular table parse runs in parallel with the per-revision
+			// counter parse — the table comes from `check -tabular` (always-on),
+			// the counters come from the SNAPSHOT_CHECK summary lines that
+			// appear regardless. Both fire for the same job.
+			j.mu.Lock()
+			if j.tabular == nil {
+				j.tabular = &checkTabularParser{}
+			}
+			parser := j.tabular
+			j.mu.Unlock()
+			if row := parser.feed(line); row != nil {
+				j.mu.Lock()
+				j.tabularRows = append(j.tabularRows, row)
+				j.mu.Unlock()
+			}
+		case ActionPrune:
+			if j.parsePruneLine(line) {
 				r.emitProgress(j)
 			}
 		}

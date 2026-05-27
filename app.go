@@ -19,7 +19,8 @@ type app struct {
 	scheduler           *scheduler
 	filters             *filterCache
 	events              *eventBuffer
-	mapping             *repoMappingStore // controller-managed repo↔credential mapping
+	snapshotStats       *snapshotStatsStore // per-snapshot dedup rows from `check -tabular`
+	mapping             *repoMappingStore   // controller-managed repo↔credential mapping
 	secrets             *secretCache      // 60s TTL cache of vended bundles
 	compose             *composeIndex     // bounded scan of mounted COMPOSE_SCAN_ROOTS for compose project dirs
 	fleet               *fleetHub         // /ws/fleet broadcaster — pushes snapshot on init / job state change
@@ -80,12 +81,23 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 		jobs:                jobs,
 		repos:               repos,
 		events:              events,
+		snapshotStats:       newSnapshotStatsStore(events.DB()),
 		filters:             filters,
 		mapping:             mapping,
 		secrets:             newSecretCache(),
 		compose:             newComposeIndex(cfg.ComposeScanRoots),
 		stop:                make(chan struct{}),
 	}
+	// Flush per-snapshot dedup rows captured during a `check -tabular` run
+	// into snapshot_stats on terminal state. Runs in a goroutine because the
+	// completion hook fires from cmd.Wait()'s tail goroutine — we don't want
+	// to block job teardown on a slow SQLite write.
+	jobs.RegisterHook(func(j *Job, evt JobEvent) {
+		if evt != EventCompleted || j.snapshot().Action != ActionCheck {
+			return
+		}
+		go a.flushSnapshotStats(j)
+	})
 	a.fleet = newFleetHub(a)
 	// Trigger a fleet snapshot on every job lifecycle event so connected
 	// dashboards see state transitions in real time.
