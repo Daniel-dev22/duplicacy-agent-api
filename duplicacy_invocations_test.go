@@ -46,7 +46,7 @@ func TestInvocationForCopy(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			inv := invocationForCopy(repo, tc.from, tc.to, tc.threads, tc.snapshotID)
+			inv := invocationForCopy(repo, tc.from, tc.to, tc.threads, tc.snapshotID, "", "")
 			if inv.RepoRoot != "/relay" {
 				t.Errorf("RepoRoot = %q, want /relay", inv.RepoRoot)
 			}

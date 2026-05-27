@@ -976,12 +976,16 @@ func (a *app) handleCopy(c *gin.Context) {
 	}
 	// prepareEnvForRepo vends env for ALL of the repo's storages, so both
 	// -from and -to credentials are available without per-call selection.
-	env, _, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	// rsaPriv carries per-alias RSA priv key paths; pass the SOURCE's to
+	// `duplicacy copy -key` so RSA-encrypted source snapshot indices can be
+	// read. The matching passphrase (if any) reaches duplicacy via the
+	// DUPLICACY_RSA_PASSPHRASE env var already in `env`.
+	env, rsaPriv, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
 		return
 	}
-	inv := invocationForCopy(repo, req.From, req.To, req.Threads, req.SnapshotID)
+	inv := invocationForCopy(repo, req.From, req.To, req.Threads, req.SnapshotID, rsaPriv[req.From], "")
 	inv.EnvAdds = append(inv.EnvAdds, env...)
 	// Detached context — see handleBackup comment. StorageName on the job is
 	// the destination alias so the fleet WS shows "copy to b2" rather than the
