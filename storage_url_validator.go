@@ -23,11 +23,25 @@ import (
 )
 
 // ValidateStorageURL applies the per-backend shape check. Returns nil when
-// the URL is acceptable. Empty templated placeholders (`{home}` etc.) are
-// the controller's responsibility — agent always sees resolved URLs.
+// the URL is acceptable.
+//
+// The controller stores URLs with templated placeholders (`{home}`,
+// `{remote_home}`, `{site}`, `{server_type}`) that get resolved at
+// init/add time and baked into `.duplicacy/preferences`. The vended URL
+// itself isn't used as a literal connection target at runtime —
+// duplicacy reads the already-resolved URL from preferences. So we skip
+// per-backend host/path validation for templated URLs.
+//
+// We still validate the Storj S3 region for templated URLs because the
+// region is a literal ("US1"/"EU1"/"AP1") that precedes the @ separator
+// and can't carry a placeholder — that's the exact misconfig the
+// validator was added to catch.
 func ValidateStorageURL(storageType, rawURL string) error {
 	if strings.Contains(rawURL, "{") || strings.Contains(rawURL, "}") {
-		return fmt.Errorf("storage URL still contains template placeholders: %q (controller resolution didn't run)", rawURL)
+		if storageType == "s3" || storageType == "s3c" {
+			return validateS3URL(rawURL)
+		}
+		return nil
 	}
 	switch storageType {
 	case "sftp":
@@ -118,11 +132,14 @@ func validateS3URL(raw string) error {
 	if strings.Contains(endpoint, "storjshare.io") && !storjRegions[region] {
 		return fmt.Errorf("storj s3 URL region %q not in {US1,EU1,AP1}: %q", region, raw)
 	}
-	// Bucket+prefix presence check.
-	bp := rest[atIdx+1:]
-	slashIdx := strings.Index(bp, "/")
-	if slashIdx < 0 || slashIdx == len(bp)-1 {
-		return fmt.Errorf("s3 URL missing bucket: %q", raw)
+	// Bucket+prefix presence check — skipped for templated URLs since the
+	// bucket name itself can be a placeholder like {home}.
+	if !strings.Contains(raw, "{") {
+		bp := rest[atIdx+1:]
+		slashIdx := strings.Index(bp, "/")
+		if slashIdx < 0 || slashIdx == len(bp)-1 {
+			return fmt.Errorf("s3 URL missing bucket: %q", raw)
+		}
 	}
 	return nil
 }

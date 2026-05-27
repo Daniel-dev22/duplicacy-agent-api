@@ -37,8 +37,18 @@ func TestValidateStorageURL(t *testing.T) {
 		// GCS
 		{"gcs ok", "gcs", "gcs://my-bucket", ""},
 		{"gcs missing bucket", "gcs", "gcs://", "missing bucket"},
-		// Template placeholders not resolved
-		{"template not resolved", "sftp", "sftp://backup@nas.{remote_home}apps.com:22//path", "template placeholders"},
+		// Templated URLs are EXPECTED in vended bundles — controller stores
+		// them with {home}/{site}/{remote_home}/{server_type}; duplicacy
+		// reads the resolved URL from .duplicacy/preferences at runtime,
+		// the vended URL is never used as a literal connection target.
+		// Validation skips host/path/bucket shape for templated URLs.
+		{"templated sftp ok", "sftp", "sftp://backup@nas.{remote_home}apps.com:22//mnt/array/{home}_backup/duplicacy", ""},
+		{"templated b2 ok", "b2", "b2://{home}-bucket/prefix", ""},
+		{"templated gcs ok", "gcs", "gcs://{home}-bucket", ""},
+		// Storj S3 region IS a literal (never templated) — region check
+		// still applies even for otherwise-templated URLs.
+		{"templated storj US1 ok", "s3", "s3://US1@gateway.storjshare.io/{home}/{site}-{server_type}/duplicacy", ""},
+		{"templated storj BAD region", "s3", "s3://us1@gateway.storjshare.io/{home}/{site}-{server_type}/duplicacy", "not in {US1,EU1,AP1}"},
 		// Unknown type
 		{"unknown type → no-op", "weird-future-backend", "anything://goes", ""},
 	}
