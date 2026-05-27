@@ -26,6 +26,12 @@ func main() {
 		"site", cfg.SiteID,
 		"backup_roots", cfg.BackupRoots)
 
+	// Report how long the previous instance was offline. Logs WARN on a
+	// >2 min gap (likely crash/OOM/restart). Must run BEFORE newApp opens
+	// any DB so a "first boot" / "clean shutdown" / "long downtime" line
+	// is the very first record we emit for this boot.
+	reportBootGap(cfg)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -35,6 +41,11 @@ func main() {
 		os.Exit(1)
 	}
 	defer app.close()
+
+	// Persistent heartbeat — 30s tick writes a Unix-nano timestamp to
+	// ${CONFIG_DIR}/heartbeat.last. Clean shutdown writes "0" so the
+	// next boot's reportBootGap can distinguish stop vs crash.
+	go heartbeatLoop(ctx, cfg, 30*time.Second)
 
 	// Orphan-job sweep — recover controller rows stuck in running/pending
 	// from a prior container exit before the HTTP listener opens. Bounded
