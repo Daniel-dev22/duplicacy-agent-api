@@ -138,10 +138,7 @@ func (h *fleetHub) Run(ctx context.Context) {
 				h.sendOne(c, ev)
 			}
 		case c := <-h.unregister:
-			h.mu.Lock()
-			delete(h.clients, c)
-			h.mu.Unlock()
-			close(c.send)
+			h.handleUnregister(c)
 		case <-h.trigger:
 			ev, ok := h.buildSnapshot()
 			if !ok {
@@ -149,6 +146,23 @@ func (h *fleetHub) Run(ctx context.Context) {
 			}
 			h.broadcast(ev)
 		}
+	}
+}
+
+// handleUnregister removes a client and closes its send channel exactly once.
+// A client can reach unregister from two paths — sendOne() on a full buffer and
+// the WS handler's read-pump defer on disconnect — so the close MUST be guarded
+// on still-present membership. Without the guard the second unregister double-
+// closes c.send → `panic: close of closed channel`, which crashed the whole
+// agent under bursty job churn. Runs only on the Run() goroutine, so the
+// map check + close are not racing another unregister.
+func (h *fleetHub) handleUnregister(c *fleetClient) {
+	h.mu.Lock()
+	_, present := h.clients[c]
+	delete(h.clients, c)
+	h.mu.Unlock()
+	if present {
+		close(c.send)
 	}
 }
 
