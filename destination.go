@@ -62,7 +62,11 @@ func DestinationKey(storageURL string) (key, label string) {
 			return "unknown://" + storageURL, "Unknown"
 		}
 		k := scheme + "://" + host + "/" + bucket
-		if strings.Contains(host, "storj.io") {
+		// Storj exposes S3 gateways under both us1.storj.io / eu1.storj.io
+		// AND gateway.storjshare.io — match on "storj" substring so either
+		// form is recognised. Pre-fix witness 2026-05-28: substring "storj.io"
+		// missed gateway.storjshare.io and the destination rendered "S3 (site-a)".
+		if strings.Contains(host, "storj") {
 			return k, "Storj (" + bucket + ")"
 		}
 		return k, "S3 (" + bucket + ")"
