@@ -211,6 +211,26 @@ type StorageRollup struct {
 	Series       []StorageSeries      `json:"series"`
 }
 
+// RepoDestinationRow is one (repo, destination) tuple — answers "what does
+// THIS repo cost on THAT destination?". Sorted by uniq_bytes DESC on the
+// frontend so the highest-floor repos surface first ("cheapest to delete
+// for the most savings"). Same Repo can appear N times if it backs up to N
+// destinations (typical for source repos that copy to local NAS + remote
+// NAS + Storj).
+type RepoDestinationRow struct {
+	RepoID                string    `json:"repo_id"`
+	RepoSnapshotID        string    `json:"snapshot_id"` // duplicacy's snapshot id — distinguishes repos within one pool
+	Node                  string    `json:"node"`        // bare hostname so the frontend can build links
+	DestinationKey        string    `json:"destination_key"`
+	DestinationLabel      string    `json:"destination_label"`
+	ReferencedBytes       int64     `json:"referenced_bytes"`
+	ReferencedBytesPretty string    `json:"referenced_bytes_pretty,omitempty"`
+	UniqBytes             int64     `json:"uniq_bytes"`
+	UniqBytesPretty       string    `json:"uniq_bytes_pretty,omitempty"`
+	SnapshotCount         int       `json:"snapshot_count"`
+	LastCheckAt           time.Time `json:"last_check_at"`
+}
+
 // rollup computes the destination summary cards + time-series for a repo
 // scope (or repo+storage scope when storageName != ""). The node-wide scope
 // is just rollup with repoIDs containing every repo on the agent.
@@ -395,6 +415,64 @@ ORDER BY destination_label, captured_at`
 	return out, nil
 }
 
+// listRepoDestinations returns one row per (snapshot_id, storage_name) tuple,
+// aggregating across the latest revision per snapshot. This is the data
+// behind /storage's "Repos by usage" table — every source repo contributing
+// chunks to a destination shows up as one row per destination it backs up
+// to. Same as queryDestinations except the GROUP BY also includes
+// snapshot_id, so repos are kept separate rather than collapsed into the
+// destination total.
+//
+// Returned rows are sorted by uniq_bytes DESC so the "biggest standalone
+// cost" repos surface first. Node is filled in from a caller-supplied map
+// (snapshot_id → node name) since the agent doesn't always know which
+// originating node a snapshot came from on its own.
+func (s *snapshotStatsStore) listRepoDestinations(ctx context.Context, node string) ([]RepoDestinationRow, error) {
+	q := `
+WITH latest AS (
+    SELECT snapshot_id, storage_name, repo_id, destination_key, destination_label,
+           total_bytes, uniq_bytes, captured_at,
+           ROW_NUMBER() OVER (
+               PARTITION BY snapshot_id, storage_name
+               ORDER BY revision DESC, captured_at DESC
+           ) AS rn
+    FROM snapshot_stats
+)
+SELECT snapshot_id, repo_id, destination_key, destination_label,
+       COALESCE(SUM(total_bytes), 0)  AS referenced_bytes,
+       COALESCE(SUM(uniq_bytes),  0)  AS uniq_bytes,
+       MAX(captured_at)               AS last_check_at,
+       COUNT(*)                       AS revision_count
+FROM latest
+WHERE rn = 1
+GROUP BY snapshot_id, repo_id, destination_key, destination_label
+ORDER BY uniq_bytes DESC`
+
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("listRepoDestinations: %w", err)
+	}
+	defer rows.Close()
+
+	var out []RepoDestinationRow
+	for rows.Next() {
+		var r RepoDestinationRow
+		var lastCheckRaw sql.NullString
+		if err := rows.Scan(&r.RepoSnapshotID, &r.RepoID, &r.DestinationKey, &r.DestinationLabel,
+			&r.ReferencedBytes, &r.UniqBytes, &lastCheckRaw, &r.SnapshotCount); err != nil {
+			return nil, fmt.Errorf("listRepoDestinations scan: %w", err)
+		}
+		if lastCheckRaw.Valid {
+			r.LastCheckAt = parseSQLiteTime(lastCheckRaw.String)
+		}
+		r.ReferencedBytesPretty = formatPrettyBytes(r.ReferencedBytes)
+		r.UniqBytesPretty = formatPrettyBytes(r.UniqBytes)
+		r.Node = node
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // repoIDFilter builds "AND repo_id IN (?, ?, …)" with the corresponding args.
 // Empty repoIDs returns "" + nil (no filter — all rows).
 func repoIDFilter(repoIDs []string) (string, []any) {
@@ -552,6 +630,21 @@ func (a *app) handleNodeStorageRollup(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, rollup)
+}
+
+// handleStorageReposBreakdown GET /storage-rollup/repos
+// Returns one row per (snapshot_id, destination_key) — the data behind the
+// "Repos by usage" table on /duplicacy/storage. Sorted by uniq_bytes DESC.
+// Node name comes from the agent config so the frontend can render links
+// back to the originating node/repo.
+func (a *app) handleStorageReposBreakdown(c *gin.Context) {
+	rows, err := a.snapshotStats.listRepoDestinations(c.Request.Context(), a.cfg.NodeName)
+	if err != nil {
+		slog.Warn("storage repos breakdown failed", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "repos breakdown: " + err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"rows": rows})
 }
 
 // parseSinceParam accepts an RFC3339 timestamp or a relative form like

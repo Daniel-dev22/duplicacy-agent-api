@@ -100,6 +100,7 @@ func registerRoutes(r *gin.Engine, app *app) {
 	r.GET("/repos/:id/snapshot-stats", app.handleListSnapshotStats)
 	r.GET("/repos/:id/storage-rollup", app.handleRepoStorageRollup)
 	r.GET("/storage-rollup", app.handleNodeStorageRollup)
+	r.GET("/storage-rollup/repos", app.handleStorageReposBreakdown)
 	r.POST("/repos/:id/backup", app.handleBackup)
 	r.POST("/repos/:id/restore", app.handleRestore)
 	r.POST("/repos/:id/check", app.handleCheck)
