@@ -37,6 +37,8 @@ func newTestStatsStore(t *testing.T) *snapshotStatsStore {
 			new_chunks         INTEGER,
 			new_bytes          INTEGER,
 			new_bytes_pretty   TEXT,
+			pool_bytes         INTEGER,
+			pool_chunks        INTEGER,
 			captured_at        TIMESTAMP NOT NULL,
 			PRIMARY KEY (snapshot_id, revision, storage_name)
 		);
@@ -73,7 +75,7 @@ func TestSnapshotStatsUpsertAndRollup(t *testing.T) {
 	t0 := time.Date(2026, 5, 20, 3, 0, 0, 0, time.UTC)
 
 	// Run 1: repo A → Storj, two revisions.
-	err := store.upsertCheckRun(ctx, "repoA", "storj", "s3://us1.storj.io/bucket-a", "Storj (bucket-a)", t0, []*snapshotStatRow{
+	err := store.upsertCheckRun(ctx, "repoA", "storj", "s3://us1.storj.io/bucket-a", "Storj (bucket-a)", t0, 400<<20, 100, []*snapshotStatRow{
 		mkRow("host01", 1, 400<<20, 400<<20, 400<<20),
 		mkRow("host01", 2, 408<<20, 8<<20, 8<<20),
 	})
@@ -84,7 +86,7 @@ func TestSnapshotStatsUpsertAndRollup(t *testing.T) {
 	// Run 2 — same repo, same revisions but new captured_at; verifies UPSERT
 	// overwrites, doesn't duplicate.
 	t1 := t0.Add(24 * time.Hour)
-	err = store.upsertCheckRun(ctx, "repoA", "storj", "s3://us1.storj.io/bucket-a", "Storj (bucket-a)", t1, []*snapshotStatRow{
+	err = store.upsertCheckRun(ctx, "repoA", "storj", "s3://us1.storj.io/bucket-a", "Storj (bucket-a)", t1, 412<<20, 103, []*snapshotStatRow{
 		mkRow("host01", 1, 400<<20, 400<<20, 400<<20),
 		mkRow("host01", 2, 408<<20, 8<<20, 8<<20),
 		mkRow("host01", 3, 412<<20, 4<<20, 4<<20),
@@ -95,7 +97,7 @@ func TestSnapshotStatsUpsertAndRollup(t *testing.T) {
 
 	// Run 3 — second repo on same destination so we can prove the rollup sums
 	// across repos pointing at the same physical place.
-	err = store.upsertCheckRun(ctx, "repoB", "storj", "s3://us1.storj.io/bucket-a", "Storj (bucket-a)", t1, []*snapshotStatRow{
+	err = store.upsertCheckRun(ctx, "repoB", "storj", "s3://us1.storj.io/bucket-a", "Storj (bucket-a)", t1, 412<<20, 103, []*snapshotStatRow{
 		mkRow("host02", 1, 200<<20, 200<<20, 200<<20),
 	})
 	if err != nil {
@@ -155,7 +157,7 @@ func TestSnapshotStatsUpsertAndRollup(t *testing.T) {
 		// t1 because every run-1 row was overwritten by run 2 (same
 		// snapshot/revision/storage PK → UPDATE captured_at).
 		t0only := t0.Add(-1 * time.Hour)
-		err := store.upsertCheckRun(ctx, "repoA", "storj", "s3://us1.storj.io/bucket-a", "Storj (bucket-a)", t0only, []*snapshotStatRow{
+		err := store.upsertCheckRun(ctx, "repoA", "storj", "s3://us1.storj.io/bucket-a", "Storj (bucket-a)", t0only, 50<<20, 12, []*snapshotStatRow{
 			mkRow("retired-host", 99, 50<<20, 50<<20, 50<<20),
 		})
 		if err != nil {
@@ -177,12 +179,11 @@ func TestSnapshotStatsUpsertAndRollup(t *testing.T) {
 		if !pts[0].TS.Equal(t0only) || !pts[1].TS.Equal(t1) {
 			t.Errorf("timestamps unexpected: %v, %v", pts[0].TS, pts[1].TS)
 		}
-		// t1 point should sum every snapshot's latest at t1:
-		// host01 rev1+rev2+rev3 = 1220M, host02 rev1 = 200M
-		// But wait — series is "sum total_bytes at this captured_at",
-		// summed across all rows at that timestamp regardless of revision.
-		// At t1: rev1(400) + rev2(408) + rev3(412) + host02 rev1(200) = 1420M
-		wantT1 := int64((400 + 408 + 412 + 200) << 20)
+		// Series semantics: pool_bytes at this captured_at (NOT a sum across
+		// snapshots — those are denormalised duplicates). At t1, both repoA
+		// and repoB runs upserted pool_bytes=412M, so MAX = 412M. That's the
+		// actual disk usage on the destination at that moment.
+		wantT1 := int64(412 << 20)
 		if pts[1].Bytes != wantT1 {
 			t.Errorf("t1 point bytes = %d (=%s) want %d (=%s)", pts[1].Bytes, formatPrettyBytes(pts[1].Bytes), wantT1, formatPrettyBytes(wantT1))
 		}

@@ -95,6 +95,14 @@ type JobProgress struct {
 	CheckRevisionsTotal    int `json:"check_revisions_total,omitempty"`
 	CheckRevisionsVerified int `json:"check_revisions_verified,omitempty"`
 
+	// Destination pool size, parsed from "INFO SNAPSHOT_CHECK Total chunk size
+	// is X in N chunks" — emitted once per check run and represents the
+	// destination's actual deduplicated disk usage. Stays in JobProgress so the
+	// live job card can surface it as soon as the line lands.
+	CheckPoolBytes       int64  `json:"check_pool_bytes,omitempty"`
+	CheckPoolBytesPretty string `json:"check_pool_bytes_pretty,omitempty"`
+	CheckPoolChunks      int    `json:"check_pool_chunks,omitempty"`
+
 	// Prune counters — no percent; total work is unknown until done.
 	PruneSnapshotsRemoved int `json:"prune_snapshots_removed,omitempty"`
 	PruneChunksDeleted    int `json:"prune_chunks_deleted,omitempty"`
@@ -299,6 +307,14 @@ var checkRevisionDoneRe = regexp.MustCompile(
 	`^INFO SNAPSHOT_CHECK All chunks referenced by snapshot \S+ at revision \d+ exist$`,
 )
 
+// checkPoolSizeRe captures the "Total chunk size is X in N chunks" line —
+// the destination's actual deduplicated disk usage. Reported once per check
+// run near the start. duplicacy's PrettyBytes form (e.g. "1.2G", "350.4M"),
+// converted to int64 via parsePrettyBytes.
+var checkPoolSizeRe = regexp.MustCompile(
+	`^INFO SNAPSHOT_CHECK Total chunk size is (\S+) in (\d+) chunks$`,
+)
+
 // parseCheckLine bumps CheckRevisions{Total,Verified} from `check` stdout
 // and recomputes Percent. Returns true on any match so the caller can fire
 // the progress hook.
@@ -333,6 +349,19 @@ func (j *Job) parseCheckLine(line string) bool {
 			}
 			j.Progress.Percent = pct
 		}
+		j.Progress.UpdatedAt = time.Now().UTC()
+		j.mu.Unlock()
+		return true
+	}
+	if m := checkPoolSizeRe.FindStringSubmatch(line); m != nil {
+		chunks, _ := strconv.Atoi(m[2])
+		j.mu.Lock()
+		if j.Progress == nil {
+			j.Progress = &JobProgress{}
+		}
+		j.Progress.CheckPoolBytesPretty = m[1]
+		j.Progress.CheckPoolBytes = parsePrettyBytes(m[1])
+		j.Progress.CheckPoolChunks = chunks
 		j.Progress.UpdatedAt = time.Now().UTC()
 		j.mu.Unlock()
 		return true

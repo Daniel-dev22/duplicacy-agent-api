@@ -208,6 +208,27 @@ func TestParseCheckLine(t *testing.T) {
 			t.Errorf("Progress should remain nil on miss-only input, got %+v", j.Progress)
 		}
 	})
+	t.Run("pool_size_line", func(t *testing.T) {
+		j := &Job{}
+		// "Total chunk size is X in N chunks" — the destination's actual
+		// deduplicated disk usage. Drives the storage dashboard's headline.
+		if !j.parseCheckLine("INFO SNAPSHOT_CHECK Total chunk size is 350.4M in 8234 chunks") {
+			t.Fatalf("pool size line should match")
+		}
+		if j.Progress.CheckPoolBytesPretty != "350.4M" {
+			t.Errorf("CheckPoolBytesPretty=%q want 350.4M", j.Progress.CheckPoolBytesPretty)
+		}
+		// Compute via a function call so Go doesn't fold the float literal at
+		// compile-time (constant float→int64 conversion is rejected by the spec).
+		mul := func(f float64, sh uint) int64 { return int64(f * float64(int64(1)<<sh)) }
+		wantBytes := mul(350.4, 20)
+		if j.Progress.CheckPoolBytes != wantBytes {
+			t.Errorf("CheckPoolBytes=%d want %d", j.Progress.CheckPoolBytes, wantBytes)
+		}
+		if j.Progress.CheckPoolChunks != 8234 {
+			t.Errorf("CheckPoolChunks=%d want 8234", j.Progress.CheckPoolChunks)
+		}
+	})
 }
 
 // TestParsePruneLine covers the three counter lines and ensures unrelated
