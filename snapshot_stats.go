@@ -28,7 +28,7 @@ func newSnapshotStatsStore(db *sql.DB) *snapshotStatsStore { return &snapshotSta
 // repoID + storageName + destination identity travel from the job context
 // (the agent already knows them when it spawns the check); the parser only
 // produces the snapshot-id/revision-keyed numeric rows.
-func (s *snapshotStatsStore) upsertCheckRun(ctx context.Context, repoID, storageName, destKey, destLabel string, capturedAt time.Time, rows []*snapshotStatRow) error {
+func (s *snapshotStatsStore) upsertCheckRun(ctx context.Context, repoID, storageName, destKey, destLabel string, capturedAt time.Time, poolBytes int64, poolChunks int, rows []*snapshotStatRow) error {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -46,8 +46,9 @@ func (s *snapshotStatsStore) upsertCheckRun(ctx context.Context, repoID, storage
 			total_chunks, total_bytes, total_bytes_pretty,
 			uniq_chunks, uniq_bytes, uniq_bytes_pretty,
 			new_chunks, new_bytes, new_bytes_pretty,
+			pool_bytes, pool_chunks,
 			captured_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(snapshot_id, revision, storage_name) DO UPDATE SET
 			repo_id            = excluded.repo_id,
 			destination_key    = excluded.destination_key,
@@ -64,6 +65,8 @@ func (s *snapshotStatsStore) upsertCheckRun(ctx context.Context, repoID, storage
 			new_chunks         = excluded.new_chunks,
 			new_bytes          = excluded.new_bytes,
 			new_bytes_pretty   = excluded.new_bytes_pretty,
+			pool_bytes         = excluded.pool_bytes,
+			pool_chunks        = excluded.pool_chunks,
 			captured_at        = excluded.captured_at
 	`)
 	if err != nil {
@@ -79,6 +82,7 @@ func (s *snapshotStatsStore) upsertCheckRun(ctx context.Context, repoID, storage
 			r.TotalChunks, r.TotalBytes, r.TotalBytesPretty,
 			r.UniqChunks, r.UniqBytes, r.UniqBytesPretty,
 			r.NewChunks, r.NewBytes, r.NewBytesPretty,
+			poolBytes, poolChunks,
 			capturedAt,
 		); err != nil {
 			return fmt.Errorf("upsert row %s/r%d: %w", r.SnapshotID, r.Revision, err)
@@ -151,16 +155,41 @@ func (s *snapshotStatsStore) listByRepo(ctx context.Context, repoID, storageName
 }
 
 // StorageDestination is one entry on the rollup's summary-card row.
+//
+// Field semantics:
+//   - PoolBytes / PoolBytesPretty: actual deduplicated disk usage on the
+//     destination (parsed from "Total chunk size is X in N chunks"). This
+//     is what the destination is physically storing — the operator-meaningful
+//     "how much storage am I using" number. Same across all agents that share
+//     a chunk pool.
+//   - ReferencedBytes / ReferencedBytesPretty: SUM(total_bytes) across the
+//     latest revision of each snapshot in the pool — i.e. "if every snapshot
+//     stored its content alone with no sharing". Always >= PoolBytes; the
+//     gap is the dedup savings.
+//   - UniqBytes / UniqBytesPretty: SUM(uniq_bytes) — the floor of bytes that
+//     CANNOT be removed without losing data (chunks unique to one snapshot).
+//   - DedupPctPretty: human-readable percent string like "57%", ready to render.
+//   - SnapshotCount: distinct snapshot ids in the pool.
 type StorageDestination struct {
-	Key                string    `json:"key"`
-	Label              string    `json:"label"`
-	CurrentBytes       int64     `json:"current_bytes"`
-	CurrentBytesPretty string    `json:"current_bytes_pretty,omitempty"`
-	UniqBytes          int64     `json:"uniq_bytes"`
-	DedupPct           float64   `json:"dedup_pct"`
-	LastCheckAt        time.Time `json:"last_check_at"`
-	SnapshotCount      int       `json:"snapshot_count"`
-	RevisionCount      int       `json:"revision_count"`
+	Key                   string    `json:"key"`
+	Label                 string    `json:"label"`
+	PoolBytes             int64     `json:"pool_bytes"`
+	PoolBytesPretty       string    `json:"pool_bytes_pretty,omitempty"`
+	PoolChunks            int       `json:"pool_chunks,omitempty"`
+	ReferencedBytes       int64     `json:"referenced_bytes"`
+	ReferencedBytesPretty string    `json:"referenced_bytes_pretty,omitempty"`
+	UniqBytes             int64     `json:"uniq_bytes"`
+	UniqBytesPretty       string    `json:"uniq_bytes_pretty,omitempty"`
+	DedupPct              float64   `json:"dedup_pct"`
+	DedupPctPretty        string    `json:"dedup_pct_pretty,omitempty"`
+	LastCheckAt           time.Time `json:"last_check_at"`
+	SnapshotCount         int       `json:"snapshot_count"`
+	RevisionCount         int       `json:"revision_count"`
+
+	// Back-compat: keep CurrentBytes/CurrentBytesPretty for clients that
+	// haven't upgraded to read the new fields. Mirrors ReferencedBytes.
+	CurrentBytes       int64  `json:"current_bytes"`
+	CurrentBytesPretty string `json:"current_bytes_pretty,omitempty"`
 }
 
 // StorageSeriesPoint is one (timestamp, total bytes) sample for the chart.
@@ -220,7 +249,7 @@ func (s *snapshotStatsStore) queryDestinations(ctx context.Context, repoIDs []st
 	q := `
 WITH latest AS (
     SELECT snapshot_id, storage_name, destination_key, destination_label,
-           total_bytes, uniq_bytes, captured_at,
+           total_bytes, uniq_bytes, pool_bytes, pool_chunks, captured_at,
            ROW_NUMBER() OVER (
                PARTITION BY snapshot_id, storage_name
                ORDER BY revision DESC, captured_at DESC
@@ -229,11 +258,13 @@ WITH latest AS (
     WHERE 1=1 ` + whereRepo + storageFilter + `
 )
 SELECT destination_key, destination_label,
-       COALESCE(SUM(total_bytes), 0),
-       COALESCE(SUM(uniq_bytes),  0),
-       MAX(captured_at),
-       COUNT(DISTINCT snapshot_id),
-       COUNT(*)
+       COALESCE(MAX(pool_bytes),  0)  AS pool_bytes,
+       COALESCE(MAX(pool_chunks), 0)  AS pool_chunks,
+       COALESCE(SUM(total_bytes), 0)  AS referenced_bytes,
+       COALESCE(SUM(uniq_bytes),  0)  AS uniq_bytes,
+       MAX(captured_at)               AS last_check_at,
+       COUNT(DISTINCT snapshot_id)    AS snapshot_count,
+       COUNT(*)                       AS revision_count
 FROM latest
 WHERE rn = 1
 GROUP BY destination_key, destination_label
@@ -252,19 +283,27 @@ ORDER BY destination_label`
 		// the aggregate strips the column-type info that would otherwise let
 		// the driver auto-decode to time.Time. Scan as string and parse.
 		var lastCheckRaw sql.NullString
-		if err := rows.Scan(&d.Key, &d.Label, &d.CurrentBytes, &d.UniqBytes, &lastCheckRaw, &d.SnapshotCount, &d.RevisionCount); err != nil {
+		if err := rows.Scan(&d.Key, &d.Label, &d.PoolBytes, &d.PoolChunks, &d.ReferencedBytes, &d.UniqBytes, &lastCheckRaw, &d.SnapshotCount, &d.RevisionCount); err != nil {
 			return nil, fmt.Errorf("dest scan: %w", err)
 		}
 		if lastCheckRaw.Valid {
 			d.LastCheckAt = parseSQLiteTime(lastCheckRaw.String)
 		}
-		d.CurrentBytesPretty = formatPrettyBytes(d.CurrentBytes)
-		if d.CurrentBytes > 0 {
-			d.DedupPct = (1 - float64(d.UniqBytes)/float64(d.CurrentBytes)) * 100
+		d.PoolBytesPretty = formatPrettyBytes(d.PoolBytes)
+		d.ReferencedBytesPretty = formatPrettyBytes(d.ReferencedBytes)
+		d.UniqBytesPretty = formatPrettyBytes(d.UniqBytes)
+		// Back-compat mirrors (pre-1.0.70 frontend reads these).
+		d.CurrentBytes = d.ReferencedBytes
+		d.CurrentBytesPretty = d.ReferencedBytesPretty
+		// Dedup ratio: how much of the referenced bytes overlap with at least
+		// one other snapshot. (1 - uniq/referenced) * 100.
+		if d.ReferencedBytes > 0 {
+			d.DedupPct = (1 - float64(d.UniqBytes)/float64(d.ReferencedBytes)) * 100
 			if d.DedupPct < 0 {
 				d.DedupPct = 0
 			}
 		}
+		d.DedupPctPretty = fmt.Sprintf("%.0f%%", d.DedupPct)
 		out = append(out, d)
 	}
 	return out, rows.Err()
@@ -291,9 +330,12 @@ func parseSQLiteTime(s string) time.Time {
 	return time.Time{}
 }
 
-// querySeries returns one point per (destination, captured_at) — summed
-// across all snapshots checked at that timestamp. Each check run shares one
-// captured_at, so one point per check run per destination is exactly right.
+// querySeries returns one point per (destination, captured_at) using the
+// destination's actual pool_bytes — the deduplicated disk usage observed at
+// that check run. MAX (not SUM) because every snapshot row from one check
+// run carries the same pool_bytes value (denormalised), so SUM would
+// N-times-inflate the chart. Falls back to SUM(total_bytes) for old rows
+// where pool_bytes is NULL (pre-1.0.70 data).
 func (s *snapshotStatsStore) querySeries(ctx context.Context, repoIDs []string, storageName string, since time.Time) ([]StorageSeries, error) {
 	whereRepo, args := repoIDFilter(repoIDs)
 	storageFilter := ""
@@ -309,7 +351,7 @@ func (s *snapshotStatsStore) querySeries(ctx context.Context, repoIDs []string, 
 
 	q := `
 SELECT destination_key, destination_label, captured_at,
-       COALESCE(SUM(total_bytes), 0)
+       COALESCE(MAX(pool_bytes), SUM(total_bytes), 0)
 FROM snapshot_stats
 WHERE 1=1 ` + whereRepo + storageFilter + sinceFilter + `
 GROUP BY destination_key, destination_label, captured_at
@@ -433,9 +475,21 @@ func (a *app) flushSnapshotStats(j *Job) {
 		storageName = "default"
 	}
 
+	// Pull the destination pool size (actual deduplicated disk usage) the
+	// check parser captured from "Total chunk size is X in N chunks". Zero
+	// when the line never appeared (very small/empty pools, or duplicacy
+	// versions that don't emit it) — still UPSERT, just leaves pool_bytes
+	// NULL in the row.
+	var poolBytes int64
+	var poolChunks int
+	if snap.Progress != nil {
+		poolBytes = snap.Progress.CheckPoolBytes
+		poolChunks = snap.Progress.CheckPoolChunks
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := a.snapshotStats.upsertCheckRun(ctx, snap.RepoID, storageName, destKey, destLabel, time.Now().UTC(), rows); err != nil {
+	if err := a.snapshotStats.upsertCheckRun(ctx, snap.RepoID, storageName, destKey, destLabel, time.Now().UTC(), poolBytes, poolChunks, rows); err != nil {
 		slog.Warn("snapshot stats upsert failed", "error", err, "job", snap.ID, "rows", len(rows))
 		return
 	}

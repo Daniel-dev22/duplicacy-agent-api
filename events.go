@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -92,6 +93,8 @@ func newEventBuffer(cfg Config, client *http.Client) (*eventBuffer, error) {
 			new_chunks         INTEGER,
 			new_bytes          INTEGER,
 			new_bytes_pretty   TEXT,
+			pool_bytes         INTEGER,
+			pool_chunks        INTEGER,
 			captured_at        TIMESTAMP NOT NULL,
 			PRIMARY KEY (snapshot_id, revision, storage_name)
 		);
@@ -104,6 +107,18 @@ func newEventBuffer(cfg Config, client *http.Client) (*eventBuffer, error) {
 	`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
+	}
+	// Idempotent ADD COLUMN for snapshot_stats tables that predate the
+	// pool_bytes/pool_chunks columns (1.0.69 → 1.0.70 upgrade path). SQLite
+	// lacks "ADD COLUMN IF NOT EXISTS"; catch the duplicate-column error.
+	for _, ddl := range []string{
+		`ALTER TABLE snapshot_stats ADD COLUMN pool_bytes INTEGER`,
+		`ALTER TABLE snapshot_stats ADD COLUMN pool_chunks INTEGER`,
+	} {
+		if _, err := db.Exec(ddl); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("schema upgrade: %w", err)
+		}
 	}
 
 	return &eventBuffer{
