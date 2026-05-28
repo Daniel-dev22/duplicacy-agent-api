@@ -6,9 +6,56 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"sort"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
+
+// fleetJobsCap bounds how many jobs the fleet snapshot carries.
+const fleetJobsCap = 50
+
+// fleetJobs returns the jobs for the fleet snapshot: live in-memory jobs (with
+// up-to-date progress) plus recent persisted jobs from the local SQLite store
+// that aren't currently in memory. The persisted overlay is what gives the
+// dashboard restart-survival — the in-memory registry comes up empty after an
+// agent restart, but events.sqlite still holds recent history, so the node keeps
+// showing its recent backups instead of going blank until the next run.
+func (a *app) fleetJobs() []jobPublic {
+	live := a.jobs.list()
+	seen := make(map[string]struct{}, len(live))
+	for _, j := range live {
+		seen[j.ID] = struct{}{}
+	}
+	out := make([]jobPublic, 0, len(live)+fleetJobsCap)
+	out = append(out, live...)
+	if a.events != nil {
+		persisted, err := a.events.listRecentJobs(fleetJobsCap)
+		if err != nil {
+			slog.Warn("fleet: list persisted jobs failed", "error", err)
+		} else {
+			for _, jp := range persisted {
+				if _, ok := seen[jp.ID]; !ok {
+					out = append(out, jp)
+				}
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return jobRecency(out[i]).After(jobRecency(out[j]))
+	})
+	if len(out) > fleetJobsCap {
+		out = out[:fleetJobsCap]
+	}
+	return out
+}
+
+func jobRecency(j jobPublic) time.Time {
+	if !j.CompletedAt.IsZero() {
+		return j.CompletedAt
+	}
+	return j.StartedAt
+}
 
 // app holds wiring for all subsystems. Constructed once in main(), passed to handlers.
 type app struct {

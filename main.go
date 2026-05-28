@@ -47,11 +47,11 @@ func main() {
 	// next boot's reportBootGap can distinguish stop vs crash.
 	go heartbeatLoop(ctx, cfg, 30*time.Second)
 
-	// Orphan-job sweep — recover controller rows stuck in running/pending
-	// from a prior container exit before the HTTP listener opens. Bounded
-	// 15s timeout inside; non-fatal on failure so a slow controller doesn't
-	// block boot.
-	sweepOrphanJobs(ctx, cfg, app.controlCenterClient, app.events)
+	// Orphan-job sweep — recover jobs stuck in running/pending from a prior
+	// container exit, BEFORE the HTTP listener opens. Runs against the local
+	// jobs table (no controller round-trip), then enqueues synthetic terminal
+	// events via the durable outbox so the controller converges when reachable.
+	sweepOrphanJobs(ctx, cfg, app.events)
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
