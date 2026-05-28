@@ -294,17 +294,23 @@ func (j *Job) applyProgress(speed, eta, pctStr, idxStr, totalStr string) bool {
 	return true
 }
 
+// `INFO SNAPSHOT_CHECK ` prefix is OPTIONAL on every check parser regex:
+// duplicacy only prepends "INFO <TAG> " when invoked with `-log`. The agent
+// runs without `-log`, so the lines arrive bare. Pre-fix witness 2026-05-28:
+// regexes required the prefix → check counters never populated and
+// pool_bytes stayed 0 across the fleet (1.0.70 deploy day).
+
 // checkRevisionsTotalRe captures the "<N> snapshots and <M> revisions" line
 // duplicacy emits early in `check`. M is the work-total we divide against
-// when deriving Percent. Source: duplicacy_snapshotmanager.go (SNAPSHOT_CHECK).
+// when deriving Percent.
 var checkRevisionsTotalRe = regexp.MustCompile(
-	`^INFO SNAPSHOT_CHECK \d+ snapshots and (\d+) revisions$`,
+	`^(?:INFO SNAPSHOT_CHECK )?\d+ snapshots and (\d+) revisions$`,
 )
 
 // checkRevisionDoneRe fires once per verified revision; increments the
 // verified-counter on every match.
 var checkRevisionDoneRe = regexp.MustCompile(
-	`^INFO SNAPSHOT_CHECK All chunks referenced by snapshot \S+ at revision \d+ exist$`,
+	`^(?:INFO SNAPSHOT_CHECK )?All chunks referenced by snapshot \S+ at revision \d+ exist$`,
 )
 
 // checkPoolSizeRe captures the "Total chunk size is X in N chunks" line —
@@ -312,7 +318,7 @@ var checkRevisionDoneRe = regexp.MustCompile(
 // run near the start. duplicacy's PrettyBytes form (e.g. "1.2G", "350.4M"),
 // converted to int64 via parsePrettyBytes.
 var checkPoolSizeRe = regexp.MustCompile(
-	`^INFO SNAPSHOT_CHECK Total chunk size is (\S+) in (\d+) chunks$`,
+	`^(?:INFO SNAPSHOT_CHECK )?Total chunk size is (\S+) in (\d+) chunks$`,
 )
 
 // parseCheckLine bumps CheckRevisions{Total,Verified} from `check` stdout
@@ -372,17 +378,17 @@ func (j *Job) parseCheckLine(line string) bool {
 // pruneSnapshotRemovedRe / pruneChunkDeletedRe / pruneFossilCollectedRe
 // match duplicacy's per-action log lines during `prune`. We have no total to
 // divide against, so Percent stays at 0 and the UI shows an indeterminate
-// bar + the live counters. Source: duplicacy_snapshotmanager.go +
-// duplicacy_chunkoperator.go.
+// bar + the live counters. `INFO <TAG>` prefix is optional (agent runs
+// without -log; same reason as the check parsers above).
 var (
 	pruneSnapshotRemovedRe = regexp.MustCompile(
-		`^INFO SNAPSHOT_DELETE The snapshot \S+ at revision \d+ has been removed$`,
+		`^(?:INFO SNAPSHOT_DELETE )?The snapshot \S+ at revision \d+ has been removed$`,
 	)
 	pruneChunkDeletedRe = regexp.MustCompile(
-		`^INFO CHUNK_DELETE The chunk \S+ has been permanently removed$`,
+		`^(?:INFO CHUNK_DELETE )?The chunk \S+ has been permanently removed$`,
 	)
 	pruneFossilCollectedRe = regexp.MustCompile(
-		`^INFO FOSSIL_COLLECT Fossil collection \d+ saved$`,
+		`^(?:INFO FOSSIL_COLLECT )?Fossil collection \d+ saved$`,
 	)
 )
 

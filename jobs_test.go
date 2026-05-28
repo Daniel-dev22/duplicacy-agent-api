@@ -208,6 +208,34 @@ func TestParseCheckLine(t *testing.T) {
 			t.Errorf("Progress should remain nil on miss-only input, got %+v", j.Progress)
 		}
 	})
+	t.Run("bare_lines_without_log_prefix", func(t *testing.T) {
+		// duplicacy WITHOUT `-log` (our default invocation) emits the bare
+		// text — no "INFO SNAPSHOT_CHECK " prefix. Verified against actual
+		// job log on kd-nuc01 2026-05-28. Regex must accept both forms or
+		// the entire check counter / pool size path silently no-ops.
+		j := &Job{}
+		if !j.parseCheckLine("11 snapshots and 9 revisions") {
+			t.Fatalf("bare 'snapshots and revisions' line should match")
+		}
+		if j.Progress.CheckRevisionsTotal != 9 {
+			t.Errorf("CheckRevisionsTotal=%d want 9", j.Progress.CheckRevisionsTotal)
+		}
+		if !j.parseCheckLine("All chunks referenced by snapshot nuc-home-user at revision 1 exist") {
+			t.Fatalf("bare 'chunks referenced' line should match")
+		}
+		if j.Progress.CheckRevisionsVerified != 1 {
+			t.Errorf("CheckRevisionsVerified=%d want 1", j.Progress.CheckRevisionsVerified)
+		}
+		if !j.parseCheckLine("Total chunk size is 147,748M in 10573 chunks") {
+			t.Fatalf("bare 'Total chunk size' line should match")
+		}
+		if j.Progress.CheckPoolBytesPretty != "147,748M" {
+			t.Errorf("CheckPoolBytesPretty=%q want 147,748M", j.Progress.CheckPoolBytesPretty)
+		}
+		if j.Progress.CheckPoolChunks != 10573 {
+			t.Errorf("CheckPoolChunks=%d want 10573", j.Progress.CheckPoolChunks)
+		}
+	})
 	t.Run("pool_size_line", func(t *testing.T) {
 		j := &Job{}
 		// "Total chunk size is X in N chunks" — the destination's actual
