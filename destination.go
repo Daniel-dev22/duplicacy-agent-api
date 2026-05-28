@@ -46,11 +46,13 @@ func DestinationKey(storageURL string) (key, label string) {
 			return "unknown://" + storageURL, "Unknown"
 		}
 		k := scheme + "://" + host
-		// Friendly label: strip a leading "nas." for NAS hosts so the chart
-		// legend reads "NAS (example.com)" not "NAS (nas.example.com)".
-		display := strings.TrimPrefix(host, "nas.")
+		// Friendly label: NAS hosts collapse to the short site name to match
+		// the project's existing terminology (site-a, site-b — the same
+		// strings used in ansible's server_home var). "nas.example.com"
+		// → "NAS (site-a)". Falls back to the full hostname for non-NAS
+		// SFTP destinations.
 		if strings.HasPrefix(host, "nas.") {
-			return k, "NAS (" + display + ")"
+			return k, "NAS (" + shortSiteName(strings.TrimPrefix(host, "nas.")) + ")"
 		}
 		return k, strings.ToUpper(scheme) + " (" + host + ")"
 
@@ -165,4 +167,15 @@ func extractFirstSegment(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// shortSiteName collapses a project domain to the canonical short site name
+// used everywhere else in the codebase (site-a / site-b — the same string
+// ansible's server_home var carries). "example.com" → "site-a";
+// "example.net" → "site-b"; anything else returns the input unchanged.
+func shortSiteName(domain string) string {
+	if i := strings.Index(domain, "apps."); i >= 0 {
+		return domain[:i]
+	}
+	return domain
 }
