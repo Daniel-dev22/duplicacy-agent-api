@@ -62,6 +62,36 @@ func TestJobPersistenceRoundTrip(t *testing.T) {
 	}
 }
 
+// fleetJobs must surface persisted jobs even when the in-memory registry is
+// empty — this is the restart-survival guarantee: after a restart the registry
+// comes up empty, but the fleet snapshot must still show recent backups from the
+// SQLite jobs table. Also verifies live jobs are preferred over their persisted
+// copy (dedup by id) so live progress isn't masked by a stale row.
+func TestFleetJobsMergesPersistedAndLive(t *testing.T) {
+	e := newTestEventBuffer(t)
+	// Persisted-only terminal job (as if from before a restart).
+	e.upsertJob(jobPublic{ID: "persisted-1", Action: ActionBackup, State: JobCompleted, CompletedAt: time.Now().Add(-time.Hour)})
+	// A job that is BOTH persisted (stale) and live in-memory (running now).
+	e.upsertJob(jobPublic{ID: "dual-1", Action: ActionBackup, State: JobRunning, StartedAt: time.Now()})
+
+	reg := newJobRegistry()
+	reg.jobs["dual-1"] = &Job{jobPublic: jobPublic{ID: "dual-1", Action: ActionBackup, State: JobRunning, StartedAt: time.Now()}}
+
+	a := &app{jobs: reg, events: e}
+	got := a.fleetJobs()
+
+	ids := map[string]int{}
+	for _, j := range got {
+		ids[j.ID]++
+	}
+	if ids["persisted-1"] != 1 {
+		t.Fatalf("persisted-only job not surfaced after empty-registry merge: %v", ids)
+	}
+	if ids["dual-1"] != 1 {
+		t.Fatalf("dual job should appear exactly once (live preferred), got %d", ids["dual-1"])
+	}
+}
+
 // A running job persisted before a crash must be recoverable by the local boot
 // sweep — flipped to failed with the orphan error + exit 137, with a zero
 // completed_at reconstructed as the zero time.
