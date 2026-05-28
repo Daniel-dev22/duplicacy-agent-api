@@ -16,12 +16,12 @@ func TestDestinationKey(t *testing.T) {
 		{
 			"sftp://backup@nas.example.com/mnt/backups/repoA",
 			"sftp://nas.example.com",
-			"NAS (example.com)",
+			"NAS (site-a)",
 		},
 		{
 			"sftp://backup@nas.example.net:2222/mnt/backups/repoB",
 			"sftp://nas.example.net",
-			"NAS (example.net)",
+			"NAS (site-b)",
 		},
 		// SFTP — non-NAS host falls back to SFTP label
 		{
