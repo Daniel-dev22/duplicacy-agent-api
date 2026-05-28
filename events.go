@@ -1,20 +1,18 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
+	eventoutbox "github.com/Daniel-dev22/agent-kit-go/eventoutbox"
 	_ "modernc.org/sqlite" // pure-Go sqlite driver, works with CGO_ENABLED=0
 )
 
@@ -40,17 +38,17 @@ type EventPayload struct {
 	EmittedAt   time.Time `json:"emitted_at"`
 }
 
-// eventBuffer is the durable push queue.
-// Lifecycle: handleJobEvent (called on hook fire) → SQLite INSERT → immediate POST.
-// On POST failure, row stays; ticker drains every 30s once POST starts succeeding again.
+// eventBuffer owns the agent's shared events.sqlite and wires three concerns on
+// it: (1) the durable outbound event queue (the kit eventoutbox, which owns the
+// pending_events table), (2) the snapshot_stats dedup table (duplicacy-specific,
+// read by snapshotStatsStore), and (3) the local `jobs` table that gives the
+// fleet snapshot restart-survival — the in-memory jobRegistry starts empty after
+// a restart, but this table retains recent job history so the dashboard still
+// shows recent backups.
 type eventBuffer struct {
 	cfg    Config
-	client *http.Client
 	db     *sql.DB
-
-	wg       sync.WaitGroup
-	stopOnce sync.Once
-	stop     chan struct{}
+	outbox *eventoutbox.Outbox
 }
 
 func newEventBuffer(cfg Config, client *http.Client) (*eventBuffer, error) {
@@ -62,18 +60,9 @@ func newEventBuffer(cfg Config, client *http.Client) (*eventBuffer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// snapshot_stats (duplicacy-specific) + jobs (restart-survival). The
+	// pending_events outbox table is created by eventoutbox.New below.
 	if _, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS pending_events (
-			id          INTEGER PRIMARY KEY AUTOINCREMENT,
-			job_id      TEXT NOT NULL,
-			event       TEXT NOT NULL,
-			payload     BLOB NOT NULL,
-			created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			attempts    INTEGER NOT NULL DEFAULT 0,
-			last_error  TEXT
-		);
-		CREATE INDEX IF NOT EXISTS idx_pending_events_id ON pending_events(id);
-
 		CREATE TABLE IF NOT EXISTS snapshot_stats (
 			snapshot_id        TEXT    NOT NULL,
 			revision           INTEGER NOT NULL,
@@ -104,6 +93,25 @@ func newEventBuffer(cfg Config, client *http.Client) (*eventBuffer, error) {
 			ON snapshot_stats (captured_at);
 		CREATE INDEX IF NOT EXISTS idx_snapshot_stats_repo
 			ON snapshot_stats (repo_id);
+
+		CREATE TABLE IF NOT EXISTS jobs (
+			id              TEXT PRIMARY KEY,
+			repo_id         TEXT,
+			repo_path       TEXT,
+			action          TEXT,
+			storage_name    TEXT,
+			state           TEXT,
+			started_at_ns   INTEGER,
+			completed_at_ns INTEGER,
+			exit_code       INTEGER,
+			error           TEXT,
+			line_count      INTEGER,
+			schedule_id     TEXT,
+			trigger_key     TEXT,
+			progress        BLOB,
+			updated_at_ns   INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_jobs_updated ON jobs (updated_at_ns);
 	`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
@@ -121,12 +129,16 @@ func newEventBuffer(cfg Config, client *http.Client) (*eventBuffer, error) {
 		}
 	}
 
-	return &eventBuffer{
-		cfg:    cfg,
-		client: client,
-		db:     db,
-		stop:   make(chan struct{}),
-	}, nil
+	urlFor := func(jobID string) string {
+		return cfg.ControlCenterURL + "/api/duplicacy/jobs/" + jobID + "/event"
+	}
+	outbox, err := eventoutbox.New(db, client, urlFor)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("event outbox: %w", err)
+	}
+
+	return &eventBuffer{cfg: cfg, db: db, outbox: outbox}, nil
 }
 
 // DB returns the shared SQLite handle so other subsystems (snapshot_stats)
@@ -139,19 +151,27 @@ func (e *eventBuffer) DB() *sql.DB {
 	return e.db
 }
 
+// Start runs the outbox drain loop.
+func (e *eventBuffer) Start(ctx context.Context) {
+	if e == nil {
+		return
+	}
+	e.outbox.Start(ctx)
+}
+
 func (e *eventBuffer) close() {
 	if e == nil {
 		return
 	}
-	e.stopOnce.Do(func() { close(e.stop) })
-	e.wg.Wait()
+	e.outbox.Close()
 	if e.db != nil {
 		_ = e.db.Close()
 	}
 }
 
-// handleJobEvent is the JobEventHook registered with jobRegistry.
-// It enqueues to SQLite and tries an immediate push (best-effort).
+// handleJobEvent is the JobEventHook registered with jobRegistry. It persists
+// the job to the local jobs table (restart-survival) and enqueues the event for
+// durable delivery to controller.
 func (e *eventBuffer) handleJobEvent(j *Job, evt JobEvent) {
 	snap := j.snapshot()
 	payload := EventPayload{
@@ -178,160 +198,124 @@ func (e *eventBuffer) handleJobEvent(j *Job, evt JobEvent) {
 		slog.Error("marshal event payload failed", "error", err, "job", snap.ID)
 		return
 	}
+	e.upsertJob(snap)
+	e.outbox.Enqueue(snap.ID, string(evt), body)
+}
 
-	res, err := e.db.Exec(
-		`INSERT INTO pending_events (job_id, event, payload) VALUES (?, ?, ?)`,
-		snap.ID, string(evt), body,
+// --- local jobs table: restart-survival for the fleet snapshot ---
+
+const jobsTable = "jobs"
+
+func tsToNs(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+func nsToTime(ns int64) time.Time {
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns).UTC()
+}
+
+// upsertJob writes the current job state to the local jobs table. Called on
+// every lifecycle event (incl. the Started event), so a job running at crash
+// time is persisted as state='running' and the boot sweep can recover it.
+func (e *eventBuffer) upsertJob(snap jobPublic) {
+	if e == nil || e.db == nil {
+		return
+	}
+	var progressJSON []byte
+	if snap.Progress != nil {
+		if b, err := json.Marshal(snap.Progress); err == nil {
+			progressJSON = b
+		}
+	}
+	_, err := e.db.Exec(`
+		INSERT INTO jobs (id, repo_id, repo_path, action, storage_name, state,
+			started_at_ns, completed_at_ns, exit_code, error, line_count,
+			schedule_id, trigger_key, progress, updated_at_ns)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET
+			repo_id=excluded.repo_id, repo_path=excluded.repo_path, action=excluded.action,
+			storage_name=excluded.storage_name, state=excluded.state,
+			started_at_ns=excluded.started_at_ns, completed_at_ns=excluded.completed_at_ns,
+			exit_code=excluded.exit_code, error=excluded.error, line_count=excluded.line_count,
+			schedule_id=excluded.schedule_id, trigger_key=excluded.trigger_key,
+			progress=excluded.progress, updated_at_ns=excluded.updated_at_ns`,
+		snap.ID, snap.RepoID, snap.RepoPath, string(snap.Action), snap.StorageName, string(snap.State),
+		tsToNs(snap.StartedAt), tsToNs(snap.CompletedAt), snap.ExitCode, snap.ErrorMsg, snap.LineCount,
+		snap.ScheduleID, snap.TriggerKey, progressJSON, time.Now().UnixNano(),
 	)
 	if err != nil {
-		slog.Error("enqueue event failed; event lost", "error", err, "job", snap.ID)
-		return
-	}
-	rowID, _ := res.LastInsertId()
-
-	go e.tryPush(rowID, snap.ID, body)
-}
-
-// tryPush attempts a single POST. On success: DELETE row. On failure: increment attempts.
-func (e *eventBuffer) tryPush(rowID int64, jobID string, body []byte) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	url := e.cfg.ControlCenterURL + "/api/duplicacy/jobs/" + jobID + "/event"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		e.recordFailure(rowID, err.Error())
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := e.client.Do(req)
-	if err != nil {
-		e.recordFailure(rowID, err.Error())
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		if _, err := e.db.Exec(`DELETE FROM pending_events WHERE id = ?`, rowID); err != nil {
-			slog.Warn("failed to delete pushed event row", "error", err, "row", rowID)
-		}
-		return
-	}
-	respBody, _ := io.ReadAll(resp.Body)
-	e.recordFailure(rowID, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 200)))
-}
-
-func (e *eventBuffer) recordFailure(rowID int64, msg string) {
-	if _, err := e.db.Exec(
-		`UPDATE pending_events SET attempts = attempts + 1, last_error = ? WHERE id = ?`,
-		msg, rowID,
-	); err != nil {
-		slog.Warn("failed to record push failure", "error", err, "row", rowID)
+		slog.Warn("persist job failed", "error", err, "job", snap.ID)
 	}
 }
 
-// Start runs the drain loop in a tracked goroutine. The previous pattern
-// (caller `go e.drainLoop(ctx)` + Add(1) inside the goroutine) raced with
-// e.wg.Wait(); wg.Go does the Add atomically before the goroutine is
-// scheduled, eliminating that race.
-func (e *eventBuffer) Start(ctx context.Context) {
-	e.wg.Go(func() { e.drainLoop(ctx) })
-}
+const jobSelectCols = `id, repo_id, repo_path, action, storage_name, state,
+	started_at_ns, completed_at_ns, exit_code, error, line_count,
+	schedule_id, trigger_key, progress`
 
-// drainLoop runs every 30s, retrying any pending events oldest-first.
-// Started via eventBuffer.Start.
-func (e *eventBuffer) drainLoop(ctx context.Context) {
-	t := time.NewTicker(30 * time.Second)
-	defer t.Stop()
-
-	// First-tick at startup so any leftover from a previous run flushes immediately.
-	e.drainOnce(ctx)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-e.stop:
-			return
-		case <-t.C:
-			e.drainOnce(ctx)
+func scanJob(s interface{ Scan(...any) error }) (jobPublic, error) {
+	var (
+		jp                       jobPublic
+		action, state           string
+		startedNs, completedNs  int64
+		progress                []byte
+	)
+	if err := s.Scan(&jp.ID, &jp.RepoID, &jp.RepoPath, &action, &jp.StorageName, &state,
+		&startedNs, &completedNs, &jp.ExitCode, &jp.ErrorMsg, &jp.LineCount,
+		&jp.ScheduleID, &jp.TriggerKey, &progress); err != nil {
+		return jobPublic{}, err
+	}
+	jp.Action = JobAction(action)
+	jp.State = JobState(state)
+	jp.StartedAt = nsToTime(startedNs)
+	jp.CompletedAt = nsToTime(completedNs)
+	if len(progress) > 0 {
+		var p JobProgress
+		if err := json.Unmarshal(progress, &p); err == nil {
+			jp.Progress = &p
 		}
 	}
+	return jp, nil
 }
 
-func (e *eventBuffer) drainOnce(ctx context.Context) {
-	// Fetch up to 100 pending rows oldest-first; cap so a huge backlog doesn't block forever.
-	rows, err := e.db.QueryContext(ctx,
-		`SELECT id, job_id, payload FROM pending_events ORDER BY id ASC LIMIT 100`)
+// listRecentJobs returns the most-recently-updated persisted jobs, newest first.
+func (e *eventBuffer) listRecentJobs(limit int) ([]jobPublic, error) {
+	if e == nil || e.db == nil {
+		return nil, nil
+	}
+	rows, err := e.db.Query(
+		`SELECT `+jobSelectCols+` FROM jobs ORDER BY updated_at_ns DESC LIMIT ?`, limit)
 	if err != nil {
-		slog.Warn("drain query failed", "error", err)
-		return
+		return nil, err
 	}
-	type pending struct {
-		id      int64
-		jobID   string
-		payload []byte
-	}
-	var batch []pending
+	defer rows.Close()
+	var out []jobPublic
 	for rows.Next() {
-		var p pending
-		if err := rows.Scan(&p.id, &p.jobID, &p.payload); err != nil {
-			slog.Warn("scan failed", "error", err)
-			continue
+		jp, err := scanJob(rows)
+		if err != nil {
+			return nil, err
 		}
-		batch = append(batch, p)
+		out = append(out, jp)
 	}
-	rows.Close()
-
-	if len(batch) == 0 {
-		return
-	}
-
-	// Push sequentially: if the first one fails, controller is probably down — bail and retry next tick.
-	pushed := 0
-	for _, p := range batch {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		ok := e.pushBlocking(ctx, p.id, p.jobID, p.payload)
-		if !ok {
-			break
-		}
-		pushed++
-	}
-	if pushed > 0 {
-		slog.Info("drained events", "pushed", pushed, "remaining", len(batch)-pushed)
-	}
+	return out, rows.Err()
 }
 
-// pushBlocking is like tryPush but returns success/failure (used by drain loop).
-func (e *eventBuffer) pushBlocking(ctx context.Context, rowID int64, jobID string, body []byte) bool {
-	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	url := e.cfg.ControlCenterURL + "/api/duplicacy/jobs/" + jobID + "/event"
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(body))
+// getJob fetches one persisted job by id.
+func (e *eventBuffer) getJob(id string) (jobPublic, bool, error) {
+	if e == nil || e.db == nil {
+		return jobPublic{}, false, nil
+	}
+	jp, err := scanJob(e.db.QueryRow(`SELECT `+jobSelectCols+` FROM jobs WHERE id = ?`, id))
+	if err == sql.ErrNoRows {
+		return jobPublic{}, false, nil
+	}
 	if err != nil {
-		e.recordFailure(rowID, err.Error())
-		return false
+		return jobPublic{}, false, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := e.client.Do(req)
-	if err != nil {
-		e.recordFailure(rowID, err.Error())
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		if _, err := e.db.Exec(`DELETE FROM pending_events WHERE id = ?`, rowID); err != nil {
-			slog.Warn("failed to delete pushed event row", "error", err, "row", rowID)
-		}
-		return true
-	}
-	respBody, _ := io.ReadAll(resp.Body)
-	e.recordFailure(rowID, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 200)))
-	return false
+	return jp, true, nil
 }
