@@ -41,6 +41,15 @@ func TestDestinationKey(t *testing.T) {
 			"s3://eu1.storj.io/cold-bucket",
 			"Storj (cold-bucket)",
 		},
+		// Storj's S3 gateway uses *.storjshare.io as the host (the form our
+		// actual repos use: s3://US1@gateway.storjshare.io/<bucket>/...).
+		// Pre-2026-05-28 this rendered as "S3 (site-a)" because the
+		// substring check was for "storj.io" not "storj".
+		{
+			"s3://US1@gateway.storjshare.io/site-a/kd-nas/duplicacy",
+			"s3://gateway.storjshare.io/site-a",
+			"Storj (site-a)",
+		},
 		// S3 — AWS
 		{
 			"s3://s3.amazonaws.com/my-bucket/repo",
