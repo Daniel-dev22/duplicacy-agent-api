@@ -88,7 +88,7 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 		return nil, fmt.Errorf("event buffer: %w", err)
 	}
 
-	jobs := newJobRegistry()
+	jobs := newJobRegistry(cfg.MaxConcurrentCopies)
 	jobs.RegisterHook(events.handleJobEvent)
 
 	// Persist per-job ring buffers under ${CONFIG_DIR}/job-logs on terminal.

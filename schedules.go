@@ -153,6 +153,12 @@ func makeDuplicacyFire(cfg Config, jobs *jobRegistry, repos *repoIndex, prepareE
 			from := kitsched.ParamString(sch.Params, "copy_from")
 			snapID := kitsched.ParamString(sch.Params, "copy_id")
 			threads := kitsched.ParamInt(sch.Params, "threads")
+			// Unpinned copies (the common case — every auto-generated copy
+			// schedule passes 0) use the low CopyThreads default, NOT
+			// autoThreads, to bound per-copy RAM during the nightly fan-out.
+			if threads <= 0 {
+				threads = cfg.CopyThreads
+			}
 			inv = invocationForCopy(repo, from, sch.Storage, threads, snapID, "", "")
 		default:
 			slog.Warn("schedule fire: unsupported action", "action", sch.Action, "schedule", sch.ID)
