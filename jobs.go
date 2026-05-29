@@ -516,12 +516,24 @@ type jobRegistry struct {
 	// Without it, the registry just falls back to the in-memory ring buffer
 	// (legacy behaviour). See flushJobLog() for the on-disk format.
 	jobLogDir string
+
+	// copySem caps concurrent `duplicacy copy` processes on this host. The
+	// relay fans every source repo out to several destinations on the same
+	// cron minute; running them all at once spikes RAM and OOM-kills the NAS.
+	// Buffered to MaxConcurrentCopies; nil means unbounded (cap disabled).
+	// Only copy jobs acquire it — backup/check/prune/restore are unaffected.
+	copySem chan struct{}
 }
 
-func newJobRegistry() *jobRegistry {
+func newJobRegistry(maxConcurrentCopies int) *jobRegistry {
+	var copySem chan struct{}
+	if maxConcurrentCopies > 0 {
+		copySem = make(chan struct{}, maxConcurrentCopies)
+	}
 	return &jobRegistry{
 		jobs:     map[string]*Job{},
 		terminal: make([]string, 0, recentJobsRetained+1),
+		copySem:  copySem,
 	}
 }
 
@@ -594,16 +606,101 @@ func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo
 	r.jobs[j.ID] = j
 	r.mu.Unlock()
 
+	// Copy jobs are gated by the per-host copy semaphore so the nightly
+	// destination fan-out doesn't spawn N processes at once and OOM the box.
+	// The slot is acquired inside a goroutine (NOT here) so neither the gin
+	// handler nor the kit's single, serial fireLoop blocks while a copy waits
+	// its turn — the queued job simply stays Pending until a slot frees.
+	if action == ActionCopy && r.copySem != nil {
+		go r.spawnGated(jobCtx, cancel, j, binary, inv)
+		return j, nil
+	}
+
+	// All other actions (and copies when the cap is disabled) spawn
+	// synchronously so start() can still surface a cmd.Start() error to the
+	// caller — unchanged legacy behaviour.
+	if err := r.spawn(jobCtx, cancel, j, binary, inv, nil); err != nil {
+		return j, err
+	}
+	return j, nil
+}
+
+// spawnGated waits for a copy slot, then spawns the job. Runs in its own
+// goroutine; the job is already registered as Pending. If the job is cancelled
+// while queued, it never starts. The acquired slot is released exactly once
+// when the job reaches a terminal state (handled inside spawn via the release
+// callback, which also covers the cmd.Start()-failure path).
+func (r *jobRegistry) spawnGated(jobCtx context.Context, cancel context.CancelFunc, j *Job, binary string, inv cliInvocation) {
+	select {
+	case <-jobCtx.Done():
+		// Cancelled (or parent context done) before we ever got a slot —
+		// finalise as cancelled without spawning anything.
+		r.finalizeUnstarted(j, cancel)
+		return
+	case r.copySem <- struct{}{}:
+	}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			<-r.copySem
+		}
+	}
+	if err := r.spawn(jobCtx, cancel, j, binary, inv, release); err != nil {
+		// spawn already finalised the job + invoked release on the
+		// Start-failure path; nothing more to do.
+		slog.Warn("gated copy failed to start", "job", j.ID, "error", err)
+	}
+}
+
+// finalizeUnstarted marks a job that never spawned (e.g. cancelled while queued
+// on the copy semaphore) as terminal and runs its cleanup.
+func (r *jobRegistry) finalizeUnstarted(j *Job, cancel context.CancelFunc) {
+	cancel()
+	j.mu.Lock()
+	if j.State != JobCancelled {
+		j.State = JobCancelled
+	}
+	if j.ErrorMsg == "" {
+		j.ErrorMsg = "cancelled before start"
+	}
+	j.CompletedAt = time.Now().UTC()
+	for ch := range j.subscribers {
+		close(ch)
+	}
+	j.subscribers = map[chan string]struct{}{}
+	cleanup := j.cleanup
+	j.cleanup = nil
+	j.mu.Unlock()
+	if cleanup != nil {
+		cleanup()
+	}
+	r.markTerminated(j)
+	r.emit(j, EventCancelled)
+	slog.Info("job terminal", "job", j.ID, "state", string(JobCancelled))
+}
+
+// spawn starts the CLI process, tails its output, and waits for completion in a
+// background goroutine. release, if non-nil, is invoked exactly once when the
+// job reaches a terminal state (including the Start-failure path) — used to
+// free the copy semaphore slot. Returns a non-nil error only when the process
+// could not be started.
+func (r *jobRegistry) spawn(jobCtx context.Context, cancel context.CancelFunc, j *Job, binary string, inv cliInvocation, release func()) error {
+	if release == nil {
+		release = func() {}
+	}
 	cmd := inv.command(jobCtx, binary)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("stdout pipe: %w", err)
+		release()
+		return fmt.Errorf("stdout pipe: %w", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("stderr pipe: %w", err)
+		release()
+		return fmt.Errorf("stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -618,7 +715,8 @@ func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo
 		j.mu.Unlock()
 		r.markTerminated(j)
 		r.emit(j, EventFailed)
-		return j, err
+		release()
+		return err
 	}
 
 	j.mu.Lock()
@@ -631,8 +729,9 @@ func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo
 	go r.tail(j, stdout, "stdout")
 	go r.tail(j, stderr, "stderr")
 
-	// Wait for completion in a separate goroutine so start() returns immediately.
+	// Wait for completion in a separate goroutine so spawn() returns immediately.
 	go func() {
+		defer release()
 		err := cmd.Wait()
 		j.mu.Lock()
 		j.CompletedAt = time.Now().UTC()
@@ -695,7 +794,7 @@ func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo
 		slog.Info("job terminal", "job", j.ID, "state", string(state))
 	}()
 
-	return j, nil
+	return nil
 }
 
 func (r *jobRegistry) tail(j *Job, rdr io.Reader, source string) {
@@ -801,7 +900,12 @@ func (r *jobRegistry) cancel(id string) bool {
 		return false
 	}
 	j.mu.Lock()
-	if j.State != JobRunning {
+	// Running jobs are cancelled by killing the process; Pending jobs are
+	// copies still queued on the copy semaphore — cancelling their context
+	// trips the jobCtx.Done() path in spawnGated so they finalise as cancelled
+	// without ever spawning. Both set State first so the terminal-handler
+	// preserves JobCancelled instead of overwriting with JobFailed.
+	if j.State != JobRunning && j.State != JobPending {
 		j.mu.Unlock()
 		return false
 	}
@@ -1238,7 +1342,11 @@ func (a *app) handleCopy(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
 		return
 	}
-	inv := invocationForCopy(repo, req.From, req.To, req.Threads, req.SnapshotID, rsaPriv[req.From], "")
+	copyThreads := req.Threads
+	if copyThreads <= 0 {
+		copyThreads = a.cfg.CopyThreads
+	}
+	inv := invocationForCopy(repo, req.From, req.To, copyThreads, req.SnapshotID, rsaPriv[req.From], "")
 	inv.EnvAdds = append(inv.EnvAdds, env...)
 	// Detached context — see handleBackup comment. StorageName on the job is
 	// the destination alias so the fleet WS shows "copy to b2" rather than the

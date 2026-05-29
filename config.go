@@ -46,6 +46,25 @@ type Config struct {
 	// to inspect restored files outside the container.
 	RestoreScratchRoot string
 
+	// CopyThreads is the duplicacy `copy -threads N` default used when a copy
+	// schedule/request does not pin its own thread count (the common case —
+	// every auto-generated copy schedule passes 0). Kept deliberately low
+	// (default 2, vs backup/restore's autoThreads = NumCPU/2) because each copy
+	// thread holds an in-flight chunk buffer (≤ max-chunk 64M) plus codec
+	// scratch, and the nightly fan-out runs many copies; a high per-copy thread
+	// count multiplied across destinations is what OOM-killed the NAS.
+	// Override via DUPLICACY_COPY_THREADS. An explicit per-schedule/request
+	// `threads` still wins.
+	CopyThreads int
+	// MaxConcurrentCopies caps how many `duplicacy copy` processes run at once
+	// on this host. The relay fans every source repo out to several
+	// destinations on the same cron minute; without a cap all of them spike RAM
+	// simultaneously and trip the kernel OOM-killer (witnessed 2026-05-29:
+	// nightly NAS copies dying with "signal: killed" / exit 137). Excess copies
+	// queue as Pending and run as slots free. Override via
+	// DUPLICACY_MAX_CONCURRENT_COPIES; <=0 disables the cap (unbounded).
+	MaxConcurrentCopies int
+
 	// --- Directory-size gatherer (tree_sizes.go) ---
 	// The gatherer is a self-paced background loop, fully decoupled from the
 	// 5-min tree push: it fills a persisted per-directory size cache "as it
@@ -89,6 +108,9 @@ func loadConfig() Config {
 		DuplicacyBinary:    getEnv("DUPLICACY_BINARY", "/usr/local/bin/duplicacy"),
 		BearerTokenFile:    getEnv("BEARER_TOKEN_FILE", "/etc/duplicacy-agent-api/bearer-token"),
 		RestoreScratchRoot: getEnv("RESTORE_SCRATCH_ROOT", "/tmp/duplicacy-restore"),
+
+		CopyThreads:         getEnvInt("DUPLICACY_COPY_THREADS", 2),
+		MaxConcurrentCopies: getEnvInt("DUPLICACY_MAX_CONCURRENT_COPIES", 1),
 
 		TreeSizeEnabled:            getEnvBool("TREE_SIZE_ENABLED", true),
 		TreeSizeLargeFileThreshold: int64(getEnvInt("TREE_SIZE_LARGE_FILE_THRESHOLD", 50000)),
