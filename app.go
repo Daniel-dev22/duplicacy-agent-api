@@ -9,6 +9,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/Daniel-dev22/agent-kit-go/jobstore"
+	"github.com/Daniel-dev22/agent-kit-go/reconcile"
 	"github.com/gin-gonic/gin"
 )
 
@@ -212,9 +214,36 @@ func (a *app) startBackgroundWorkers(ctx context.Context) {
 	go a.filters.reconcileLoop(ctx, a.stop)
 	go a.fleet.Run(ctx)
 	go a.reconcileLoop(ctx)
+	go a.startJobStateReconcile(ctx)
 	a.trees.Start(ctx)
 	a.sizeGatherer.Start(ctx)
 	slog.Info("background workers started")
+}
+
+// startJobStateReconcile runs the declarative job-state reconcile loop: on
+// startup and every 5 min it POSTs this node's full authoritative job set
+// (non-terminal + last-24h terminals, from the local events.sqlite) to the
+// controller, which converges its duplicacy_jobs rows. This is the safety net
+// for the edge-triggered event path — a lost or out-of-order terminal event
+// can strand a controller row in 'running' forever (witnessed: ng/nas copy
+// a2e80cbe). Reuses the same controller HTTP client as the event outbox
+// (bearer + Traefik-dial transport); a stateless POST, no socket.
+func (a *app) startJobStateReconcile(ctx context.Context) {
+	reconcile.Run(ctx, reconcile.Config{
+		Client:   a.controlCenterClient,
+		URL:      a.cfg.ControlCenterURL + "/api/duplicacy/reconcile",
+		Site:     a.cfg.SiteID,
+		Node:     a.cfg.NodeName,
+		Interval: 5 * time.Minute,
+		Snapshot: func(sctx context.Context) ([]jobstore.JobRef, error) {
+			return jobstore.ListForReconcile(sctx, a.events.DB(), jobstore.ListOptions{
+				Table:                   jobsTable,
+				ExitCodeColumn:          "exit_code",
+				RecentTerminalPredicate: "completed_at_ns >= ?",
+				RecentTerminalArg:       time.Now().Add(-24 * time.Hour).UnixNano(),
+			})
+		},
+	})
 }
 
 // --- placeholder handlers; real implementations replace these in subsequent tasks ---
