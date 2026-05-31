@@ -74,7 +74,7 @@ func TestFleetJobsMergesPersistedAndLive(t *testing.T) {
 	// A job that is BOTH persisted (stale) and live in-memory (running now).
 	e.upsertJob(jobPublic{ID: "dual-1", Action: ActionBackup, State: JobRunning, StartedAt: time.Now()})
 
-	reg := newJobRegistry(0)
+	reg := newJobRegistry(0, 0)
 	reg.jobs["dual-1"] = &Job{jobPublic: jobPublic{ID: "dual-1", Action: ActionBackup, State: JobRunning, StartedAt: time.Now()}}
 
 	a := &app{jobs: reg, events: e}

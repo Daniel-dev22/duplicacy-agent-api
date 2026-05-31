@@ -64,6 +64,13 @@ type Config struct {
 	// queue as Pending and run as slots free. Override via
 	// DUPLICACY_MAX_CONCURRENT_COPIES; <=0 disables the cap (unbounded).
 	MaxConcurrentCopies int
+	// MaxConcurrentMaint caps how many maintenance processes (check + prune)
+	// run at once on this host. The after-wave chain fires ~30 prune then ~30
+	// check schedules in one burst once the nightly wave drains; running them
+	// all in parallel would spike NAS RAM the same way unbounded copies did.
+	// Excess queue as Pending and run as slots free. Override via
+	// DUPLICACY_MAX_CONCURRENT_MAINT; <=0 disables the cap (unbounded).
+	MaxConcurrentMaint int
 
 	// --- Directory-size gatherer (tree_sizes.go) ---
 	// The gatherer is a self-paced background loop, fully decoupled from the
@@ -111,6 +118,7 @@ func loadConfig() Config {
 
 		CopyThreads:         getEnvInt("DUPLICACY_COPY_THREADS", 2),
 		MaxConcurrentCopies: getEnvInt("DUPLICACY_MAX_CONCURRENT_COPIES", 1),
+		MaxConcurrentMaint:  getEnvInt("DUPLICACY_MAX_CONCURRENT_MAINT", 1),
 
 		TreeSizeEnabled:            getEnvBool("TREE_SIZE_ENABLED", true),
 		TreeSizeLargeFileThreshold: int64(getEnvInt("TREE_SIZE_LARGE_FILE_THRESHOLD", 50000)),

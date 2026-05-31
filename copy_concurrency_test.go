@@ -40,7 +40,7 @@ func waitForState(t *testing.T, r *jobRegistry, id string, deadline time.Duratio
 // finishes — proving the per-host copy semaphore serialises the nightly
 // destination fan-out instead of spawning all copies at once.
 func TestCopySemaphoreSerialises(t *testing.T) {
-	r := newJobRegistry(1)
+	r := newJobRegistry(1, 0)
 	repo := &Repo{ID: "r1", Path: "/"}
 
 	j1, err := r.start(context.Background(), "/bin/sleep", repo, ActionCopy, "remote-nas", sleepInv("0.4"), "", "schedule", nil)
@@ -74,7 +74,7 @@ func TestCopySemaphoreSerialises(t *testing.T) {
 // Non-copy actions are never gated by the copy semaphore: many backups can run
 // at once even with MaxConcurrentCopies=1.
 func TestNonCopyNotGated(t *testing.T) {
-	r := newJobRegistry(1)
+	r := newJobRegistry(1, 0)
 	repo := &Repo{ID: "r1", Path: "/"}
 
 	const n = 4
@@ -109,7 +109,7 @@ func TestNonCopyNotGated(t *testing.T) {
 // A copy cancelled while queued behind the semaphore must finalise as
 // cancelled and never spawn a process.
 func TestQueuedCopyCancelBeforeStart(t *testing.T) {
-	r := newJobRegistry(1)
+	r := newJobRegistry(1, 0)
 	repo := &Repo{ID: "r1", Path: "/"}
 
 	// Hold the only slot with a long-running copy.
@@ -140,7 +140,7 @@ func TestQueuedCopyCancelBeforeStart(t *testing.T) {
 
 // Sanity: concurrent starts don't race the semaphore (run under -race).
 func TestCopySemaphoreNoRace(t *testing.T) {
-	r := newJobRegistry(2)
+	r := newJobRegistry(2, 0)
 	repo := &Repo{ID: "r1", Path: "/"}
 	var wg sync.WaitGroup
 	var started int32

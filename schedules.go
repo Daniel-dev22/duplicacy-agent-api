@@ -101,9 +101,14 @@ func makeDuplicacyFire(cfg Config, jobs *jobRegistry, repos *repoIndex, prepareE
 		// multiple agents for ~90s. Jitter spreads the load across a
 		// minute; the bearer-token / vend retry handles any residual.
 		//
-		// Manual triggers (triggerKey == "manual" or "manual-*") skip the
-		// jitter — operator-initiated runs should fire immediately.
-		if !strings.HasPrefix(triggerKey, "manual") {
+		// Manual triggers ("manual"/"manual-*") and after-wave chain triggers
+		// ("chain-*") skip the jitter. Manual runs are operator-initiated and
+		// should fire immediately; chain runs are already serialised by the
+		// maintenance semaphore (only one prune/check executes at a time, the
+		// rest queue Pending), so they produce no controller-event herd and
+		// gain nothing from smearing — while jittering them would block the
+		// synchronous FireMatching loop for up to 60s per schedule.
+		if !strings.HasPrefix(triggerKey, "manual") && !strings.HasPrefix(triggerKey, "chain") {
 			jitter := fireJitter(cfg.NodeName, sch.ID, 60*time.Second)
 			if jitter > 0 {
 				select {
