@@ -11,6 +11,7 @@ import (
 
 	"github.com/Daniel-dev22/agent-kit-go/jobstore"
 	"github.com/Daniel-dev22/agent-kit-go/reconcile"
+	kitsched "github.com/Daniel-dev22/agent-kit-go/scheduler"
 	"github.com/gin-gonic/gin"
 )
 
@@ -66,6 +67,7 @@ type app struct {
 	jobs                *jobRegistry
 	repos               *repoIndex
 	scheduler           *scheduler
+	chain               *kitsched.Chain // after-wave maintenance chain (prune→check)
 	filters             *filterCache
 	events              *eventBuffer
 	snapshotStats       *snapshotStatsStore // per-snapshot dedup rows from `check -tabular`
@@ -90,7 +92,7 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 		return nil, fmt.Errorf("event buffer: %w", err)
 	}
 
-	jobs := newJobRegistry(cfg.MaxConcurrentCopies)
+	jobs := newJobRegistry(cfg.MaxConcurrentCopies, cfg.MaxConcurrentMaint)
 	jobs.RegisterHook(events.handleJobEvent)
 
 	// Persist per-job ring buffers under ${CONFIG_DIR}/job-logs on terminal.
@@ -161,6 +163,22 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 		return nil, fmt.Errorf("scheduler: %w", err)
 	}
 	a.scheduler = sched
+
+	// After-wave chain: when the nightly backup+copy wave drains on this host,
+	// fire the after-wave prune schedules, then (once those drain) the check
+	// schedules. The chain only acts on completions it personally witnesses, so
+	// a mid-morning restart never retroactively re-fires a past wave (first-run
+	// safe); a same-day restart between stages resumes from its persisted
+	// per-stage marker. Registered as a terminal-event hook below.
+	a.chain = newDuplicacyChain(sched, jobs, cfg.ConfigDir)
+	jobs.RegisterHook(func(j *Job, evt JobEvent) {
+		switch evt {
+		case EventCompleted, EventFailed, EventCancelled:
+			// Detached context — chain fires spawn jobs that must outlive this
+			// hook goroutine (same rationale as the manual handlers).
+			a.chain.OnJobComplete(context.Background(), string(j.snapshot().Action))
+		}
+	})
 
 	a.trees = newTreeWalker(cfg, repos, a)
 

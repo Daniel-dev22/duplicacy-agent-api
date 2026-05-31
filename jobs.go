@@ -521,20 +521,71 @@ type jobRegistry struct {
 	// relay fans every source repo out to several destinations on the same
 	// cron minute; running them all at once spikes RAM and OOM-kills the NAS.
 	// Buffered to MaxConcurrentCopies; nil means unbounded (cap disabled).
-	// Only copy jobs acquire it — backup/check/prune/restore are unaffected.
+	// Only copy jobs acquire it — backup/restore are unaffected.
 	copySem chan struct{}
+
+	// maintSem caps concurrent maintenance jobs (check + prune). After the
+	// nightly wave the chain fires ~30 prune then ~30 check schedules at once;
+	// running them all in parallel would spike NAS RAM the same way unbounded
+	// copies did. Buffered to MaxConcurrentMaint; nil means unbounded.
+	// Only check/prune acquire it — backup/copy/restore are unaffected.
+	maintSem chan struct{}
 }
 
-func newJobRegistry(maxConcurrentCopies int) *jobRegistry {
+func newJobRegistry(maxConcurrentCopies, maxConcurrentMaint int) *jobRegistry {
 	var copySem chan struct{}
 	if maxConcurrentCopies > 0 {
 		copySem = make(chan struct{}, maxConcurrentCopies)
+	}
+	var maintSem chan struct{}
+	if maxConcurrentMaint > 0 {
+		maintSem = make(chan struct{}, maxConcurrentMaint)
 	}
 	return &jobRegistry{
 		jobs:     map[string]*Job{},
 		terminal: make([]string, 0, recentJobsRetained+1),
 		copySem:  copySem,
+		maintSem: maintSem,
 	}
+}
+
+// semFor returns the concurrency semaphore that gates this action, or nil if
+// the action runs ungated. Copy is gated by copySem; check/prune by maintSem;
+// everything else (backup/restore/init) runs immediately.
+func (r *jobRegistry) semFor(action JobAction) chan struct{} {
+	switch action {
+	case ActionCopy:
+		return r.copySem
+	case ActionCheck, ActionPrune:
+		return r.maintSem
+	default:
+		return nil
+	}
+}
+
+// countActive returns how many jobs matching any of `actions` are currently
+// running or pending (i.e. in flight, including queued-on-semaphore). Used by
+// the after-wave chain to tell when the wave (backup/copy) has drained and when
+// a maintenance stage (prune, then check) has finished. Terminal jobs in the
+// registry ring are not counted.
+func (r *jobRegistry) countActive(actions ...JobAction) int {
+	want := make(map[JobAction]struct{}, len(actions))
+	for _, a := range actions {
+		want[a] = struct{}{}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	n := 0
+	for _, j := range r.jobs {
+		s := j.snapshot()
+		if _, ok := want[s.Action]; !ok {
+			continue
+		}
+		if s.State == JobRunning || s.State == JobPending {
+			n++
+		}
+	}
+	return n
 }
 
 // setJobLogDir wires the on-disk job-log directory. Idempotent.
@@ -606,13 +657,14 @@ func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo
 	r.jobs[j.ID] = j
 	r.mu.Unlock()
 
-	// Copy jobs are gated by the per-host copy semaphore so the nightly
-	// destination fan-out doesn't spawn N processes at once and OOM the box.
+	// Copy and maintenance (check/prune) jobs are gated by a per-host
+	// semaphore so the nightly destination fan-out — and the after-wave
+	// prune/check fan-out — don't spawn N processes at once and OOM the box.
 	// The slot is acquired inside a goroutine (NOT here) so neither the gin
-	// handler nor the kit's single, serial fireLoop blocks while a copy waits
+	// handler nor the kit's single, serial fireLoop blocks while a job waits
 	// its turn — the queued job simply stays Pending until a slot frees.
-	if action == ActionCopy && r.copySem != nil {
-		go r.spawnGated(jobCtx, cancel, j, binary, inv)
+	if sem := r.semFor(action); sem != nil {
+		go r.spawnGated(jobCtx, cancel, j, binary, inv, sem)
 		return j, nil
 	}
 
@@ -630,20 +682,20 @@ func (r *jobRegistry) start(parentCtx context.Context, binary string, repo *Repo
 // while queued, it never starts. The acquired slot is released exactly once
 // when the job reaches a terminal state (handled inside spawn via the release
 // callback, which also covers the cmd.Start()-failure path).
-func (r *jobRegistry) spawnGated(jobCtx context.Context, cancel context.CancelFunc, j *Job, binary string, inv cliInvocation) {
+func (r *jobRegistry) spawnGated(jobCtx context.Context, cancel context.CancelFunc, j *Job, binary string, inv cliInvocation, sem chan struct{}) {
 	select {
 	case <-jobCtx.Done():
 		// Cancelled (or parent context done) before we ever got a slot —
 		// finalise as cancelled without spawning anything.
 		r.finalizeUnstarted(j, cancel)
 		return
-	case r.copySem <- struct{}{}:
+	case sem <- struct{}{}:
 	}
 	released := false
 	release := func() {
 		if !released {
 			released = true
-			<-r.copySem
+			<-sem
 		}
 	}
 	if err := r.spawn(jobCtx, cancel, j, binary, inv, release); err != nil {
