@@ -305,6 +305,40 @@ func (e *eventBuffer) listRecentJobs(limit int) ([]jobPublic, error) {
 	return out, rows.Err()
 }
 
+// lastBackupByRepo returns, per repo_id, the wall-clock time of the most recent
+// COMPLETED backup. Unlike the fleet jobs list (capped at fleetJobsCap=50 and
+// sorted by recency, so a repo's last backup can fall out of the window behind
+// a burst of copy/check/prune jobs), this is a direct MAX over the durable
+// jobs table — the controller-side freshness badge derives node staleness from
+// it so a node that backed up today never shows "stale" just because its backup
+// scrolled out of the 50-job snapshot. Repos with no completed backup (e.g. a
+// copy-only relay repo) are absent from the map.
+func (e *eventBuffer) lastBackupByRepo() (map[string]time.Time, error) {
+	if e == nil || e.db == nil {
+		return nil, nil
+	}
+	rows, err := e.db.Query(
+		`SELECT repo_id, MAX(completed_at_ns) FROM jobs
+		  WHERE action = 'backup' AND state = 'completed' AND completed_at_ns > 0
+		  GROUP BY repo_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]time.Time{}
+	for rows.Next() {
+		var repoID string
+		var ns int64
+		if err := rows.Scan(&repoID, &ns); err != nil {
+			return nil, err
+		}
+		if ns > 0 {
+			out[repoID] = time.Unix(0, ns).UTC()
+		}
+	}
+	return out, rows.Err()
+}
+
 // getJob fetches one persisted job by id.
 func (e *eventBuffer) getJob(id string) (jobPublic, bool, error) {
 	if e == nil || e.db == nil {

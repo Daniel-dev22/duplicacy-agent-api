@@ -83,7 +83,25 @@ func newFleetHub(a *app) *fleetHub {
 	build := func(_ context.Context) (fleetEvent, error) {
 		ev := fleetEvent{Type: fleetEventSnapshot, Data: fleetSnapshot{Host: host}}
 		if a != nil {
-			ev.Data.Repos = a.repos.list()
+			repos := a.repos.list()
+			// Enrich each repo with its durable last-completed-backup time from
+			// the jobs table, so the controller's freshness badge doesn't read a
+			// node as "stale" merely because its backup scrolled out of the
+			// 50-job fleet window behind copy/check/prune jobs. list() returns
+			// value copies, so this never mutates the shared repo cache.
+			if a.events != nil {
+				if lb, err := a.events.lastBackupByRepo(); err != nil {
+					slog.Warn("fleet: last-backup-by-repo query failed", "error", err)
+				} else if len(lb) > 0 {
+					for i := range repos {
+						if t, ok := lb[repos[i].ID]; ok {
+							tc := t
+							repos[i].LastBackupAt = &tc
+						}
+					}
+				}
+			}
+			ev.Data.Repos = repos
 			ev.Data.Jobs = a.fleetJobs()
 		}
 		return ev, nil
