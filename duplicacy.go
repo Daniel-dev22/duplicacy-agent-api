@@ -161,15 +161,34 @@ func (a *app) handleListSnapshots(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "repo not found"})
 		return
 	}
-	env, _, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	// Ensure a requested secondary storage is in .duplicacy/preferences before
+	// listing — same lazy-add the copy path does (see handleSnapshotFiles).
+	storage := c.Query("storage")
+	if storage != "" && storage != "default" {
+		if err := a.ensureDestinations(c.Request.Context(), repo, destinationSpec{alias: storage}); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "ensure destination " + storage + ": " + err.Error()})
+			return
+		}
+	}
+
+	env, rsaPriv, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
 		return
 	}
 	defer cleanup()
 
-	storage := c.Query("storage")
+	// For an RSA-encrypted storage `duplicacy list` needs the private key to
+	// read the snapshot file index; pass it the same way handleRestore /
+	// handleSnapshotFiles do. -key must precede the other flags.
+	keyAlias := storage
+	if keyAlias == "" {
+		keyAlias = "default"
+	}
 	args := []string{"list"}
+	if kp := rsaPriv[keyAlias]; kp != "" {
+		args = append(args, "-key", kp)
+	}
 	if storage != "" {
 		args = append(args, "-storage", storage)
 	}
@@ -215,16 +234,43 @@ func (a *app) handleSnapshotFiles(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "revision must be a positive integer"})
 		return
 	}
-	env, _, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	// A source repo is init'd with only its primary (default) storage; the
+	// secondary storages (remote-nas, storj) are `duplicacy add`-ed into
+	// .duplicacy/preferences lazily, and until now ONLY inside the copy-job
+	// path. So an ad-hoc `list -files -storage <secondary>` failed with
+	// "storage <name> has not been added" (exit 100) → 500, while the local
+	// default worked. Mirror the copy path: ensure the requested secondary is
+	// in preferences before invoking duplicacy.
+	storage := c.Query("storage")
+	if storage != "" && storage != "default" {
+		if err := a.ensureDestinations(c.Request.Context(), repo, destinationSpec{alias: storage}); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "ensure destination " + storage + ": " + err.Error()})
+			return
+		}
+	}
+
+	env, rsaPriv, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
 		return
 	}
 	defer cleanup()
 
+	// `list -files` reads chunk/file metadata INSIDE a revision, which for an
+	// RSA-encrypted storage requires the private key to decrypt. Backup/copy
+	// only write (public key), so they never needed -key. Pass the per-storage
+	// private key the same way handleRestore does. -key must come before the
+	// other flags per duplicacy's arg parser.
+	keyAlias := storage
+	if keyAlias == "" {
+		keyAlias = "default"
+	}
 	args := []string{"list", "-files", "-r", strconv.Itoa(rev)}
-	if s := c.Query("storage"); s != "" {
-		args = append(args, "-storage", s)
+	if kp := rsaPriv[keyAlias]; kp != "" {
+		args = append(args, "-key", kp)
+	}
+	if storage != "" {
+		args = append(args, "-storage", storage)
 	}
 	out, err := runSync(c.Request.Context(), a.cfg.DuplicacyBinary, cliInvocation{
 		RepoRoot: repo.Path,
