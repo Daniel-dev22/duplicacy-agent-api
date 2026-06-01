@@ -181,6 +181,11 @@ func (a *app) handleListSnapshots(c *gin.Context) {
 	if kp := rsaPriv[keyAlias]; kp != "" {
 		args = append(args, "-key", kp)
 	}
+	// ?id scopes the revision list to one snapshot id — required when listing a
+	// relay/hub repo whose storage pools many source repos (restore-via-relay).
+	if id := c.Query("id"); id != "" {
+		args = append(args, "-id", id)
+	}
 	if storage != "" {
 		args = append(args, "-storage", storage)
 	}
@@ -247,6 +252,13 @@ func (a *app) handleSnapshotFiles(c *gin.Context) {
 	args := []string{"list", "-files", "-r", strconv.Itoa(rev)}
 	if kp := rsaPriv[keyAlias]; kp != "" {
 		args = append(args, "-key", kp)
+	}
+	// ?id scopes the listing to one snapshot id. Required when listing against a
+	// relay/hub repo whose storage pools many source repos' snapshots (e.g.
+	// restoring a node's offsite copy via the NAS relay): revision numbers are
+	// per-snapshot-id, so without -id duplicacy can't resolve -r <rev>.
+	if id := c.Query("id"); id != "" {
+		args = append(args, "-id", id)
 	}
 	if storage != "" {
 		args = append(args, "-storage", storage)
