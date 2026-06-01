@@ -118,6 +118,16 @@ type SnapshotStatPublic struct {
 // listByRepo returns all snapshot-stats rows for a repo, optionally filtered
 // to one storage_name. Ordering: revision DESC so the most recent shows first.
 func (s *snapshotStatsStore) listByRepo(ctx context.Context, repoID, storageName string) ([]SnapshotStatPublic, error) {
+	return s.list(ctx, repoID, storageName, "")
+}
+
+// list returns per-revision dedup rows, filtered by repo_id and optionally by
+// storage_name and snapshot_id. snapshotID is used by the restore-via-relay
+// stats path: a source repo's offsite stats are written on the NAS relay repo
+// (repo_id = relay UUID) but keyed by the SOURCE snapshot_id, so the relay
+// query must filter by snapshot_id to return just that source's rows instead
+// of the whole pooled set.
+func (s *snapshotStatsStore) list(ctx context.Context, repoID, storageName, snapshotID string) ([]SnapshotStatPublic, error) {
 	q := `SELECT snapshot_id, revision, storage_name, destination_key, destination_label,
 		files, bytes, bytes_pretty, total_chunks, total_bytes, total_bytes_pretty,
 		uniq_chunks, uniq_bytes, uniq_bytes_pretty, new_chunks, new_bytes, new_bytes_pretty,
@@ -127,6 +137,10 @@ func (s *snapshotStatsStore) listByRepo(ctx context.Context, repoID, storageName
 	if storageName != "" {
 		q += " AND storage_name = ?"
 		args = append(args, storageName)
+	}
+	if snapshotID != "" {
+		q += " AND snapshot_id = ?"
+		args = append(args, snapshotID)
 	}
 	q += " ORDER BY revision DESC, storage_name ASC"
 
@@ -590,7 +604,9 @@ func (a *app) handleListSnapshotStats(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "repo not found"})
 		return
 	}
-	stats, err := a.snapshotStats.listByRepo(c.Request.Context(), repo.ID, c.Query("storage"))
+	// ?snapshot_id scopes to one source snapshot id — used when querying a relay
+	// repo for a source node's offsite stats (the relay pools many snapshot ids).
+	stats, err := a.snapshotStats.list(c.Request.Context(), repo.ID, c.Query("storage"), c.Query("snapshot_id"))
 	if err != nil {
 		slog.Warn("list snapshot stats failed", "error", err, "repo", repo.ID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "list snapshot stats: " + err.Error()})
