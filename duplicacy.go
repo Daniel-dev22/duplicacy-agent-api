@@ -161,15 +161,7 @@ func (a *app) handleListSnapshots(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "repo not found"})
 		return
 	}
-	// Ensure a requested secondary storage is in .duplicacy/preferences before
-	// listing — same lazy-add the copy path does (see handleSnapshotFiles).
 	storage := c.Query("storage")
-	if storage != "" && storage != "default" {
-		if err := a.ensureDestinations(c.Request.Context(), repo, destinationSpec{alias: storage}); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "ensure destination " + storage + ": " + err.Error()})
-			return
-		}
-	}
 
 	env, rsaPriv, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
 	if err != nil {
@@ -234,20 +226,7 @@ func (a *app) handleSnapshotFiles(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "revision must be a positive integer"})
 		return
 	}
-	// A source repo is init'd with only its primary (default) storage; the
-	// secondary storages (remote-nas, storj) are `duplicacy add`-ed into
-	// .duplicacy/preferences lazily, and until now ONLY inside the copy-job
-	// path. So an ad-hoc `list -files -storage <secondary>` failed with
-	// "storage <name> has not been added" (exit 100) → 500, while the local
-	// default worked. Mirror the copy path: ensure the requested secondary is
-	// in preferences before invoking duplicacy.
 	storage := c.Query("storage")
-	if storage != "" && storage != "default" {
-		if err := a.ensureDestinations(c.Request.Context(), repo, destinationSpec{alias: storage}); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "ensure destination " + storage + ": " + err.Error()})
-			return
-		}
-	}
 
 	env, rsaPriv, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
 	if err != nil {

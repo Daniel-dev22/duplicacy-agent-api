@@ -56,6 +56,13 @@ type Repo struct {
 	// repository value (falls back to walking Repo.Path).
 	SourcePath     string `json:"source_path,omitempty"`
 	SourceHostPath string `json:"source_host_path,omitempty"` // always == SourcePath on mirrored mounts
+	// LastBackupAt is this repo's most recent completed backup, from the durable
+	// jobs table (NOT the 50-job fleet window). Set only when enriching the
+	// /ws/fleet snapshot (fleet_ws.go); the filesystem scanner leaves it nil.
+	// Absent (nil) for copy-only repos that never run a local backup. Drives the
+	// controller's freshness badge so a node that backed up today is never
+	// flagged "stale" merely because its backup scrolled out of the job window.
+	LastBackupAt *time.Time `json:"last_backup_at,omitempty"`
 }
 
 // rawPreference is the on-disk shape from duplicacy_preference.go::Preference.
