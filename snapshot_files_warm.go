@@ -106,8 +106,13 @@ func (a *app) warmListCacheSweep(ctx context.Context) {
 	if keepN <= 0 {
 		return
 	}
-	var warmed, reconciled int
+	var warmed int
 	capped := false
+	// Accumulated across the whole sweep, then reconciled ONCE at the end (see
+	// reconcileAgainstKeep): swept = storages we successfully listed; keep =
+	// every currently-existing (storage, snapshot_id, revision) discovered.
+	swept := map[string]struct{}{}
+	keep := map[string]struct{}{}
 
 	for _, repo := range a.repos.list() {
 		if ctx.Err() != nil {
@@ -129,18 +134,20 @@ func (a *app) warmListCacheSweep(ctx context.Context) {
 			}
 			keyPath := rsaPriv[storage]
 
-			// 1. List live revisions across every snapshot id on this storage
-			//    (cheap — downloads only the snapshot index). Used both to
-			//    reconcile prunes and to choose the newest-N to warm.
+			// 1. List live revisions on this storage (cheap — downloads only the
+			//    snapshot index). Scoped per warmListArgs: own id for default, all
+			//    ids for relay secondaries.
 			live, err := a.warmListSnapshots(ctx, repo, storage, keyPath, env)
 			if err != nil {
 				slog.Warn("list-cache warm: list failed", "repo", repo.ID, "storage", storage, "error", err)
 				continue
 			}
-			if n, rerr := a.filesCache.reconcile(ctx, storage, live); rerr != nil {
-				slog.Warn("list-cache reconcile failed", "repo", repo.ID, "storage", storage, "error", rerr)
-			} else {
-				reconciled += n
+			// Record what exists so the end-of-sweep reconcile keeps it. Only a
+			// successfully-listed storage is marked swept (a transient list error
+			// never purges that storage's cache).
+			swept[storage] = struct{}{}
+			for _, sn := range live {
+				keep[storageSnapRevKey(storage, sn.SnapshotID, sn.Revision)] = struct{}{}
 			}
 
 			// 2. Warm the newest-N revisions per snapshot id that aren't cached.
@@ -169,6 +176,13 @@ func (a *app) warmListCacheSweep(ctx context.Context) {
 		cleanup()
 	}
 
+	// One reconcile against the whole sweep's keep-set: removes pruned revisions
+	// AND any snapshot this node no longer warms (e.g. foreign snapshots an edge
+	// node used to over-warm via -all), without multi-repo thrashing.
+	reconciled, rerr := a.filesCache.reconcileAgainstKeep(ctx, swept, keep)
+	if rerr != nil {
+		slog.Warn("list-cache reconcile failed", "error", rerr)
+	}
 	if err := a.filesCache.evictBySize(ctx); err != nil {
 		slog.Warn("list-cache evict failed", "error", err)
 	}
