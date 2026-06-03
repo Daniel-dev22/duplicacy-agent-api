@@ -549,6 +549,25 @@ func newJobRegistry(maxConcurrentCopies, maxConcurrentMaint int) *jobRegistry {
 	}
 }
 
+// acquireMaint blocks until a maintenance slot is free (or ctx is done),
+// returning a release func and ok. When the semaphore is unbounded (nil) it's a
+// no-op. This lets non-job background work — specifically the list-files cache
+// warmer — share the SAME concurrency budget as check/prune so its `list`
+// calls queue behind/beside maintenance instead of piling extra load onto the
+// nightly wave on the RAM-constrained NAS. Always call release() (a no-op when
+// ok is false).
+func (r *jobRegistry) acquireMaint(ctx context.Context) (release func(), ok bool) {
+	if r.maintSem == nil {
+		return func() {}, true
+	}
+	select {
+	case r.maintSem <- struct{}{}:
+		return func() { <-r.maintSem }, true
+	case <-ctx.Done():
+		return func() {}, false
+	}
+}
+
 // semFor returns the concurrency semaphore that gates this action, or nil if
 // the action runs ungated. Copy is gated by copySem; check/prune by maintSem;
 // everything else (backup/restore/init) runs immediately.

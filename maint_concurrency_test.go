@@ -40,6 +40,55 @@ func TestMaintSemaphoreSerialises(t *testing.T) {
 	}
 }
 
+// acquireMaint (used by the list-cache warmer) shares the maint semaphore:
+// with cap 1, a second acquire blocks until the first releases; an unbounded
+// (nil) semaphore is a no-op; a cancelled ctx returns ok=false.
+func TestAcquireMaint(t *testing.T) {
+	// Unbounded → always ok, release is a safe no-op.
+	r0 := newJobRegistry(0, 0)
+	if rel, ok := r0.acquireMaint(context.Background()); !ok {
+		t.Fatal("unbounded acquireMaint should succeed")
+	} else {
+		rel()
+	}
+
+	// Cap 1: hold the slot, a second acquire must block, then unblock on release.
+	r := newJobRegistry(0, 1)
+	rel1, ok := r.acquireMaint(context.Background())
+	if !ok {
+		t.Fatal("first acquire should succeed")
+	}
+	got := make(chan struct{})
+	go func() {
+		rel2, _ := r.acquireMaint(context.Background())
+		rel2()
+		close(got)
+	}()
+	select {
+	case <-got:
+		t.Fatal("second acquire ran while the only slot was held")
+	case <-time.After(80 * time.Millisecond):
+	}
+	rel1()
+	select {
+	case <-got:
+	case <-time.After(time.Second):
+		t.Fatal("second acquire did not proceed after release")
+	}
+
+	// Cancelled ctx while the slot is held → ok=false.
+	rel3, ok := r.acquireMaint(context.Background())
+	if !ok {
+		t.Fatal("acquire should succeed when slot free")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, ok := r.acquireMaint(ctx); ok {
+		t.Fatal("acquireMaint with cancelled ctx should return ok=false")
+	}
+	rel3()
+}
+
 // Maintenance and copy semaphores are independent: a maint cap of 1 does not
 // gate copies, and vice-versa. Also exercises countActive across actions.
 func TestMaintAndCopyIndependentAndCountActive(t *testing.T) {

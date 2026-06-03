@@ -12,6 +12,12 @@ const (
 	// listWarmDebounce collapses a burst of backup/copy/prune completions (the
 	// nightly wave) into a single warm sweep that runs once activity settles.
 	listWarmDebounce = 2 * time.Minute
+	// listWarmStartupDelay defers the post-restart safety-net sweep so the
+	// initial repo scan can settle first. The persisted SQLite cache survives
+	// restarts, so this sweep is usually cheap (most entries already present);
+	// it exists to re-warm anything created/evicted/missed while the agent was
+	// down.
+	listWarmStartupDelay = 2 * time.Minute
 	// maxWarmListsPerSweep bounds `list -files` invocations in one sweep so a
 	// cold cache (first run after deploy) can't pin the maintenance lane for
 	// hours. Anything skipped this sweep is warmed on a later sweep or lazily
@@ -19,36 +25,71 @@ const (
 	maxWarmListsPerSweep = 200
 )
 
-// runListCacheWarmer is the debounced driver behind the list-files warm cache.
-// It waits for a warmDirty nudge, lets the burst settle (listWarmDebounce),
-// then runs one warmListCacheSweep. A single goroutine ⇒ sweeps never overlap
-// and the `list` subprocesses never fan out across the host.
+// runListCacheWarmer drives the list-files warm cache from three triggers:
+//   - edge: a warmDirty nudge on backup/copy/prune completion (debounced so the
+//     nightly burst collapses to one sweep that runs after the wave settles);
+//   - level: a periodic ticker (ListCacheWarmInterval) — the SLA safety net that
+//     re-warms newest-N even when a completion event is missed; and
+//   - startup: one sweep shortly after boot to recover anything created/evicted
+//     while the agent was down.
+//
+// A single goroutine ⇒ sweeps never overlap and the `list` subprocesses never
+// fan out across the host; each `list` additionally takes a maintenance-semaphore
+// slot (see runListGated) so warming queues behind/beside check+prune rather
+// than piling onto the wave.
 func (a *app) runListCacheWarmer(ctx context.Context) {
+	startup := time.NewTimer(listWarmStartupDelay)
+	defer startup.Stop()
+
+	var tickC <-chan time.Time
+	if a.cfg.ListCacheWarmInterval > 0 {
+		ticker := time.NewTicker(a.cfg.ListCacheWarmInterval)
+		defer ticker.Stop()
+		tickC = ticker.C
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-startup.C:
+			a.warmListCacheSweep(ctx)
+		case <-tickC:
+			a.warmListCacheSweep(ctx)
 		case <-a.warmDirty:
-		}
-		// Debounce: keep extending the window while nudges keep arriving.
-		timer := time.NewTimer(listWarmDebounce)
-	settle:
-		for {
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return
-			case <-a.warmDirty:
-				if !timer.Stop() {
-					<-timer.C
+			// Debounce: keep extending the window while nudges keep arriving.
+			timer := time.NewTimer(listWarmDebounce)
+		settle:
+			for {
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-a.warmDirty:
+					if !timer.Stop() {
+						<-timer.C
+					}
+					timer.Reset(listWarmDebounce)
+				case <-timer.C:
+					break settle
 				}
-				timer.Reset(listWarmDebounce)
-			case <-timer.C:
-				break settle
 			}
+			a.warmListCacheSweep(ctx)
 		}
-		a.warmListCacheSweep(ctx)
 	}
+}
+
+// runListGated runs a warm `list`/`list -files` invocation while holding a
+// maintenance-semaphore slot, so background warming shares the same concurrency
+// budget as check+prune and never competes with the nightly wave on the
+// RAM-constrained NAS. Returns ctx.Err() if cancelled while queued.
+func (a *app) runListGated(ctx context.Context, inv cliInvocation, timeout time.Duration) ([]byte, error) {
+	release, ok := a.jobs.acquireMaint(ctx)
+	if !ok {
+		return nil, ctx.Err()
+	}
+	defer release()
+	return runSync(ctx, a.cfg.DuplicacyBinary, inv, timeout)
 }
 
 // warmListCacheSweep pre-lists the newest-N revisions per (snapshot_id,
@@ -149,7 +190,7 @@ func (a *app) warmListSnapshots(ctx context.Context, repo *Repo, storage, keyPat
 	if storage != "" && storage != "default" {
 		args = append(args, "-storage", storage)
 	}
-	out, err := runSync(ctx, a.cfg.DuplicacyBinary, cliInvocation{
+	out, err := a.runListGated(ctx, cliInvocation{
 		RepoRoot: repo.Path, Args: args, EnvAdds: env,
 	}, 60*time.Second)
 	if err != nil {
@@ -172,7 +213,7 @@ func (a *app) warmOneListing(ctx context.Context, repo *Repo, storage, keyPath, 
 	if storage != "" && storage != "default" {
 		args = append(args, "-storage", storage)
 	}
-	out, err := runSync(ctx, a.cfg.DuplicacyBinary, cliInvocation{
+	out, err := a.runListGated(ctx, cliInvocation{
 		RepoRoot: repo.Path, Args: args, EnvAdds: env,
 	}, 5*time.Minute)
 	if err != nil {

@@ -80,6 +80,16 @@ type Config struct {
 	ListCacheEnabled  bool  // master switch (LIST_FILES_CACHE_ENABLED)
 	ListCacheWarmN    int   // newest-N revisions pre-listed per (snapshot, storage) and pinned from size eviction
 	ListCacheMaxBytes int64 // hard size cap on gzipped cache bytes; <=0 disables size eviction
+	// ListCacheWarmInterval is the SLA safety net: a level-triggered warm sweep
+	// runs this often (plus once shortly after startup) IN ADDITION to the
+	// event-triggered sweep on backup/copy/prune completion. It guarantees the
+	// newest-N listings get (re)cached even when a completion event is missed —
+	// agent restart across a backup, a dropped event, or an evicted entry — so
+	// the cache self-heals on a bounded schedule. The sweep is idempotent (skips
+	// already-cached immutable revisions), so steady-state cost is one cheap
+	// `list` per repo+storage. <=0 disables the periodic tick (the startup sweep
+	// still runs).
+	ListCacheWarmInterval time.Duration
 
 	// --- Directory-size gatherer (tree_sizes.go) ---
 	// The gatherer is a self-paced background loop, fully decoupled from the
@@ -129,9 +139,10 @@ func loadConfig() Config {
 		MaxConcurrentCopies: getEnvInt("DUPLICACY_MAX_CONCURRENT_COPIES", 1),
 		MaxConcurrentMaint:  getEnvInt("DUPLICACY_MAX_CONCURRENT_MAINT", 1),
 
-		ListCacheEnabled:  getEnvBool("LIST_FILES_CACHE_ENABLED", true),
-		ListCacheWarmN:    getEnvInt("LIST_FILES_CACHE_WARM_N", 5),
-		ListCacheMaxBytes: int64(getEnvInt("LIST_FILES_CACHE_MAX_BYTES", 1<<30)), // 1 GiB
+		ListCacheEnabled:      getEnvBool("LIST_FILES_CACHE_ENABLED", true),
+		ListCacheWarmN:        getEnvInt("LIST_FILES_CACHE_WARM_N", 5),
+		ListCacheMaxBytes:     int64(getEnvInt("LIST_FILES_CACHE_MAX_BYTES", 1<<30)), // 1 GiB
+		ListCacheWarmInterval: getEnvDuration("LIST_FILES_CACHE_WARM_INTERVAL", 30*time.Minute),
 
 		TreeSizeEnabled:            getEnvBool("TREE_SIZE_ENABLED", true),
 		TreeSizeLargeFileThreshold: int64(getEnvInt("TREE_SIZE_LARGE_FILE_THRESHOLD", 50000)),
