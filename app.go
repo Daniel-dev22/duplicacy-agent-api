@@ -70,15 +70,17 @@ type app struct {
 	chain               *kitsched.Chain // after-wave maintenance chain (prune→check)
 	filters             *filterCache
 	events              *eventBuffer
-	snapshotStats       *snapshotStatsStore // per-snapshot dedup rows from `check -tabular`
-	mapping             *repoMappingStore   // controller-managed repo↔credential mapping
-	secrets             *secretCache      // 60s TTL cache of vended bundles
-	compose             *composeIndex     // bounded scan of mounted COMPOSE_SCAN_ROOTS for compose project dirs
-	fleet               *fleetHub         // /ws/fleet broadcaster — pushes snapshot on init / job state change
-	trees               *treeWalker       // 5-min push of repo + node filesystem trees to controller
-	sizes               *dirSizeCache     // persisted per-directory subtree byte totals (read by the tree push)
-	sizeGatherer        *sizeGatherer     // self-paced background loop that fills `sizes`
-	stop                chan struct{}     // closed in close(); subsystems range on it for shutdown
+	snapshotStats       *snapshotStatsStore      // per-snapshot dedup rows from `check -tabular`
+	filesCache          *snapshotFilesCacheStore // persistent `list -files` cache (nil when disabled)
+	warmDirty           chan struct{}            // buffered(1) nudge → debounced list-cache warm sweep
+	mapping             *repoMappingStore        // controller-managed repo↔credential mapping
+	secrets             *secretCache             // 60s TTL cache of vended bundles
+	compose             *composeIndex            // bounded scan of mounted COMPOSE_SCAN_ROOTS for compose project dirs
+	fleet               *fleetHub                // /ws/fleet broadcaster — pushes snapshot on init / job state change
+	trees               *treeWalker              // 5-min push of repo + node filesystem trees to controller
+	sizes               *dirSizeCache            // persisted per-directory subtree byte totals (read by the tree push)
+	sizeGatherer        *sizeGatherer            // self-paced background loop that fills `sizes`
+	stop                chan struct{}            // closed in close(); subsystems range on it for shutdown
 }
 
 func newApp(ctx context.Context, cfg Config) (*app, error) {
@@ -137,7 +139,13 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 		mapping:             mapping,
 		secrets:             newSecretCache(),
 		compose:             newComposeIndex(cfg.ComposeScanRoots),
+		warmDirty:           make(chan struct{}, 1),
 		stop:                make(chan struct{}),
+	}
+	// Persistent `list -files` cache (snapshot_files_cache.go). Shares the
+	// events.sqlite handle. Disabled → nil, and every call site no-ops.
+	if cfg.ListCacheEnabled {
+		a.filesCache = newSnapshotFilesCacheStore(events.DB(), cfg.ListCacheMaxBytes, cfg.ListCacheWarmN)
 	}
 	// Flush per-snapshot dedup rows captured during a `check -tabular` run
 	// into snapshot_stats on terminal state. Runs in a goroutine because the
@@ -148,6 +156,22 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 			return
 		}
 		go a.flushSnapshotStats(j)
+	})
+	// Nudge the list-files cache warmer on any terminal backup/copy/prune. A
+	// backup/copy creates a new revision to pre-list; a prune removes revisions
+	// the warmer must reconcile out of the cache. The nudge is debounced inside
+	// runListCacheWarmer so a nightly burst collapses to one sweep.
+	jobs.RegisterHook(func(j *Job, evt JobEvent) {
+		if a.filesCache == nil || evt != EventCompleted {
+			return
+		}
+		switch j.snapshot().Action {
+		case ActionBackup, ActionCopy, ActionPrune:
+			select {
+			case a.warmDirty <- struct{}{}:
+			default: // a sweep is already pending; coalesce
+			}
+		}
 	})
 	a.fleet = newFleetHub(a)
 	// Trigger a fleet snapshot on every job lifecycle event so connected
@@ -235,6 +259,9 @@ func (a *app) startBackgroundWorkers(ctx context.Context) {
 	go a.startJobStateReconcile(ctx)
 	a.trees.Start(ctx)
 	a.sizeGatherer.Start(ctx)
+	if a.filesCache != nil {
+		go a.runListCacheWarmer(ctx)
+	}
 	slog.Info("background workers started")
 }
 

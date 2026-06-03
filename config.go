@@ -72,6 +72,15 @@ type Config struct {
 	// DUPLICACY_MAX_CONCURRENT_MAINT; <=0 disables the cap (unbounded).
 	MaxConcurrentMaint int
 
+	// --- list -files cache (snapshot_files_cache.go) ---
+	// Persistent cache of `duplicacy list -files` output, keyed by the immutable
+	// (snapshot_id, revision, storage). Read-through on every restore-drawer
+	// open + proactively warmed for the newest-N revisions after each
+	// backup/copy so the common restore is instant. See the design memo.
+	ListCacheEnabled  bool  // master switch (LIST_FILES_CACHE_ENABLED)
+	ListCacheWarmN    int   // newest-N revisions pre-listed per (snapshot, storage) and pinned from size eviction
+	ListCacheMaxBytes int64 // hard size cap on gzipped cache bytes; <=0 disables size eviction
+
 	// --- Directory-size gatherer (tree_sizes.go) ---
 	// The gatherer is a self-paced background loop, fully decoupled from the
 	// 5-min tree push: it fills a persisted per-directory size cache "as it
@@ -119,6 +128,10 @@ func loadConfig() Config {
 		CopyThreads:         getEnvInt("DUPLICACY_COPY_THREADS", 2),
 		MaxConcurrentCopies: getEnvInt("DUPLICACY_MAX_CONCURRENT_COPIES", 1),
 		MaxConcurrentMaint:  getEnvInt("DUPLICACY_MAX_CONCURRENT_MAINT", 1),
+
+		ListCacheEnabled:  getEnvBool("LIST_FILES_CACHE_ENABLED", true),
+		ListCacheWarmN:    getEnvInt("LIST_FILES_CACHE_WARM_N", 5),
+		ListCacheMaxBytes: int64(getEnvInt("LIST_FILES_CACHE_MAX_BYTES", 1<<30)), // 1 GiB
 
 		TreeSizeEnabled:            getEnvBool("TREE_SIZE_ENABLED", true),
 		TreeSizeLargeFileThreshold: int64(getEnvInt("TREE_SIZE_LARGE_FILE_THRESHOLD", 50000)),
