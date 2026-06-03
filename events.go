@@ -112,6 +112,28 @@ func newEventBuffer(cfg Config, client *http.Client) (*eventBuffer, error) {
 			updated_at_ns   INTEGER NOT NULL
 		);
 		CREATE INDEX IF NOT EXISTS idx_jobs_updated ON jobs (updated_at_ns);
+
+		-- snapshot_files_cache: gzipped "duplicacy list -files" output, keyed by
+		-- the IMMUTABLE (snapshot_id, revision, storage_name) tuple. A revision's
+		-- file list never changes once created, so a hit is valid forever with
+		-- zero invalidation. Eviction is only (a) size-cap LRU by last_access and
+		-- (b) prune-reconcile when a revision leaves retention. See
+		-- snapshot_files_cache.go.
+		CREATE TABLE IF NOT EXISTS snapshot_files_cache (
+			snapshot_id   TEXT    NOT NULL,
+			revision      INTEGER NOT NULL,
+			storage_name  TEXT    NOT NULL,
+			repo_id       TEXT    NOT NULL,
+			gz_output     BLOB    NOT NULL,
+			raw_bytes     INTEGER NOT NULL,
+			gz_bytes      INTEGER NOT NULL,
+			cached_at     TIMESTAMP NOT NULL,
+			last_access   TIMESTAMP NOT NULL,
+			PRIMARY KEY (snapshot_id, revision, storage_name)
+		);
+		CREATE INDEX IF NOT EXISTS idx_sfc_repo ON snapshot_files_cache (repo_id);
+		CREATE INDEX IF NOT EXISTS idx_sfc_access ON snapshot_files_cache (last_access);
+		CREATE INDEX IF NOT EXISTS idx_sfc_storage ON snapshot_files_cache (storage_name);
 	`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)

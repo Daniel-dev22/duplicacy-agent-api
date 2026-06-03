@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -233,6 +234,28 @@ func (a *app) handleSnapshotFiles(c *gin.Context) {
 	}
 	storage := c.Query("storage")
 
+	// Cache key uses the IMMUTABLE identity of the listing: the effective
+	// snapshot id (the ?id override for relay/hub repos, else the repo's own
+	// snapshot id) + revision + storage. A revision's file list never changes,
+	// so a hit is always correct — serve it without vending secrets or running
+	// duplicacy (the slow part, esp. for cross-site/SFTP secondaries).
+	storageKey := storage
+	if storageKey == "" {
+		storageKey = "default"
+	}
+	snapID := c.Query("id")
+	if snapID == "" {
+		snapID = repo.SnapshotID
+	}
+	if a.filesCache != nil && snapID != "" {
+		if raw, hit, cerr := a.filesCache.get(c.Request.Context(), snapID, rev, storageKey); cerr != nil {
+			slog.Warn("list-files cache get failed", "error", cerr, "repo", repo.ID, "snapshot_id", snapID, "rev", rev, "storage", storageKey)
+		} else if hit {
+			c.Data(http.StatusOK, "text/plain; charset=utf-8", raw)
+			return
+		}
+	}
+
 	env, rsaPriv, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
@@ -271,6 +294,19 @@ func (a *app) handleSnapshotFiles(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "output": string(out)})
 		return
+	}
+	// Populate the cache off the hot path with a detached context (the request
+	// context is cancelled the moment we return c.Data, which would abort the
+	// write). Immutable key ⇒ safe to store unconditionally.
+	if a.filesCache != nil && snapID != "" {
+		cached := out
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := a.filesCache.put(ctx, snapID, rev, storageKey, repo.ID, cached); err != nil {
+				slog.Warn("list-files cache put failed", "error", err, "repo", repo.ID, "snapshot_id", snapID, "rev", rev, "storage", storageKey)
+			}
+		}()
 	}
 	c.Data(http.StatusOK, "text/plain; charset=utf-8", out)
 }
