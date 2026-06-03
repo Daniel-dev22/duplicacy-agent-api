@@ -178,20 +178,44 @@ func (a *app) warmListCacheSweep(ctx context.Context) {
 		"rows", rows, "gz_bytes", gzBytes)
 }
 
-// warmListSnapshots runs `duplicacy list -all -storage <storage>` and returns
-// the parsed revisions across ALL snapshot ids on that storage. -all is
-// required so a relay/hub repo enumerates every pooled source id (without it
-// duplicacy lists only the repo's own snapshot id).
-func (a *app) warmListSnapshots(ctx context.Context, repo *Repo, storage, keyPath string, env []string) ([]Snapshot, error) {
-	args := []string{"list", "-all"}
+// warmListArgs builds the discovery `duplicacy list` args that decide WHICH
+// snapshots a sweep warms on a given storage:
+//
+//   - default (the shared local pool every host SFTPs into): scope to the
+//     repo's OWN snapshot id. `list -all` here would return the entire fleet's
+//     snapshots, but a node only ever serves routine-restore listings for its
+//     OWN repos (default listings are served by the source node, not the relay),
+//     so warming the whole pool just wastes cache + warm-time on every node
+//     (notably the SD-card pi). Fall back to -all only if the repo has no id.
+//   - a relay secondary (remote-nas / storj): keep -all. These storages exist
+//     only on the NAS relay, which serves relay-files for EVERY pooled source,
+//     so all ids must be enumerated.
+func warmListArgs(storage, keyPath, ownSnapshotID string) []string {
+	args := []string{"list"}
 	if keyPath != "" {
 		args = append(args, "-key", keyPath)
+	}
+	if storage == "" || storage == "default" {
+		if ownSnapshotID != "" {
+			args = append(args, "-id", ownSnapshotID)
+		} else {
+			args = append(args, "-all")
+		}
+	} else {
+		args = append(args, "-all")
 	}
 	if storage != "" && storage != "default" {
 		args = append(args, "-storage", storage)
 	}
+	return args
+}
+
+// warmListSnapshots runs the discovery `duplicacy list` for a (repo, storage)
+// and returns the parsed revisions to consider for warming. See warmListArgs
+// for the own-id vs -all scoping.
+func (a *app) warmListSnapshots(ctx context.Context, repo *Repo, storage, keyPath string, env []string) ([]Snapshot, error) {
 	out, err := a.runListGated(ctx, cliInvocation{
-		RepoRoot: repo.Path, Args: args, EnvAdds: env,
+		RepoRoot: repo.Path, Args: warmListArgs(storage, keyPath, repo.SnapshotID), EnvAdds: env,
 	}, 60*time.Second)
 	if err != nil {
 		return nil, err
