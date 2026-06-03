@@ -115,38 +115,67 @@ func TestFilesCacheEvictPinsNewestN(t *testing.T) {
 	}
 }
 
-func TestFilesCacheReconcilePrunesMissingRevisions(t *testing.T) {
+func TestReconcileAgainstKeep(t *testing.T) {
 	c := newTestFilesCache(t, 0, 5)
 	ctx := context.Background()
-	for rev := 1; rev <= 3; rev++ {
-		if err := c.put(ctx, "snapA", rev, "storj", "repo1", []byte(fmt.Sprintf("rev%d\n", rev))); err != nil {
-			t.Fatalf("put: %v", err)
+	put := func(snap string, rev int, storage string) {
+		if err := c.put(ctx, snap, rev, storage, "repo", []byte(fmt.Sprintf("%s-%d\n", snap, rev))); err != nil {
+			t.Fatalf("put %s r%d %s: %v", snap, rev, storage, err)
 		}
 	}
-	// A different storage's row must be untouched by a storj reconcile.
-	if err := c.put(ctx, "snapA", 1, "default", "repo1", []byte("d\n")); err != nil {
-		t.Fatalf("put default: %v", err)
+	// storj: snapA revs 1-3 (rev1 will be pruned). default: two DIFFERENT
+	// snapshots (the multi-repo case) + a foreign snapshot to be cleaned.
+	put("snapA", 1, "storj")
+	put("snapA", 2, "storj")
+	put("snapA", 3, "storj")
+	put("ownA", 5, "default")
+	put("ownB", 5, "default")
+	put("foreign", 9, "default")
+	// A storage NOT swept this round must be untouched even if absent from keep.
+	put("snapA", 1, "remote-nas")
+
+	swept := map[string]struct{}{"storj": {}, "default": {}}
+	keep := map[string]struct{}{}
+	for _, k := range []struct {
+		st, sn string
+		rev    int
+	}{
+		{"storj", "snapA", 2}, {"storj", "snapA", 3}, // rev1 pruned
+		{"default", "ownA", 5}, {"default", "ownB", 5}, // both own repos kept (no fight)
+		// "foreign" intentionally absent → should be cleaned
+	} {
+		keep[storageSnapRevKey(k.st, k.sn, k.rev)] = struct{}{}
 	}
 
-	// Live set after a prune: only rev2 + rev3 still exist on storj.
-	live := []Snapshot{{SnapshotID: "snapA", Revision: 2}, {SnapshotID: "snapA", Revision: 3}}
-	n, err := c.reconcile(ctx, "storj", live)
+	n, err := c.reconcileAgainstKeep(ctx, swept, keep)
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("expected 1 eviction (rev1), got %d", n)
+	if n != 2 { // storj rev1 + default foreign
+		t.Fatalf("expected 2 evictions (storj rev1, default foreign), got %d", n)
 	}
+	// Pruned + foreign gone:
 	if ok, _ := c.has(ctx, "snapA", 1, "storj"); ok {
-		t.Fatalf("pruned rev1 should be evicted")
+		t.Fatal("pruned storj rev1 should be evicted")
 	}
-	for _, rev := range []int{2, 3} {
-		if ok, _ := c.has(ctx, "snapA", rev, "storj"); !ok {
-			t.Fatalf("live rev%d should remain", rev)
+	if ok, _ := c.has(ctx, "foreign", 9, "default"); ok {
+		t.Fatal("foreign default snapshot should be cleaned")
+	}
+	// Both own default snapshots survive (no multi-repo thrash):
+	for _, sn := range []string{"ownA", "ownB"} {
+		if ok, _ := c.has(ctx, sn, 5, "default"); !ok {
+			t.Fatalf("own default snapshot %s should remain (no fight)", sn)
 		}
 	}
-	if ok, _ := c.has(ctx, "snapA", 1, "default"); !ok {
-		t.Fatalf("reconcile on storj must not touch the default storage row")
+	// Live storj revs survive:
+	for _, rev := range []int{2, 3} {
+		if ok, _ := c.has(ctx, "snapA", rev, "storj"); !ok {
+			t.Fatalf("live storj rev%d should remain", rev)
+		}
+	}
+	// Un-swept storage untouched:
+	if ok, _ := c.has(ctx, "snapA", 1, "remote-nas"); !ok {
+		t.Fatal("un-swept remote-nas row must not be touched")
 	}
 }
 

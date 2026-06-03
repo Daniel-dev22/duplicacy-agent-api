@@ -181,22 +181,32 @@ func (s *snapshotFilesCacheStore) evictBySize(ctx context.Context) (err error) {
 	return s.deleteByRowID(ctx, victims)
 }
 
-// reconcile deletes cache rows for `storage` whose (snapshot_id, revision) no
-// longer appears in the live snapshot list — i.e. the revision was pruned out
-// of retention. live is the parsed output of `duplicacy list -storage
-// <storage>` (every currently-existing revision on that storage). Returns the
+// reconcileAgainstKeep deletes cache rows that the warm sweep did NOT decide to
+// keep, scoped to the storages the sweep actually listed. It runs ONCE at the
+// end of a sweep against the union keep-set, rather than per-(repo,storage),
+// for two reasons:
+//
+//   - Correctness: a per-storage reconcile keyed on one repo's scoped `list`
+//     would delete other repos' entries on the same shared storage (default),
+//     so on a multi-repo node each repo's reconcile would nuke the others'
+//     freshly-warmed rows — the warm cache would thrash down to the
+//     last-processed repo every sweep.
+//   - Cleanup: a row in a swept storage that's in nobody's keep-set is either a
+//     pruned revision OR a snapshot this node no longer warms (e.g. an edge
+//     node that used to over-warm the whole shared pool). Both should go, so the
+//     node converges to exactly what it warms today.
+//
+// `swept` is the set of storages successfully listed this sweep (a storage whose
+// `list` errored is absent, so its rows are left untouched rather than wrongly
+// purged on a transient failure). `keep` holds storageSnapRevKey(...) for every
+// currently-existing (storage, snapshot_id, revision) discovered. Returns the
 // number of rows evicted.
-func (s *snapshotFilesCacheStore) reconcile(ctx context.Context, storage string, live []Snapshot) (int, error) {
-	if s == nil || s.db == nil {
+func (s *snapshotFilesCacheStore) reconcileAgainstKeep(ctx context.Context, swept, keep map[string]struct{}) (int, error) {
+	if s == nil || s.db == nil || len(swept) == 0 {
 		return 0, nil
 	}
-	liveKey := make(map[string]struct{}, len(live))
-	for _, sn := range live {
-		liveKey[snapRevKey(sn.SnapshotID, sn.Revision)] = struct{}{}
-	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT rowid, snapshot_id, revision FROM snapshot_files_cache WHERE storage_name = ?`,
-		storage)
+		`SELECT rowid, storage_name, snapshot_id, revision FROM snapshot_files_cache`)
 	if err != nil {
 		return 0, fmt.Errorf("reconcile scan: %w", err)
 	}
@@ -205,12 +215,15 @@ func (s *snapshotFilesCacheStore) reconcile(ctx context.Context, storage string,
 	var victims []int64
 	for rows.Next() {
 		var rid int64
-		var sid string
+		var storage, sid string
 		var rev int
-		if err := rows.Scan(&rid, &sid, &rev); err != nil {
+		if err := rows.Scan(&rid, &storage, &sid, &rev); err != nil {
 			return 0, fmt.Errorf("reconcile row: %w", err)
 		}
-		if _, ok := liveKey[snapRevKey(sid, rev)]; !ok {
+		if _, ok := swept[storage]; !ok {
+			continue // storage not listed this sweep — leave it alone
+		}
+		if _, ok := keep[storageSnapRevKey(storage, sid, rev)]; !ok {
 			victims = append(victims, rid)
 		}
 	}
@@ -263,8 +276,10 @@ func (s *snapshotFilesCacheStore) stats(ctx context.Context) (rows int, gzBytes 
 	return rows, gzBytes, nil
 }
 
-func snapRevKey(snapshotID string, rev int) string {
-	return snapshotID + "\x00" + fmt.Sprint(rev)
+// storageSnapRevKey is the keep-set key: a listing is uniquely identified by
+// its storage + snapshot id + revision (the same tuple the cache is keyed on).
+func storageSnapRevKey(storage, snapshotID string, rev int) string {
+	return storage + "\x00" + snapshotID + "\x00" + fmt.Sprint(rev)
 }
 
 func gzipBytes(raw []byte) ([]byte, error) {
