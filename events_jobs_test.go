@@ -2,12 +2,45 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Daniel-dev22/agent-kit-go/jobstore"
 )
+
+// The wire payload must OMIT completed_at when the job isn't done yet (started /
+// progress events). A value time.Time with `omitempty` would instead serialize
+// the zero time as "0001-01-01T00:00:00Z"; the controller stores that non-NULL
+// zero and its COALESCE upsert guard then pins it, discarding the real
+// completion time from the terminal event — the false-"stale" regression. The
+// *time.Time + tPtr(zero)==nil combination is what keeps it omitted.
+func TestEventPayloadOmitsZeroCompletedAt(t *testing.T) {
+	started := time.Now().UTC()
+	running := EventPayload{State: JobRunning, StartedAt: tPtr(started), CompletedAt: tPtr(time.Time{}), EmittedAt: started}
+	b, err := json.Marshal(running)
+	if err != nil {
+		t.Fatalf("marshal running: %v", err)
+	}
+	if strings.Contains(string(b), "completed_at") {
+		t.Fatalf("running event must omit completed_at, got: %s", b)
+	}
+	if strings.Contains(string(b), "0001-01-01") {
+		t.Fatalf("payload leaked the zero time: %s", b)
+	}
+
+	completed := time.Now().UTC()
+	done := EventPayload{State: JobCompleted, StartedAt: tPtr(started), CompletedAt: tPtr(completed), EmittedAt: completed}
+	b, err = json.Marshal(done)
+	if err != nil {
+		t.Fatalf("marshal completed: %v", err)
+	}
+	if !strings.Contains(string(b), "completed_at") {
+		t.Fatalf("completed event must include completed_at, got: %s", b)
+	}
+}
 
 func newTestEventBuffer(t *testing.T) *eventBuffer {
 	t.Helper()
