@@ -81,29 +81,29 @@ type rawPreference struct {
 	ExcludeByAttr     bool              `json:"exclude_by_attribute"`
 }
 
-// repoIndex caches scanned repos. The HTTP layer reads from the cache; a refresh
-// is triggered by handleListRepos and by anything that mutates a repo (init, storage add).
+// repoIndex caches the managed-repo set. The HTTP layer reads from the cache; a
+// refresh is triggered by handleListRepos and by anything that mutates a repo
+// (init, storage add, delete).
 //
-// scanTTL bounds how often the on-disk walk runs in response to /repos polls.
-// The fleet-page polls every 15s × N nodes; without a cache each call walks
-// ALL backup roots to depth 3 (~1.5–2s on busy hosts), making the dashboard
-// feel sluggish. Mutating ops (init, storage add, delete) call ScanForce()
-// to invalidate the cache and re-walk immediately so the next list reflects
-// fresh state.
+// The repo set is the durable registry (CONFIG_DIR/repos.json via `mapping`),
+// NOT a filesystem crawl: a refresh loads each registered repo's preferences
+// from disk (a handful of stat/reads), so it is cheap and its latency is
+// independent of how large BACKUP_ROOTS is. scanTTL just coalesces refreshes
+// under fleet-page polling. Mutating ops (init, storage add, delete) call
+// ScanForce() to refresh immediately so the next list reflects fresh state.
 type repoIndex struct {
-	roots  []string
 	binary string
+	// mapping is the durable registry of managed repos (CONFIG_DIR/repos.json)
+	// and the SOLE source of truth for "what repos exist". The index is rebuilt
+	// by loading each registered repo's preferences, never by crawling the
+	// filesystem. See scanLocked.
+	mapping *repoMappingStore
 	// legacyBackuprootMap rewrites stale on-disk preferences whose
 	// `repository` field still references the old synthetic /backuproot/pathN
 	// paths. Empty in fresh deploys; populated for hosts that have repos
 	// migrated from duplicacy-web. Used only by rewriteLegacyBackuproot at
 	// preferences-load time — no other code path consults it.
 	legacyBackuprootMap map[string]string
-
-	// excludePaths are operator-configured path prefixes the scan skips
-	// entirely (from BACKUP_EXCLUDE_PATHS). The duplicacy-web cache layout is
-	// excluded automatically via isDuplicacyWebCache regardless of this list.
-	excludePaths []string
 
 	mu          sync.RWMutex
 	repos       map[string]*Repo // keyed by Repo.ID
@@ -130,12 +130,11 @@ func (r *repoIndex) markStalePreferences(repoRoot string) {
 		"repo", repoRoot)
 }
 
-func newRepoIndex(roots []string, binary string, legacyBackuprootMap map[string]string, excludePaths []string) *repoIndex {
+func newRepoIndex(binary string, legacyBackuprootMap map[string]string, mapping *repoMappingStore) *repoIndex {
 	return &repoIndex{
-		roots:               roots,
 		binary:              binary,
 		legacyBackuprootMap: legacyBackuprootMap,
-		excludePaths:        excludePaths,
+		mapping:             mapping,
 		repos:               map[string]*Repo{},
 	}
 }
@@ -164,8 +163,8 @@ func rewriteLegacyBackuproot(path string, legacyMap map[string]string) string {
 	return bestHost + strings.TrimPrefix(path, bestSynthetic)
 }
 
-// scan walks each backup root looking for .duplicacy/preferences files,
-// honouring the cache TTL. Use ScanForce after init/storage-add/delete.
+// scan refreshes the index from the durable registry, honouring the cache TTL.
+// Use ScanForce after init/storage-add/delete.
 func (r *repoIndex) scan() error {
 	r.mu.RLock()
 	fresh := !r.lastScanned.IsZero() && time.Since(r.lastScanned) < repoScanTTL
@@ -176,78 +175,43 @@ func (r *repoIndex) scan() error {
 	return r.scanLocked()
 }
 
-// ScanForce always rewalks regardless of cache state.
+// ScanForce always rebuilds regardless of the cache TTL.
 func (r *repoIndex) ScanForce() error { return r.scanLocked() }
 
-// scanLocked walks each backup root looking for .duplicacy/preferences files.
-// maxDepth=8 bounds the wasted walk in deep trees that contain no repo at all
-// (most of /var/lib/rancher/k3s, big media trees, etc.); we SkipDir as soon as
-// a .duplicacy is found so real repos at any reachable depth still register.
+// scanLocked rebuilds the repo index from the durable registry
+// (CONFIG_DIR/repos.json) — the SOLE source of truth for which repos exist. For
+// each registered path it loads that repo's .duplicacy/preferences (one
+// ReadFile); it does NOT crawl the filesystem. Cost is O(registered repos)
+// stat/reads, independent of BACKUP_ROOTS size — which is why it can run inline
+// on the /repos path without the cold-cache stalls a full-tree WalkDir caused on
+// hosts whose backup roots contain huge media / chunk-store trees (e.g. an 18 TB
+// frigate drive or a multi-TB duplicacy chunk store under /mnt).
 //
-// Exclusions (the pruning the old comment claimed but never actually applied):
-//   - excludeBasenames (shared with trees.go) — .git, node_modules, caches, …
-//   - r.excludePaths — operator-configured prefixes (BACKUP_EXCLUDE_PATHS)
-//   - isDuplicacyWebCache — Duplicacy Web Edition's working/cache tree
-//     (…/cache/localhost/N/.duplicacy). Those carry a preferences file but are
-//     NOT user-managed repos: duplicacy-web regenerates them continuously, so
-//     surfacing them produced undeletable "phantom" repos (a delete just gets
-//     recreated). We skip the whole subtree so they never appear.
+// Duplicacy Web Edition cache entries (…/cache/localhost/…) are skipped: they
+// carry a preferences file but are app machinery, not user-managed repos. A
+// registered path whose preferences are gone (repo deleted out-of-band) is
+// logged once and skipped, so it drops out of the list on the next refresh.
 func (r *repoIndex) scanLocked() error {
-	const maxDepth = 8
-
 	found := map[string]*Repo{}
 
-	for _, root := range r.roots {
-		rootClean := filepath.Clean(root)
-		err := filepath.WalkDir(rootClean, func(path string, d os.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				slog.Warn("walk error (skipping)", "error", walkErr, "path", path)
-				return nil
-			}
-			depth := walkDepth(rootClean, path)
-			if depth > maxDepth {
-				if d.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if !d.IsDir() {
-				return nil
-			}
-			// Prune excluded directories before treating them — or anything
-			// beneath them — as repos. This catches both the duplicacy-web
-			// cache tree and operator-excluded prefixes (and the .duplicacy
-			// inside them, since its path inherits the excluded ancestor).
-			if r.shouldSkipDir(path, d.Name()) {
-				return filepath.SkipDir
-			}
-			if d.Name() != ".duplicacy" {
-				return nil
-			}
-			repoRoot := filepath.Dir(path)
-			repo, err := r.loadRepo(repoRoot)
-			if err != nil {
-				// ENOENT on .duplicacy/preferences = the directory exists but
-				// the marker file's gone (uninitialised partial duplicacy
-				// dir, e.g. the operator removed the repo but left the
-				// chunks/cache tree, OR a third-party app dropped a
-				// .duplicacy/cache sibling without preferences). Log once at
-				// INFO with the path; quiet thereafter — this is the noise
-				// witnessed every 5 min for /mnt/storage/srv/containers/frigate
-				// on 2026-05-27.
-				if errors.Is(err, os.ErrNotExist) {
-					r.markStalePreferences(repoRoot)
-				} else {
-					slog.Warn("failed to load repo (skipping)", "error", err, "repo", repoRoot)
-				}
-				return filepath.SkipDir
-			}
-			found[repo.ID] = repo
-			return filepath.SkipDir // do not descend into the chunk store
-		})
-		if err != nil {
-			return fmt.Errorf("walk %s: %w", rootClean, err)
+	for _, m := range r.mapping.list() {
+		repoRoot := filepath.Clean(m.RepoPath)
+		if isDuplicacyWebCache(repoRoot) {
+			continue
 		}
+		repo, err := r.loadRepo(repoRoot)
+		if err != nil {
+			// ENOENT on .duplicacy/preferences = a registered repo whose marker
+			// file is gone (removed out-of-band, leaving a stale mapping entry).
+			// Log once at INFO; reconcile drops the mapping separately.
+			if errors.Is(err, os.ErrNotExist) {
+				r.markStalePreferences(repoRoot)
+			} else {
+				slog.Warn("failed to load repo (skipping)", "error", err, "repo", repoRoot)
+			}
+			continue
+		}
+		found[repo.ID] = repo
 	}
 
 	r.mu.Lock()
@@ -255,20 +219,8 @@ func (r *repoIndex) scanLocked() error {
 	r.lastScanned = time.Now()
 	r.mu.Unlock()
 
-	slog.Info("repo scan complete", "count", len(found))
+	slog.Info("repo list rebuilt from registry", "count", len(found))
 	return nil
-}
-
-// shouldSkipDir reports whether the walker must skip (not descend into, and not
-// treat as a repo) the directory at path with basename name.
-func (r *repoIndex) shouldSkipDir(path, name string) bool {
-	if _, ok := excludeBasenames[name]; ok {
-		return true
-	}
-	if isDuplicacyWebCache(path) {
-		return true
-	}
-	return pathUnderAny(path, r.excludePaths)
 }
 
 // isDuplicacyWebCache reports whether path is inside Duplicacy Web Edition's

@@ -10,8 +10,12 @@ package main
 // Recovery semantics: if repos.json is lost, the agent CANNOT decide which
 // credential to fetch for a given repo, so backup/restore/check/prune for
 // managed repos will fail loudly. The mapping is sync'd with the controller's
-// duplicacy_repos table by repo_id+node — to rebuild after disk loss, fetch
-// from the controller (handled by main.go on startup; see repoMapping.refreshFromController).
+// duplicacy_repos table by repo_id+node — to rebuild the path set after disk
+// loss, the agent best-effort upserts missing entries from the controller on
+// startup (see app.refreshMappingFromController in reconcile.go). Credential /
+// storage routing for a recovered entry is restored by the normal bind/init
+// path. This registry — NOT a filesystem crawl — is the source of truth for
+// which repos exist (see repoIndex.scanLocked).
 
 import (
 	"encoding/json"
