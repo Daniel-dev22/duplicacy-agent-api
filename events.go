@@ -28,8 +28,14 @@ type EventPayload struct {
 	StorageName string    `json:"storage_name,omitempty"`
 	State       JobState  `json:"state"`
 	Event       JobEvent  `json:"event"`
-	StartedAt   time.Time `json:"started_at,omitempty"`
-	CompletedAt time.Time `json:"completed_at,omitempty"`
+	// Pointers, not value time.Time: `omitempty` is a no-op on a struct, so a
+	// value time.Time serializes the zero value on started/progress events as
+	// "0001-01-01T00:00:00Z" instead of omitting it. The controller then stores
+	// that non-NULL zero and its COALESCE upsert guard pins it, discarding the
+	// real completion time from the terminal event — which makes the freshness
+	// rollup read every node as stale. nil ⇒ omitted ⇒ NULL on the controller.
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
 	ExitCode    int       `json:"exit_code"`
 	ErrorMsg    string    `json:"error,omitempty"`
 	LineCount   int       `json:"line_count"`
@@ -206,8 +212,8 @@ func (e *eventBuffer) handleJobEvent(j *Job, evt JobEvent) {
 		StorageName: snap.StorageName,
 		State:       snap.State,
 		Event:       evt,
-		StartedAt:   snap.StartedAt,
-		CompletedAt: snap.CompletedAt,
+		StartedAt:   tPtr(snap.StartedAt),
+		CompletedAt: tPtr(snap.CompletedAt),
 		ExitCode:    snap.ExitCode,
 		ErrorMsg:    snap.ErrorMsg,
 		LineCount:   snap.LineCount,
@@ -227,6 +233,16 @@ func (e *eventBuffer) handleJobEvent(j *Job, evt JobEvent) {
 // --- local jobs table: restart-survival for the fleet snapshot ---
 
 const jobsTable = "jobs"
+
+// tPtr returns nil for the zero time so the JSON `omitempty` actually omits the
+// field (a value time.Time is never "empty" and would serialize as the zero
+// time). Used for the wire payload to the controller.
+func tPtr(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
 
 func tsToNs(t time.Time) int64 {
 	if t.IsZero() {
