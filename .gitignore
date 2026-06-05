@@ -12,3 +12,6 @@ docker-compose.yml.*~
 # State
 state/
 known_hosts
+
+# Shared build orchestrator staged here by the ansible build playbook
+/.build/
