@@ -1,0 +1,12 @@
+{
+  "project": "duplicacy-agent-api",
+  "image_prefix": "",
+  "ssh": true,
+  "platform": { "mode": "auto" },
+  "version": { "scheme": "timestamp" },
+  "tag_rotation": true,
+  "retention_keep": 15,
+  "services": [
+    { "name": "duplicacy-agent-api", "context": ".", "dockerfile": "Dockerfile" }
+  ]
+}
