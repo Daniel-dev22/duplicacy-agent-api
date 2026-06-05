@@ -104,12 +104,14 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 	jobs.setJobLogDir(jobLogDir)
 	pruneJobLogs(jobLogDir, jobLogRetainN)
 
-	repos := newRepoIndex(cfg.BackupRoots, cfg.DuplicacyBinary, cfg.LegacyBackuprootMap, cfg.BackupExcludePaths)
-
 	mapping := newRepoMappingStore(cfg.ConfigDir)
 	if err := mapping.load(); err != nil {
 		return nil, fmt.Errorf("load repo mapping: %w", err)
 	}
+
+	// The repo index is registry-backed: it lists repos from `mapping`
+	// (CONFIG_DIR/repos.json), never by crawling BACKUP_ROOTS.
+	repos := newRepoIndex(cfg.DuplicacyBinary, cfg.LegacyBackuprootMap, mapping)
 
 	// Ensure /root/.ssh/known_hosts symlinks into the persistent state mount
 	// before any SFTP work runs. Idempotent — a no-op once set up. Don't
@@ -212,21 +214,24 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 	a.sizes = newDirSizeCache(cfg.ConfigDir)
 	a.sizeGatherer = newSizeGatherer(cfg, a.sizes, a)
 
-	// Best-effort initial repo scan so /repos returns something on first call.
-	// Run asynchronously so it doesn't block newApp returning — otherwise
-	// startup is gated on walking every backup root (on pi-class hosts with
-	// /var/lib/rancher/k3s bind-mounted, that has overrun the ansible
-	// /health/ready readiness probe). The HTTP listener is up immediately;
-	// any /repos call landing before the scan finishes triggers its own.
+	// Best-effort initial repo refresh so /repos returns the full list on the
+	// first call. Run asynchronously so it doesn't block newApp returning — the
+	// controller round-trip (refreshMappingFromController) shouldn't gate the
+	// HTTP listener / readiness probe. Listing itself is cheap (registry-backed)
+	// and any /repos call landing first triggers its own refresh.
 	//
-	// On completion we trigger the fleet hub so any WS clients that
-	// connected during the cold scan (and got an empty snapshot from the
-	// pre-warm cache) receive a refreshed broadcast with the real repo
-	// list. Without this, slow-disk hosts looked offline until the next
-	// job event happened to land.
+	// On completion we trigger the fleet hub so WS clients that connected during
+	// startup (and got an empty pre-warm snapshot) receive a refreshed broadcast
+	// with the real repo list.
 	go func() {
+		// Repopulate repos.json from the controller for this node before the
+		// first list, so a lost/empty local registry still yields a populated
+		// repo list. Bounded + non-fatal (same posture as reconcile).
+		rctx, cancel := context.WithTimeout(ctx, reconcileFetchTimeout)
+		a.refreshMappingFromController(rctx)
+		cancel()
 		if err := a.repos.scan(); err != nil {
-			slog.Warn("initial repo scan failed (will retry on first /repos call)", "error", err)
+			slog.Warn("initial repo refresh failed (will retry on first /repos call)", "error", err)
 		}
 		a.fleet.Trigger()
 	}()

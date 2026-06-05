@@ -80,6 +80,45 @@ func (a *app) fetchCentralRepos(ctx context.Context) ([]reconcileRepoDTO, error)
 	return out, nil
 }
 
+// refreshMappingFromController best-effort repopulates repos.json from the
+// controller's duplicacy_repos table for this node. It only ADDS path mappings
+// that are missing locally, so a lost/empty local registry still yields a
+// populated repo list after a restart; it never deletes (reconcileOrphans owns
+// removal). This is the durable recovery path the old repos.json comment
+// promised but never wired — and the correct source of truth (the controller
+// DB) for "what repos exist", replacing the filesystem crawl that used to
+// rediscover on-disk repos.
+//
+// Only repo_path + uuid are restored here (that's all the controller's repos
+// listing returns); full credential/storage routing for a recovered entry is
+// re-established by the normal bind/init path. Best-effort: a controller error
+// is logged and skipped, exactly like reconcile.
+func (a *app) refreshMappingFromController(ctx context.Context) {
+	central, err := a.fetchCentralRepos(ctx)
+	if err != nil {
+		slog.Warn("repo mapping refresh from controller skipped", "error", err)
+		return
+	}
+	added := 0
+	for _, r := range central {
+		path := filepath.Clean(r.RepoPath)
+		if path == "" || path == "." {
+			continue
+		}
+		if _, ok := a.mapping.getByPath(path); ok {
+			continue
+		}
+		if err := a.mapping.upsert(RepoMapping{RepoPath: path, UUID: r.ID}); err != nil {
+			slog.Warn("repo mapping refresh upsert failed", "repo", path, "error", err)
+			continue
+		}
+		added++
+	}
+	if added > 0 {
+		slog.Info("repo mapping refreshed from controller", "added", added)
+	}
+}
+
 func (a *app) reconcileOrphans(ctx context.Context) error {
 	central, err := a.fetchCentralRepos(ctx)
 	if err != nil {
