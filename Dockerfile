@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1.7
 #
-# BuildKit syntax directive required for `RUN --mount=type=ssh` below, which
-# we use to fetch the private agent-kit-go module via the host's SSH agent
-# without baking the key into the image. Build invocation must pass
-# `--ssh default` (ansible playbook handles this).
+# BuildKit syntax directive required for the `--mount=type=secret` `go mod
+# download` below. The private agent-kit-go module is fetched using the GitHub
+# App token the build-agent provides as the `ghtoken` secret — a credential
+# helper reads it from the tmpfs mount at fetch time, so the token value never
+# lands in .gitconfig or any layer (the buildcache is pushed to the registry).
 FROM golang:1.26-alpine AS builder
 # Target Intel Haswell+ / AMD Excavator+ for FMA/AVX2 wins. Override
 # with --build-arg GOAMD64=v1 for older CPUs. No-op for arm64 builds.
@@ -11,16 +12,16 @@ ARG GOAMD64=v3
 ENV GOAMD64=${GOAMD64}
 ARG DUPLICACY_VERSION=3.2.5
 WORKDIR /app
-RUN apk add --no-cache git openssh-client curl
-# Bypass the public proxy for our private GitHub org so go mod download
-# hits git directly. Rewrite https:// → git@ so it uses the SSH agent.
+RUN apk add --no-cache git curl
+# Bypass the public proxy for our private GitHub org so go mod download hits git
+# directly (the credential helper supplies the token over HTTPS).
 ENV GOPRIVATE=github.com/Daniel-dev22/*
-RUN git config --global url."git@github.com:".insteadOf "https://github.com/" && \
-    mkdir -p /root/.ssh && \
-    ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> /root/.ssh/known_hosts
 COPY go.mod go.sum* ./
-# Mount the SSH agent only for this RUN — key never lands in the image.
-RUN --mount=type=ssh go mod download
+# required=true so a build without the token fails loudly rather than silently
+# attempting an anonymous (404) fetch of the private module.
+RUN --mount=type=secret,id=ghtoken,required=true \
+    git config --global credential.helper '!f() { echo username=x-access-token; echo "password=$(cat /run/secrets/ghtoken)"; }; f' && \
+    go mod download
 COPY *.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o duplicacy-agent-api .
 
