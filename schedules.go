@@ -124,8 +124,14 @@ func makeDuplicacyFire(cfg Config, jobs *jobRegistry, repos *repoIndex, prepareE
 		// this bug too (calling generic get() which only indexes by hash).
 		repo, ok := repos.getBySnapshotID(sch.RepoID)
 		if !ok {
-			slog.Warn("schedule fire: repo not found, skipping", "schedule", sch.ID, "repo", sch.RepoID)
-			return nil
+			// Return an error (not nil) so the kit leaves this window un-stamped
+			// and retries it. "repo not found" at fire time is almost always
+			// transient — the repo index hadn't finished loading yet (a boot-time
+			// missed-run recovery fire racing the registry scan). A genuinely
+			// deleted repo wouldn't be sent by the controller, so the worst case is
+			// a few retries that drop off once the controller stops listing it.
+			slog.Warn("schedule fire: repo not found; will retry", "schedule", sch.ID, "repo", sch.RepoID)
+			return fmt.Errorf("repo not found for snapshot id %q", sch.RepoID)
 		}
 
 		action := JobAction(sch.Action)

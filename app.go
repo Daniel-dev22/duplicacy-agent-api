@@ -257,6 +257,16 @@ func (a *app) close() {
 
 func (a *app) startBackgroundWorkers(ctx context.Context) {
 	a.events.Start(ctx)
+	// Populate the repo index from the LOCAL durable registry (repos.json — cheap,
+	// no controller round-trip) BEFORE the scheduler starts. The scheduler's boot
+	// missed-run recovery fires immediately, and a fire whose repo isn't loaded yet
+	// is dropped ("repo not found"); doing the local scan first closes that race so
+	// a restart that lands after a missed 02:00 window recovers it on the first try
+	// instead of erroring and waiting for the periodic retry. The controller refresh
+	// in newApp's goroutine still runs async to repopulate a lost/empty registry.
+	if err := a.repos.scan(); err != nil {
+		slog.Warn("pre-scheduler repo scan failed (recovery may retry)", "error", err)
+	}
 	a.scheduler.Start(ctx)
 	go a.filters.reconcileLoop(ctx, a.stop)
 	go a.fleet.Run(ctx)
