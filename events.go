@@ -118,6 +118,12 @@ func newEventBuffer(cfg Config, client *http.Client) (*eventBuffer, error) {
 			updated_at_ns   INTEGER NOT NULL
 		);
 		CREATE INDEX IF NOT EXISTS idx_jobs_updated ON jobs (updated_at_ns);
+		-- Covering index for lastBackupByRepo()'s "MAX(completed_at_ns) WHERE
+		-- action='backup' AND state='completed' GROUP BY repo_id": an index scan
+		-- instead of a full scan of a multi-hundred-MB jobs table, now that the
+		-- fleet build runs it on the liveness tick (and per progress line).
+		CREATE INDEX IF NOT EXISTS idx_jobs_action_state_repo
+			ON jobs (action, state, repo_id, completed_at_ns);
 
 		-- snapshot_files_cache: gzipped "duplicacy list -files" output, keyed by
 		-- the IMMUTABLE (snapshot_id, revision, storage_name) tuple. A revision's

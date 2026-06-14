@@ -74,10 +74,14 @@ type fleetEvent struct {
 type fleetHub = kitfleet.Hub[fleetEvent]
 
 // newFleetHub builds the shared hub with a pure-cache-read snapshot builder.
-// Trigger-only (tick 0): the agent pushes on init + every job state/progress
-// transition via a.fleet.Trigger(); there is no periodic poll. The repos cache
-// is warmed by an initial scan goroutine + mutating ops, so the build never
-// forces a synchronous filesystem walk.
+// The agent pushes on init + every job state/progress transition via
+// a.fleet.Trigger(); kit's conflating delivery guarantees the latest snapshot
+// is never dropped under a fast backup's burst. A slow DefaultLivenessTick
+// rebuild is pure insurance for the rare connect/subscribe race (it keeps the
+// controller's fleet cache from going stale even if a frame were ever missed).
+// The repos cache is warmed by an initial scan goroutine + mutating ops, and
+// lastBackupByRepo is index-backed, so the periodic build never forces a
+// synchronous filesystem walk or a full table scan.
 func newFleetHub(a *app) *fleetHub {
 	host := newHostInfo()
 	build := func(_ context.Context) (fleetEvent, error) {
@@ -106,7 +110,7 @@ func newFleetHub(a *app) *fleetHub {
 		}
 		return ev, nil
 	}
-	return kitfleet.NewHub(build, 0)
+	return kitfleet.NewHub(build, kitfleet.DefaultLivenessTick)
 }
 
 // handleFleetWS upgrades to WebSocket and streams snapshot frames from the hub:
