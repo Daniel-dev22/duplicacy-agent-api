@@ -105,10 +105,18 @@ func streamLines(ctx context.Context, r io.Reader, lines chan<- string) {
 // silently dropped from /repos/:id/snapshots — operators saw only the
 // first revision in the UI even when the storage had many more.
 //
+// The match is intentionally NOT anchored with `^`. For an RSA-encrypted
+// storage whose private key is passphrase-protected, duplicacy writes the
+// prompt `Enter the passphrase for <keyfile>:` WITHOUT a trailing newline, so
+// the very first `Snapshot … revision 1 …` line gets concatenated onto the
+// prompt. An anchored `^Snapshot` would drop that first revision — hiding the
+// OLDEST revision from the list/retention/restore-picker. Matching the snapshot
+// row anywhere on the line tolerates that (and any other prompt/noise prefix).
+//
 // Capture only the date + time (always present) and tolerate optional
 // trailing fragments. parseTime below handles both timestamp variants.
 var snapshotLineRe = regexp.MustCompile(
-	`^Snapshot\s+(\S+)\s+revision\s+(\d+)\s+created at\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)`)
+	`Snapshot\s+(\S+)\s+revision\s+(\d+)\s+created at\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)`)
 
 type Snapshot struct {
 	SnapshotID string    `json:"snapshot_id"`
@@ -128,6 +136,12 @@ func parseListOutput(out string) []Snapshot {
 		if m == nil {
 			continue
 		}
+		// Strip any prefix before "Snapshot" (e.g. an RSA passphrase prompt that
+		// duplicacy emitted without a newline) so Raw shows just the snapshot row.
+		raw := line
+		if i := strings.Index(raw, "Snapshot"); i > 0 {
+			raw = raw[i:]
+		}
 		rev, _ := strconv.Atoi(m[2])
 		// duplicacy emits either "YYYY-MM-DD HH:MM" or "YYYY-MM-DD HH:MM:SS"
 		// depending on the revision; try the second-precision form first and
@@ -141,7 +155,7 @@ func parseListOutput(out string) []Snapshot {
 			SnapshotID: m[1],
 			Revision:   rev,
 			CreatedAt:  t,
-			Raw:        strings.TrimSpace(line),
+			Raw:        strings.TrimSpace(raw),
 		})
 	}
 	return snaps
