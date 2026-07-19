@@ -3,7 +3,7 @@ module duplicacy-agent-api
 go 1.26
 
 require (
-	github.com/Daniel-dev22/agent-kit-go v0.1.11
+	github.com/Daniel-dev22/agent-kit-go v0.2.0
 	github.com/gin-gonic/gin v1.10.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
@@ -47,5 +47,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-replace github.com/Daniel-dev22/agent-kit-go => ../agent-kit-go
