@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"math"
+	"slices"
 	"testing"
 )
 
@@ -307,6 +309,87 @@ func TestParsePruneLine(t *testing.T) {
 	if j.Progress.PruneSnapshotsRemoved != startSnaps || j.Progress.PruneChunksDeleted != startChunks {
 		t.Errorf("counters changed on dry-run lines")
 	}
+}
+
+// TestParsePrunePreviewLine covers the -dry-run counters. duplicacy emits both
+// lines at INFO from pruneSnapshotsNonExhaustive, so the preview works without
+// the global -debug flag.
+func TestParsePrunePreviewLine(t *testing.T) {
+	t.Run("collects revisions and unreferenced chunks", func(t *testing.T) {
+		j := &Job{}
+		for _, line := range []string{
+			"INFO SNAPSHOT_DELETE Deleting snapshot nuc-home-user at revision 21",
+			"INFO SNAPSHOT_DELETE Deleting snapshot nuc-home-user at revision 23",
+			"Deleting snapshot pi-home-user at revision 4", // no INFO prefix — agent runs without -log
+			"INFO CHUNK_UNREFERENCED Found unreferenced chunk a1b2c3",
+			"Found unreferenced chunk d4e5f6",
+		} {
+			if !j.parsePruneLine(line) {
+				t.Errorf("line should match: %q", line)
+			}
+		}
+
+		want := []string{"nuc-home-user@21", "nuc-home-user@23", "pi-home-user@4"}
+		if !slices.Equal(j.Progress.PrunePreviewRevisions, want) {
+			t.Errorf("PrunePreviewRevisions = %v want %v", j.Progress.PrunePreviewRevisions, want)
+		}
+		if j.Progress.PrunePreviewChunks != 2 {
+			t.Errorf("PrunePreviewChunks = %d want 2", j.Progress.PrunePreviewChunks)
+		}
+		// A preview must never look like it removed anything.
+		if j.Progress.PruneSnapshotsRemoved != 0 || j.Progress.PruneChunksDeleted != 0 {
+			t.Errorf("preview lines bumped the real counters: removed=%d deleted=%d",
+				j.Progress.PruneSnapshotsRemoved, j.Progress.PruneChunksDeleted)
+		}
+	})
+
+	t.Run("past-tense removal is not counted as a preview", func(t *testing.T) {
+		j := &Job{}
+		if !j.parsePruneLine("INFO SNAPSHOT_DELETE The snapshot host01 at revision 7 has been removed") {
+			t.Fatal("removal line should match")
+		}
+		if len(j.Progress.PrunePreviewRevisions) != 0 {
+			t.Errorf("removal line leaked into the preview list: %v", j.Progress.PrunePreviewRevisions)
+		}
+		if j.Progress.PruneSnapshotsRemoved != 1 {
+			t.Errorf("PruneSnapshotsRemoved = %d want 1", j.Progress.PruneSnapshotsRemoved)
+		}
+	})
+
+	t.Run("revision list is capped but the chunk count is not", func(t *testing.T) {
+		j := &Job{}
+		for i := 0; i < prunePreviewRevisionCap+50; i++ {
+			j.parsePruneLine(fmt.Sprintf("Deleting snapshot snap at revision %d", i))
+			j.parsePruneLine(fmt.Sprintf("Found unreferenced chunk %d", i))
+		}
+		if len(j.Progress.PrunePreviewRevisions) != prunePreviewRevisionCap {
+			t.Errorf("revisions = %d want cap %d", len(j.Progress.PrunePreviewRevisions), prunePreviewRevisionCap)
+		}
+		// The count drives the reclaim estimate, so it must keep going past
+		// the cap on the list.
+		if j.Progress.PrunePreviewChunks != prunePreviewRevisionCap+50 {
+			t.Errorf("chunks = %d want %d", j.Progress.PrunePreviewChunks, prunePreviewRevisionCap+50)
+		}
+	})
+
+	t.Run("near-miss lines do not match", func(t *testing.T) {
+		j := &Job{}
+		for _, line := range []string{
+			"Deleting snapshot snap at revision x",   // non-numeric revision
+			"Deleting snapshot at revision 4",        // missing id
+			"Found unreferenced chunks a1b2",         // plural
+			"Deleting snapshot snap at revision 4 !", // trailing junk
+		} {
+			if j.parsePruneLine(line) {
+				t.Errorf("line should NOT match: %q", line)
+			}
+		}
+		// Progress is allocated lazily on first match, so a clean miss must
+		// leave it nil entirely — not merely zeroed.
+		if j.Progress != nil {
+			t.Errorf("near-miss lines allocated Progress: %+v", j.Progress)
+		}
+	})
 }
 
 // parseErrorLine should overwrite ErrorMsg only when the line has the

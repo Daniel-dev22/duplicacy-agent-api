@@ -107,6 +107,19 @@ type JobProgress struct {
 	PruneSnapshotsRemoved int `json:"prune_snapshots_removed,omitempty"`
 	PruneChunksDeleted    int `json:"prune_chunks_deleted,omitempty"`
 	PruneFossilsProcessed int `json:"prune_fossils_processed,omitempty"`
+
+	// Prune PREVIEW counters — populated only by a -dry-run prune, from
+	// duplicacy's future-tense lines. Kept separate from the counters above
+	// because those deliberately match past-tense lines only: a dry run must
+	// never look like it removed anything.
+	//
+	// PrunePreviewRevisions lists "<snapshot id>@<revision>" for every snapshot
+	// duplicacy said it would delete, so the UI can show exactly what goes
+	// rather than just a count. PrunePreviewChunks counts chunks that would
+	// become unreferenced; multiply by CheckPoolBytes/CheckPoolChunks from the
+	// last check on the same storage for an estimate of the bytes reclaimed.
+	PrunePreviewRevisions []string `json:"prune_preview_revisions,omitempty"`
+	PrunePreviewChunks    int      `json:"prune_preview_chunks,omitempty"`
 }
 
 // jobPublic carries the JSON-serializable fields of a Job. It is split out
@@ -390,13 +403,59 @@ var (
 	pruneFossilCollectedRe = regexp.MustCompile(
 		`^(?:INFO FOSSIL_COLLECT )?Fossil collection \d+ saved$`,
 	)
+
+	// Preview (dry-run) lines. duplicacy emits both at INFO from
+	// pruneSnapshotsNonExhaustive, so no global -debug is needed:
+	//
+	//	INFO SNAPSHOT_DELETE Deleting snapshot pi-home at revision 42
+	//	INFO CHUNK_UNREFERENCED Found unreferenced chunk a1b2c3…
+	//
+	// "Deleting snapshot" is also emitted during a REAL prune — it is the
+	// decision, not the outcome — so these counters populate on both runs.
+	// That is deliberate: on a real prune they let the UI show what is being
+	// worked on before the past-tense "has been removed" lines land.
+	pruneWillDeleteSnapshotRe = regexp.MustCompile(
+		`^(?:INFO SNAPSHOT_DELETE )?Deleting snapshot (\S+) at revision (\d+)$`,
+	)
+	pruneUnreferencedChunkRe = regexp.MustCompile(
+		`^(?:INFO CHUNK_UNREFERENCED )?Found unreferenced chunk \S+$`,
+	)
 )
 
-// parsePruneLine bumps one of the three prune counters per matching line.
+// prunePreviewRevisionCap bounds PrunePreviewRevisions. A first correct prune
+// on a two-month-old pool lists ~50 revisions per snapshot id, but an
+// -exhaustive preview over a whole shared pool could list far more, and this
+// slice is held in memory and serialized into every job snapshot. Past the cap
+// we keep counting (the count is what the UI sizes the reclaim estimate from)
+// and stop appending.
+const prunePreviewRevisionCap = 500
+
+// parsePruneLine bumps one of the prune counters per matching line.
 // Returns true on any match.
 func (j *Job) parsePruneLine(line string) bool {
+	// Handled before the counter switch because it captures submatches rather
+	// than just incrementing.
+	if m := pruneWillDeleteSnapshotRe.FindStringSubmatch(line); m != nil {
+		j.mu.Lock()
+		if j.Progress == nil {
+			j.Progress = &JobProgress{}
+		}
+		if len(j.Progress.PrunePreviewRevisions) < prunePreviewRevisionCap {
+			j.Progress.PrunePreviewRevisions = append(j.Progress.PrunePreviewRevisions, m[1]+"@"+m[2])
+		}
+		j.Progress.UpdatedAt = time.Now().UTC()
+		j.mu.Unlock()
+		return true
+	}
+
 	var field *int
 	switch {
+	case pruneUnreferencedChunkRe.MatchString(line):
+		j.mu.Lock()
+		if j.Progress == nil {
+			j.Progress = &JobProgress{}
+		}
+		field = &j.Progress.PrunePreviewChunks
 	case pruneSnapshotRemovedRe.MatchString(line):
 		j.mu.Lock()
 		if j.Progress == nil {
@@ -1327,16 +1386,35 @@ func (a *app) handleCheck(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{"job_id": j.ID})
 }
 
+// pruneRequest drives `duplicacy prune`. KeepRules are passed through verbatim
+// and MUST already be ordered descending by m ("0:365","30:30","7:7"):
+// duplicacy applies them with a monotonic index and silently honours only the
+// first tier if they ascend. The controller's materializer guarantees this
+// (router/duplicacy_policy.go tiersToKeepRules); the agent does not reorder,
+// because reordering here would mask a broken caller.
 type pruneRequest struct {
 	Storage    string   `json:"storage"`
-	KeepRules  []string `json:"keep_rules"`  // e.g., ["1:7", "7:30", "30:180"]
+	KeepRules  []string `json:"keep_rules"` // e.g., ["30:180", "7:30", "1:7"]
 	Exclusive  bool     `json:"exclusive"`
 	Exhaustive bool     `json:"exhaustive"`
 	SnapshotID string   `json:"snapshot_id"` // optional: scope to one snapshot id via -id (hub relay)
+	Threads    int      `json:"threads"`
+	Ignore     []string `json:"ignore"` // snapshot ids excluded from the fossil-deletion decision
 	TriggerKey string   `json:"trigger_key"`
 }
 
-func (a *app) handlePrune(c *gin.Context) {
+// handlePrune runs a real prune. handlePrunePreview runs the identical
+// invocation with -dry-run; both funnel through startPrune so the previewed
+// command and the executed command can never drift.
+func (a *app) handlePrune(c *gin.Context) { a.startPrune(c, false) }
+
+// handlePrunePreview answers POST /repos/:id/prune/preview. Same body as
+// /prune. duplicacy touches nothing but still logs every revision it would
+// delete and every chunk that would become unreferenced, which the preview
+// parsers turn into JobProgress counters (see parsePruneLine).
+func (a *app) handlePrunePreview(c *gin.Context) { a.startPrune(c, true) }
+
+func (a *app) startPrune(c *gin.Context, dryRun bool) {
 	repo, ok := a.repos.get(c.Param("id"))
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "repo not found"})
@@ -1345,7 +1423,11 @@ func (a *app) handlePrune(c *gin.Context) {
 	var req pruneRequest
 	_ = c.ShouldBindJSON(&req)
 	if req.TriggerKey == "" {
-		req.TriggerKey = "manual"
+		if dryRun {
+			req.TriggerKey = "manual-preview"
+		} else {
+			req.TriggerKey = "manual"
+		}
 	}
 	// Hard rule: prune MUST carry a snapshot_id. The hub topology has many
 	// snapshot_ids in one shared NAS chunk pool; an unscoped prune would
@@ -1363,7 +1445,16 @@ func (a *app) handlePrune(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
 		return
 	}
-	inv := invocationForPrune(repo, req.Storage, req.KeepRules, req.Exclusive, req.Exhaustive, req.SnapshotID)
+	inv := invocationForPrune(repo, pruneOptions{
+		Storage:    req.Storage,
+		KeepRules:  req.KeepRules,
+		Exclusive:  req.Exclusive,
+		Exhaustive: req.Exhaustive,
+		SnapshotID: req.SnapshotID,
+		DryRun:     dryRun,
+		Threads:    req.Threads,
+		Ignore:     req.Ignore,
+	})
 	inv.EnvAdds = append(inv.EnvAdds, env...)
 	// Detached context — see handleBackup comment.
 	j, err := a.jobs.start(context.Background(), a.cfg.DuplicacyBinary, repo, ActionPrune, req.Storage, inv, "", req.TriggerKey, cleanup)
