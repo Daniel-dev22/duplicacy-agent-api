@@ -399,25 +399,63 @@ func invocationForCheck(repo *Repo, storageName string, revisions string, all bo
 	return cliInvocation{RepoRoot: repo.Path, Args: args}
 }
 
+// pruneOptions carries everything invocationForPrune needs beyond the repo.
+// A struct rather than positional args: the flag set has grown past the point
+// where `(repo, storage, rules, false, false, true, id)` is readable at a call
+// site, and every caller sets a different subset.
+type pruneOptions struct {
+	Storage    string
+	KeepRules  []string
+	Exclusive  bool
+	Exhaustive bool
+	// SnapshotID scopes the prune to one snapshot id via -id; used by the hub
+	// relay repo to apply per-source-repo retention. Required — see handlePrune.
+	SnapshotID string
+	// DryRun adds -dry-run: duplicacy reports what it would delete and touches
+	// nothing. It still logs "Deleting snapshot <id> at revision <n>" and
+	// "Found unreferenced chunk <hash>" at INFO, which is what the preview
+	// parsers read.
+	DryRun bool
+	// Threads sets -threads. duplicacy's prune default is 1, which is painfully
+	// slow when a first correct prune deletes tens of thousands of chunks over
+	// an S3 gateway. Ignored when <= 1 so the emitted args stay minimal.
+	Threads int
+	// Ignore lists snapshot ids to exclude from the fossil-deletion decision
+	// (-ignore). duplicacy's FossilCollection.IsDeletable requires EVERY
+	// snapshot id in the storage to have a revision newer than the collection;
+	// one abandoned id therefore blocks fossil deletion for the whole storage
+	// forever, and prune keeps marking fossils that are never collected.
+	Ignore []string
+}
+
 // invocationForPrune builds args for `duplicacy prune`.
-// snapshotID, when non-empty, scopes the prune to a single snapshot id via -id;
-// used by the hub relay repo to apply per-source-repo retention.
-func invocationForPrune(repo *Repo, storageName string, keepRules []string, exclusive, exhaustive bool, snapshotID string) cliInvocation {
+func invocationForPrune(repo *Repo, opts pruneOptions) cliInvocation {
 	args := []string{"prune"}
-	if storageName != "" {
-		args = append(args, "-storage", storageName)
+	if opts.Storage != "" {
+		args = append(args, "-storage", opts.Storage)
 	}
-	if snapshotID != "" {
-		args = append(args, "-id", snapshotID)
+	if opts.SnapshotID != "" {
+		args = append(args, "-id", opts.SnapshotID)
 	}
-	for _, k := range keepRules {
+	for _, k := range opts.KeepRules {
 		args = append(args, "-keep", k)
 	}
-	if exclusive {
+	for _, id := range opts.Ignore {
+		if id != "" {
+			args = append(args, "-ignore", id)
+		}
+	}
+	if opts.Threads > 1 {
+		args = append(args, "-threads", strconv.Itoa(opts.Threads))
+	}
+	if opts.Exclusive {
 		args = append(args, "-exclusive")
 	}
-	if exhaustive {
+	if opts.Exhaustive {
 		args = append(args, "-exhaustive")
+	}
+	if opts.DryRun {
+		args = append(args, "-dry-run")
 	}
 	return cliInvocation{RepoRoot: repo.Path, Args: args}
 }

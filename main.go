@@ -105,6 +105,9 @@ func registerRoutes(r *gin.Engine, app *app) {
 	r.POST("/repos/:id/restore", app.handleRestore)
 	r.POST("/repos/:id/check", app.handleCheck)
 	r.POST("/repos/:id/prune", app.handlePrune)
+	// Same body as /prune, but -dry-run: reports the revisions it would delete
+	// and the chunks that would become unreferenced without touching storage.
+	r.POST("/repos/:id/prune/preview", app.handlePrunePreview)
 	r.POST("/repos/:id/copy", app.handleCopy)
 
 	r.GET("/repos/:id/preferences", app.handleGetPreferences)

@@ -189,7 +189,11 @@ func TestInvocationForInitChunkSize(t *testing.T) {
 
 func TestInvocationForPruneSnapshotID(t *testing.T) {
 	repo := &Repo{Path: "/repo"}
-	inv := invocationForPrune(repo, "b2", []string{"1:7", "7:30"}, false, false, "pi-home")
+	inv := invocationForPrune(repo, pruneOptions{
+		Storage:    "b2",
+		KeepRules:  []string{"7:30", "1:7"},
+		SnapshotID: "pi-home",
+	})
 	if !slices.Contains(inv.Args, "-id") {
 		t.Fatalf("missing -id: %v", inv.Args)
 	}
@@ -203,4 +207,77 @@ func TestInvocationForPruneSnapshotID(t *testing.T) {
 	if keeps != 2 {
 		t.Errorf("-keep count = %d want 2 (args=%v)", keeps, inv.Args)
 	}
+}
+
+// TestInvocationForPruneKeepRuleOrderPreserved pins that the agent passes
+// keep rules through in the caller's order. duplicacy applies them with a
+// monotonic index and requires descending m; the controller's materializer
+// owns that ordering. Sorting or reordering here would paper over a broken
+// caller and make the failure invisible again — the exact property that let
+// ~2,900 prune runs report success while reclaiming nothing.
+func TestInvocationForPruneKeepRuleOrderPreserved(t *testing.T) {
+	repo := &Repo{Path: "/repo"}
+	want := []string{"0:365", "30:100", "7:30", "1:7"}
+	inv := invocationForPrune(repo, pruneOptions{KeepRules: want, SnapshotID: "pi-home"})
+
+	var got []string
+	for i, a := range inv.Args {
+		if a == "-keep" && i+1 < len(inv.Args) {
+			got = append(got, inv.Args[i+1])
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("keep rules = %v want %v (args=%v)", got, want, inv.Args)
+	}
+}
+
+func TestInvocationForPruneOptionalFlags(t *testing.T) {
+	repo := &Repo{Path: "/repo"}
+
+	t.Run("defaults emit no dry-run, threads or ignore", func(t *testing.T) {
+		inv := invocationForPrune(repo, pruneOptions{Storage: "storj", SnapshotID: "pi-home"})
+		for _, flag := range []string{"-dry-run", "-threads", "-ignore", "-exclusive", "-exhaustive"} {
+			if slices.Contains(inv.Args, flag) {
+				t.Errorf("unset option emitted %s: %v", flag, inv.Args)
+			}
+		}
+	})
+
+	t.Run("dry-run emits -dry-run", func(t *testing.T) {
+		inv := invocationForPrune(repo, pruneOptions{SnapshotID: "pi-home", DryRun: true})
+		if !slices.Contains(inv.Args, "-dry-run") {
+			t.Errorf("missing -dry-run: %v", inv.Args)
+		}
+	})
+
+	t.Run("threads <= 1 omitted, > 1 emitted", func(t *testing.T) {
+		for _, n := range []int{0, 1} {
+			inv := invocationForPrune(repo, pruneOptions{SnapshotID: "pi-home", Threads: n})
+			if slices.Contains(inv.Args, "-threads") {
+				t.Errorf("threads=%d should be omitted (duplicacy's default is 1): %v", n, inv.Args)
+			}
+		}
+		inv := invocationForPrune(repo, pruneOptions{SnapshotID: "pi-home", Threads: 8})
+		i := slices.Index(inv.Args, "-threads")
+		if i < 0 || i+1 >= len(inv.Args) || inv.Args[i+1] != "8" {
+			t.Errorf("threads=8 not passed: %v", inv.Args)
+		}
+	})
+
+	t.Run("ignore emits one -ignore per id, skipping empties", func(t *testing.T) {
+		inv := invocationForPrune(repo, pruneOptions{
+			SnapshotID: "pi-home",
+			Ignore:     []string{"restore-test-nuc", "", "restore-test-pi"},
+		})
+		var got []string
+		for i, a := range inv.Args {
+			if a == "-ignore" && i+1 < len(inv.Args) {
+				got = append(got, inv.Args[i+1])
+			}
+		}
+		want := []string{"restore-test-nuc", "restore-test-pi"}
+		if !slices.Equal(got, want) {
+			t.Errorf("ignore = %v want %v (args=%v)", got, want, inv.Args)
+		}
+	})
 }

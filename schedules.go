@@ -153,9 +153,21 @@ func makeDuplicacyFire(cfg Config, jobs *jobRegistry, repos *repoIndex, prepareE
 			// repo fall back to sch.RepoID (= that repo's own snapshot id in
 			// preferences). Solo-storage repos get -id with their only id,
 			// which is a no-op constraint.
-			inv = invocationForPrune(repo, sch.Storage, kitsched.ParamStrings(sch.Params, "keep_rules"),
-				kitsched.ParamBool(sch.Params, "exclusive"), kitsched.ParamBool(sch.Params, "exhaustive"),
-				resolveScheduleSnapshotID(sch))
+			//
+			// DryRun is deliberately NOT read from params: a scheduled prune
+			// that silently no-ops would look healthy in job history while
+			// reclaiming nothing — the exact failure mode this whole change
+			// exists to fix. Previews are operator-initiated only, via
+			// POST /repos/:id/prune/preview.
+			inv = invocationForPrune(repo, pruneOptions{
+				Storage:    sch.Storage,
+				KeepRules:  kitsched.ParamStrings(sch.Params, "keep_rules"),
+				Exclusive:  kitsched.ParamBool(sch.Params, "exclusive"),
+				Exhaustive: kitsched.ParamBool(sch.Params, "exhaustive"),
+				SnapshotID: resolveScheduleSnapshotID(sch),
+				Threads:    kitsched.ParamInt(sch.Params, "threads"),
+				Ignore:     kitsched.ParamStrings(sch.Params, "ignore"),
+			})
 		case ActionCopy:
 			// sch.Storage is the destination alias; params.copy_from is the
 			// source (the relay's "default" / nas-primary view). params.copy_id
