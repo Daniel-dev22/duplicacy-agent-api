@@ -211,9 +211,8 @@ func (f *filterCache) savePerRepo(pr PerRepoFilters) error {
 }
 
 // renderForRepo writes the merged effective filters file at <repo>/.duplicacy/filters.
-// Order: org → site → per-repo. Rules later in the file override earlier ones in duplicacy semantics.
 func (f *filterCache) renderForRepo(repo *Repo) error {
-	merged := f.computeMerged(repo.ID)
+	merged := f.computeMerged(repo.ID, repo.matchRoot())
 	dest := filepath.Join(repo.Path, ".duplicacy", "filters")
 	tmp := dest + ".tmp"
 	if err := os.WriteFile(tmp, []byte(merged), 0600); err != nil {
@@ -222,8 +221,20 @@ func (f *filterCache) renderForRepo(repo *Repo) error {
 	return os.Rename(tmp, dest)
 }
 
-// computeMerged builds the file content (used by renderForRepo and the preview endpoint).
-func (f *filterCache) computeMerged(repoID string) string {
+// computeMerged builds the file content (used by renderForRepo and the preview
+// endpoint).
+//
+// ORDER IS PER-REPO → SITE → ORG, and that is the opposite of what this function
+// used to do. duplicacy's MatchPath (duplicacy_utils.go) walks the pattern list
+// and RETURNS on the first '+' or '-' that matches — first match wins, later
+// lines never get a look in. Writing org first therefore made per-repo overrides
+// dead: any org rule that already matched decided the outcome. The old comment
+// here asserted the reverse ("rules later in the file override earlier ones"),
+// which is where the bug came from.
+//
+// matchRoot is the repository root every pattern is anchored against; see
+// anchorPattern.
+func (f *filterCache) computeMerged(repoID, matchRoot string) string {
 	f.mu.RLock()
 	sets := append([]FilterSet(nil), f.sets...)
 	lastFetched := f.lastFetched
@@ -235,7 +246,17 @@ func (f *filterCache) computeMerged(repoID string) string {
 	b.WriteString(fmt.Sprintf("# Source-of-truth fetched: %s\n", lastFetched.Format(time.RFC3339)))
 	b.WriteString("\n")
 
-	// Sort sets so org first, then site, deterministic by name within each.
+	// Most specific FIRST, because first match wins.
+	pr, _, err := f.loadPerRepo(repoID)
+	if err != nil {
+		slog.Warn("load per-repo filters failed; rendering without", "error", err, "repo", repoID)
+	} else if len(pr.Rules) > 0 {
+		b.WriteString("# === REPO: per-repo overrides ===\n")
+		writeRules(&b, pr.Rules, matchRoot)
+		b.WriteString("\n")
+	}
+
+	// Then site, then org — same reason.
 	slices.SortStableFunc(sets, func(a, b FilterSet) int {
 		return cmp.Or(
 			cmp.Compare(scopeOrder(a.Scope), scopeOrder(b.Scope)),
@@ -252,25 +273,20 @@ func (f *filterCache) computeMerged(repoID string) string {
 			strings.ToUpper(s.Scope),
 			scopeValueDisplay(s.ScopeValue),
 			s.Name))
-		writeRules(&b, s.Rules)
+		writeRules(&b, s.Rules, matchRoot)
 		b.WriteString("\n")
 	}
 
-	pr, _, err := f.loadPerRepo(repoID)
-	if err != nil {
-		slog.Warn("load per-repo filters failed; rendering without", "error", err, "repo", repoID)
-	} else if len(pr.Rules) > 0 {
-		b.WriteString("# === REPO: per-repo overrides ===\n")
-		writeRules(&b, pr.Rules)
-	}
 	return b.String()
 }
 
+// scopeOrder ranks scopes MOST SPECIFIC FIRST, so that a site rule beats an org
+// rule under duplicacy's first-match-wins evaluation.
 func scopeOrder(s string) int {
 	switch s {
-	case "org":
-		return 0
 	case "site":
+		return 0
+	case "org":
 		return 1
 	default:
 		return 2
@@ -284,16 +300,97 @@ func scopeValueDisplay(v string) string {
 	return " (" + v + ")"
 }
 
-func writeRules(b *strings.Builder, rules []FilterRule) {
+// anchorPattern converts a stored ABSOLUTE pattern into the repo-relative form
+// duplicacy actually matches against, reporting false when the pattern cannot
+// apply to this repo at all.
+//
+// THIS IS THE WHOLE BUG THIS FILE EXISTED WITH. duplicacy builds each entry's
+// path in CreateEntryFromFileInfo (duplicacy_entry.go) as `directory + name`,
+// starting from "" at the repository root — so what MatchPath sees is always
+// RELATIVE and never carries a leading slash. Directories additionally get a
+// trailing "/". A stored pattern of
+//
+//	/home/user/custom_os_isos/
+//
+// is therefore compared against
+//
+//	custom_os_isos/ubuntu/iso-root/sys/bus/workqueue/uevent
+//
+// and cannot match — the very first byte disagrees. Verified against duplicacy's
+// own matcher: the absolute form returns false, and so does the absolute form
+// with a wildcard appended. Every rule in the org set was inert on every repo,
+// silently, for as long as the feature has existed; the only visible symptom was
+// backups walking into directories the operator had excluded.
+//
+// Patterns are stored absolute on purpose and that stays: one org-scoped set is
+// rendered onto repos rooted at /home/user, /srv/containers,
+// /mnt/storage and more, so an absolute path is the only spelling that is
+// unambiguous across them. Anchoring is a render-time concern because the
+// renderer is the only layer that knows which repo it is writing for.
+//
+// Rules:
+//   - already relative (no leading "/") → passed through untouched.
+//   - inside this repo → repo-root prefix stripped.
+//   - equal to the repo root → dropped. It would strip to "", and an empty
+//     pattern matches everything; excluding the entire repository is never what
+//     an exclusion list meant to say.
+//   - anywhere else → dropped. It can never match, and emitting it only
+//     produces a filters file that looks like it is doing something.
+//
+// A wildcard inside the leading component (e.g. /home/*/x) is not anchorable by
+// prefix and so is dropped by the last rule. That is not a regression: duplicacy
+// could not have matched it either.
+func anchorPattern(pattern, matchRoot string) (string, bool) {
+	if pattern == "" {
+		return "", false
+	}
+	if !strings.HasPrefix(pattern, "/") {
+		return pattern, true // already repo-relative
+	}
+	root := strings.TrimSuffix(matchRoot, "/")
+	if root == "" || root == "/" {
+		// Repo rooted at "/": paths are relative to it, so drop just the leader.
+		return strings.TrimPrefix(pattern, "/"), true
+	}
+	if pattern == root || pattern == root+"/" {
+		return "", false
+	}
+	if rest, ok := strings.CutPrefix(pattern, root+"/"); ok && rest != "" {
+		return rest, true
+	}
+	return "", false
+}
+
+// matchRoot is the directory duplicacy resolves entry paths against. That is the
+// repository root from preferences (SourcePath) where we have it, falling back
+// to the path the agent discovered the repo at.
+func (r *Repo) matchRoot() string {
+	if r.SourcePath != "" {
+		return r.SourcePath
+	}
+	return r.Path
+}
+
+func writeRules(b *strings.Builder, rules []FilterRule, matchRoot string) {
 	sorted := append([]FilterRule(nil), rules...)
 	slices.SortStableFunc(sorted, func(a, b FilterRule) int { return cmp.Compare(a.Position, b.Position) })
 	for _, r := range sorted {
+		pattern, ok := anchorPattern(r.Pattern, matchRoot)
+		if !ok {
+			// Rendered as a comment rather than dropped silently: an operator
+			// reading this file needs to see that the rule was considered and
+			// does not apply here, not wonder whether the sync is broken.
+			b.WriteString("# (not in this repo) ")
+			b.WriteString(r.Pattern)
+			b.WriteString("\n")
+			continue
+		}
 		prefix := "-"
 		if r.Action == "include" {
 			prefix = "+"
 		}
 		b.WriteString(prefix)
-		b.WriteString(r.Pattern)
+		b.WriteString(pattern)
 		b.WriteString("\n")
 	}
 }
@@ -360,7 +457,7 @@ func (a *app) handleRenderFilters(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "repo not found"})
 		return
 	}
-	merged := a.filters.computeMerged(repo.ID)
+	merged := a.filters.computeMerged(repo.ID, repo.matchRoot())
 	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(merged))
 }
 
