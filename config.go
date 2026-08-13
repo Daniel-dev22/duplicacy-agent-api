@@ -11,12 +11,12 @@ import (
 type Config struct {
 	NodeName string // hostname-short this agent runs on (e.g. "nuc02")
 	SiteID   string // short id of the site this node belongs to (e.g. "site-a")
-	// RemoteSiteID is the peer site this deployment replicates to, used to
+	// RemoteSite is the peer site this deployment replicates to, used to
 	// expand the {remote_home} storage-URL placeholder. Optional: a
 	// single-site deployment leaves it unset and {remote_home} falls back to
 	// the local site's home. See template.go.
-	RemoteSiteID string
-	BackupRoots  []string // host paths to scan for .duplicacy repos (mirrored: host == container)
+	RemoteSite  string
+	BackupRoots []string // host paths to scan for .duplicacy repos (mirrored: host == container)
 	// BackupExcludePaths are path prefixes the repo scanner and tree walker
 	// skip entirely. Use to suppress dirs that contain a .duplicacy/ but are
 	// not user-managed repos — e.g. the Duplicacy Web Edition data dir
@@ -120,7 +120,7 @@ func loadConfig() Config {
 	cfg := Config{
 		NodeName:            requireEnv("NODE_NAME"),
 		SiteID:              requireEnv("SITE_ID"),
-		RemoteSiteID:        getEnv("REMOTE_SITE_ID", ""),
+		RemoteSite:          getEnv("REMOTE_SITE", ""),
 		BackupRoots:         splitCSV(requireEnv("BACKUP_ROOTS")),
 		BackupExcludePaths:  splitCSV(getEnv("BACKUP_EXCLUDE_PATHS", "")),
 		LegacyBackuprootMap: parseMountMap(getEnv("LEGACY_BACKUPROOT_MAP", "")),
