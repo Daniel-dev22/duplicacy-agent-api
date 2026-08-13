@@ -137,13 +137,13 @@ func TestBaseTplCtx(t *testing.T) {
 	}
 }
 
-// TestBaseTplCtxNoPeer pins the single-site default: with REMOTE_SITE_ID unset
-// there is no peer, so {remote_home} degrades to the local site's own home
-// rather than erroring or emitting an empty segment.
+// TestBaseTplCtxNoPeer pins the no-peer case: with REMOTE_SITE_ID unset there
+// is no peer, so RemoteHome is EMPTY. It must not fall back to the local site's
+// own home — see TestExpandRemoteHomeWithoutPeerErrors for why.
 func TestBaseTplCtxNoPeer(t *testing.T) {
 	cfg := Config{NodeName: "nuc02", SiteID: "site-b"}
-	if got := cfg.baseTplCtx().RemoteHome; got != "site-bhome" {
-		t.Fatalf("RemoteHome with no peer configured = %q, want %q", got, "site-bhome")
+	if got := cfg.baseTplCtx().RemoteHome; got != "" {
+		t.Fatalf("RemoteHome with no peer configured = %q, want empty", got)
 	}
 }
 
@@ -155,13 +155,47 @@ func TestSiteIDToRemoteHome(t *testing.T) {
 		{"site-a", "site-b", "site-bhome"},
 		{"site-b", "site-a", "site-ahome"},
 		{"east", "west", "westhome"},
-		// No peer configured — fall back to the local site's own home.
-		{"site-a", "", "site-ahome"},
-		{"xx", "", "xxhome"},
+		// No peer configured — empty, NOT the local home.
+		{"site-a", "", ""},
+		{"xx", "", ""},
 	}
 	for _, c := range cases {
 		if got := siteIDToRemoteHome(c.site, c.remoteSite); got != c.want {
 			t.Errorf("siteIDToRemoteHome(%q, %q) = %q, want %q", c.site, c.remoteSite, got, c.want)
 		}
+	}
+}
+
+// TestExpandRemoteHomeWithoutPeerErrors is the regression guard for a silent
+// wrong-destination bug. {remote_home} used to resolve to the LOCAL site's home
+// when no peer was configured, which is not a degraded answer — it is a
+// different site's path that looks entirely plausible. The expanded URL is
+// baked into .duplicacy/preferences at init and never re-resolved, so such a
+// repo would back up to the wrong destination indefinitely with nothing to
+// signal it. Refusing to resolve is the only safe behaviour.
+func TestExpandRemoteHomeWithoutPeerErrors(t *testing.T) {
+	noPeer := Config{NodeName: "nuc01", SiteID: "site-a"}.baseTplCtx()
+
+	tpl := "sftp://backup@nas.example.com:22//mnt/array/{remote_home}/servers/{server}/duplicacy"
+	if _, err := expandStorageURL(tpl, noPeer, ""); err == nil {
+		t.Fatal("expandStorageURL with {remote_home} and no REMOTE_SITE_ID: want error, got nil")
+	}
+
+	// A template that does not reach for a peer is unaffected.
+	if _, err := expandStorageURL("sftp://backup@nas.example.com:22//mnt/array/{home}/{server}", noPeer, ""); err != nil {
+		t.Fatalf("template without {remote_home} must still expand: %v", err)
+	}
+
+	// With a peer configured it resolves to the PEER's home, not the local one.
+	withPeer := Config{NodeName: "nuc01", SiteID: "site-a", RemoteSiteID: "site-b"}.baseTplCtx()
+	got, err := expandStorageURL(tpl, withPeer, "")
+	if err != nil {
+		t.Fatalf("expandStorageURL with peer configured: %v", err)
+	}
+	if !strings.Contains(got, "/site-bhome/") {
+		t.Fatalf("expanded %q, want it to contain /site-bhome/ (the peer, not the local site)", got)
+	}
+	if strings.Contains(got, "/site-ahome/") {
+		t.Fatalf("expanded %q resolved {remote_home} to the LOCAL site", got)
 	}
 }

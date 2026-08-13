@@ -263,7 +263,7 @@ time using this node's identity. The resolved URL is what gets written into
 | `{server_type}` | `NODE_NAME` with trailing digits stripped | `nuc` |
 | `{site}` | `SITE_ID` | `site-a` |
 | `{home}` | `SITE_ID` + `"home"` | `site-ahome` |
-| `{remote_home}` | `REMOTE_SITE_ID` + `"home"`; falls back to `{home}` when unset | `site-bhome` |
+| `{remote_home}` | `REMOTE_SITE_ID` + `"home"`. **Unset ⇒ a template using this placeholder is rejected**, rather than silently resolving to the local site | `site-bhome` |
 | `{repo_id}` | The repo's snapshot id, filled in per init | `nuc01-data` |
 
 ```
@@ -339,7 +339,7 @@ non-empty bearer token file is also required at startup.
 | Var | Default | Meaning |
 |---|---|---|
 | `BEARER_TOKEN_FILE` | `/etc/duplicacy-agent-api/bearer-token` | File holding this node's bearer token. Read once at startup; missing or empty is fatal. Trailing whitespace stripped. |
-| `REMOTE_SITE_ID` | *(empty)* | Peer site id, used only to expand `{remote_home}`. Leave unset for a single-site deployment. |
+| `REMOTE_SITE_ID` | *(empty)* | Peer site id, used only to expand `{remote_home}`. Leave unset for a single-site deployment — but if any `storage_url` uses `{remote_home}`, this is **required** and init fails loudly without it. |
 | `TRAEFIK_DOCKER_DNS` | *(empty)* | When set, the dialer ignores the URL's host and connects to this DNS name instead, so a host-local reverse proxy can attach the client certificate. Leave empty for direct dialing. |
 | `TRAEFIK_DIAL_PORT` | `1443` | Port used with `TRAEFIK_DOCKER_DNS`. |
 

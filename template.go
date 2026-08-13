@@ -52,14 +52,21 @@ func (c Config) baseTplCtx() tplCtx {
 //
 // The peer site cannot be derived from the local site — it is genuinely
 // deployment configuration — so it comes from the optional REMOTE_SITE_ID env
-// var. When that is unset there is no peer, and {remote_home} degrades to the
-// local site's own home rather than failing, which keeps single-site
-// deployments (the common case) working with no configuration at all.
+// var.
+//
+// When REMOTE_SITE_ID is unset this returns "", and expandStorageURL then
+// REJECTS any template that uses {remote_home}. It deliberately does not fall
+// back to the local site's home: that would resolve a cross-site path to this
+// site's own, and because the expanded URL is baked into .duplicacy/preferences
+// at init and never re-resolved, the repo would keep writing to the wrong
+// destination forever with nothing to indicate it. Same principle as the
+// unknown-placeholder check above — a misconfiguration must fail loudly at
+// init rather than silently ship a plausible-looking wrong path.
 func siteIDToRemoteHome(site, remoteSite string) string {
 	if remoteSite != "" {
 		return remoteSite + "home"
 	}
-	return site + "home"
+	return ""
 }
 
 // serverTypeFromNode strips trailing digits from a NodeName so "nuc01" → "nuc",
@@ -87,6 +94,9 @@ func expandStorageURL(template string, ctx tplCtx, serverOverride string) (strin
 	server := ctx.Server
 	if serverOverride != "" {
 		server = serverOverride
+	}
+	if strings.Contains(template, "{remote_home}") && ctx.RemoteHome == "" {
+		return "", fmt.Errorf("storage_url uses {remote_home} but REMOTE_SITE_ID is not set; refusing to resolve a cross-site path to this site's own home")
 	}
 	r := strings.NewReplacer(
 		"{server}", server,
