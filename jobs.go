@@ -254,6 +254,7 @@ var progressLineRe = regexp.MustCompile(
 //	Copied chunk <hash> (<idx>/<total>) <speed>MB/s <ETA> <pct>%
 //
 // e.g.:
+//
 //	Copied chunk 4ac96c2e...d3 (2/1274) 4.15MB/s 00:19:32 0.2%
 //
 // Groups: chunk_hash, idx, total, speed, eta, percent.
@@ -488,7 +489,7 @@ func (j *Job) parsePruneLine(line string) bool {
 //
 //	"All chunks: %d total, %s bytes; %d new, %s bytes, %s bytes uploaded"
 //
-// Real example from /srv/containers/duplicacy/logs/backup-….log:
+// Real example from a backup log:
 //
 //	INFO BACKUP_STATS All chunks: 1472 total, 8,353M bytes; 5 new, 7,984K bytes, 669K bytes uploaded
 //
@@ -1353,7 +1354,7 @@ func (a *app) prepareRestoreTarget(repo *Repo, target string, revision int) (str
 
 type checkRequest struct {
 	Storage    string `json:"storage"`
-	Revisions  string `json:"revisions"`   // optional: e.g., "1,3,5" or "1-10"
+	Revisions  string `json:"revisions"` // optional: e.g., "1,3,5" or "1-10"
 	All        bool   `json:"all"`
 	SnapshotID string `json:"snapshot_id"` // optional: scope to one snapshot id via -id (hub relay)
 	TriggerKey string `json:"trigger_key"`

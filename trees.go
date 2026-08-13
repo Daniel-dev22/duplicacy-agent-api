@@ -1,13 +1,13 @@
 package main
 
-// Periodic tree push from the duplicacy-agent to controller.
+// Periodic tree push from the duplicacy agent to the controller.
 //
 // Two payload shapes:
 //   - repo trees   → one per loaded *Repo, rooted at the repo's source path
 //                    so filter patterns built in the UI line up with duplicacy's
 //                    own evaluation. POST /api/duplicacy/repo-trees.
 //   - node trees   → one per backup root (the operator-meaningful paths like
-//                    /home/user, /srv/containers, or /mnt on nas),
+//                    /home/user, /srv/containers, or /mnt on a NAS),
 //                    so RepoPathPicker's adopt flow can browse the disk
 //                    without depending on server_metrics' filesystem tree.
 //                    POST /api/duplicacy/node-trees.

@@ -29,9 +29,9 @@ func TestExpandStorageURL(t *testing.T) {
 	ctx := tplCtx{
 		Server:     "nuc01",
 		ServerType: "nuc",
-		Site:       "kd",
-		Home:       "site-a",
-		RemoteHome: "site-b",
+		Site:       "site-a",
+		Home:       "site-ahome",
+		RemoteHome: "site-bhome",
 		RepoID:     "nuc01-data",
 	}
 
@@ -55,22 +55,22 @@ func TestExpandStorageURL(t *testing.T) {
 		{
 			name: "all six placeholders",
 			in:   "{site}/{home}/{remote_home}/{server}/{server_type}/{repo_id}",
-			want: "kd/site-a/site-b/nuc01/nuc/nuc01-data",
+			want: "site-a/site-ahome/site-bhome/nuc01/nuc/nuc01-data",
 		},
 		{
-			name: "user's S3 example",
+			name: "S3 example",
 			in:   "s3://US1@gateway.storjshare.io/{home}/{site}-{server_type}/duplicacy",
-			want: "s3://US1@gateway.storjshare.io/site-a/kd-nuc/duplicacy",
+			want: "s3://US1@gateway.storjshare.io/site-ahome/site-a-nuc/duplicacy",
 		},
 		{
-			name: "user's SFTP example with home and server",
-			in:   "sftp://backup@nas.{home}apps.com:22//mnt/array/{home}_backup/servers/{server}/duplicacy",
-			want: "sftp://backup@nas.example.com:22//mnt/array/site-a_backup/servers/nuc01/duplicacy",
+			name: "SFTP example with home and server",
+			in:   "sftp://backup@nas.example.com:22//mnt/array/{home}_backup/servers/{server}/duplicacy",
+			want: "sftp://backup@nas.example.com:22//mnt/array/site-ahome_backup/servers/nuc01/duplicacy",
 		},
 		{
-			name: "cross-site backup uses {remote_home} for destination host",
-			in:   "sftp://backup@nas.{remote_home}apps.com:22//mnt/array/{home}_backup/servers/{server}/duplicacy",
-			want: "sftp://backup@nas.example.net:22//mnt/array/site-a_backup/servers/nuc01/duplicacy",
+			name: "cross-site backup uses {remote_home} in the destination path",
+			in:   "sftp://backup@nas.example.net:22//mnt/array/{remote_home}/{home}_backup/servers/{server}/duplicacy",
+			want: "sftp://backup@nas.example.net:22//mnt/array/site-bhome/site-ahome_backup/servers/nuc01/duplicacy",
 		},
 		{
 			name:           "server_override wins over ctx.Server",
@@ -124,24 +124,44 @@ func TestExpandStorageURL(t *testing.T) {
 }
 
 func TestBaseTplCtx(t *testing.T) {
-	cfg := Config{NodeName: "nuc02", SiteID: "ng"}
+	cfg := Config{NodeName: "nuc02", SiteID: "site-b", RemoteSiteID: "site-a"}
 	ctx := cfg.baseTplCtx()
-	if ctx.Server != "nuc02" || ctx.ServerType != "nuc" || ctx.Site != "ng" || ctx.Home != "site-b" {
+	if ctx.Server != "nuc02" || ctx.ServerType != "nuc" || ctx.Site != "site-b" || ctx.Home != "site-bhome" {
 		t.Fatalf("baseTplCtx wrong: %+v", ctx)
 	}
-	if ctx.RemoteHome != "site-a" {
-		t.Fatalf("RemoteHome for site=ng should be site-a, got %q", ctx.RemoteHome)
+	if ctx.RemoteHome != "site-ahome" {
+		t.Fatalf("RemoteHome for RemoteSiteID=site-a should be site-ahome, got %q", ctx.RemoteHome)
 	}
 	if ctx.RepoID != "" {
 		t.Fatalf("RepoID should default to empty (caller fills it in), got %q", ctx.RepoID)
 	}
 }
 
+// TestBaseTplCtxNoPeer pins the single-site default: with REMOTE_SITE_ID unset
+// there is no peer, so {remote_home} degrades to the local site's own home
+// rather than erroring or emitting an empty segment.
+func TestBaseTplCtxNoPeer(t *testing.T) {
+	cfg := Config{NodeName: "nuc02", SiteID: "site-b"}
+	if got := cfg.baseTplCtx().RemoteHome; got != "site-bhome" {
+		t.Fatalf("RemoteHome with no peer configured = %q, want %q", got, "site-bhome")
+	}
+}
+
 func TestSiteIDToRemoteHome(t *testing.T) {
-	cases := map[string]string{"kd": "site-b", "ng": "site-a", "xx": "xxhome"}
-	for in, want := range cases {
-		if got := siteIDToRemoteHome(in); got != want {
-			t.Errorf("siteIDToRemoteHome(%q) = %q, want %q", in, got, want)
+	cases := []struct {
+		site, remoteSite, want string
+	}{
+		// Peer configured — the peer's id decides, not the local one.
+		{"site-a", "site-b", "site-bhome"},
+		{"site-b", "site-a", "site-ahome"},
+		{"east", "west", "westhome"},
+		// No peer configured — fall back to the local site's own home.
+		{"site-a", "", "site-ahome"},
+		{"xx", "", "xxhome"},
+	}
+	for _, c := range cases {
+		if got := siteIDToRemoteHome(c.site, c.remoteSite); got != c.want {
+			t.Errorf("siteIDToRemoteHome(%q, %q) = %q, want %q", c.site, c.remoteSite, got, c.want)
 		}
 	}
 }

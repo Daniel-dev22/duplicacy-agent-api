@@ -1,7 +1,7 @@
 {
   "project": "duplicacy-agent-api",
   "image_prefix": "",
-  "ssh": true,
+  "ssh": false,
   "platform": { "mode": "auto" },
   "version": { "scheme": "timestamp" },
   "tag_rotation": true,

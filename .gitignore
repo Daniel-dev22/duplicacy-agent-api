@@ -1,4 +1,4 @@
-# Ansible-deploy runtime artifacts (root-owned, per-host secrets)
+# Deploy-time runtime artifacts (root-owned, per-host secrets)
 bearer-token
 app
 docker-compose.yml
@@ -13,5 +13,5 @@ docker-compose.yml.*~
 state/
 known_hosts
 
-# Shared build orchestrator staged here by the ansible build playbook
+# Shared build orchestrator staged here by the build automation
 /.build/

@@ -11,9 +11,10 @@ package main
 //   {server}       — cfg.NodeName                              (e.g. "nuc01")
 //                    Per-storage server_override wins over this.
 //   {server_type}  — cfg.NodeName with trailing digits stripped (e.g. "nuc")
-//   {site}         — cfg.SiteID                                 (e.g. "kd")
-//   {home}         — cfg.SiteID + "home"                        (e.g. "site-a")
-//   {remote_home}  — the OTHER site's home                      (e.g. site=kd → "site-b")
+//   {site}         — cfg.SiteID                                 (e.g. "site-a")
+//   {home}         — cfg.SiteID + "home"                        (e.g. "site-ahome")
+//   {remote_home}  — the PEER site's home, from REMOTE_SITE_ID
+//                    (e.g. REMOTE_SITE_ID=site-b → "site-bhome")
 //   {repo_id}      — per-init repo's snapshot id                (e.g. "nuc01-data")
 //
 // Unknown placeholders are NOT silently passed through — expandStorageURL
@@ -42,18 +43,21 @@ func (c Config) baseTplCtx() tplCtx {
 		ServerType: serverTypeFromNode(c.NodeName),
 		Site:       c.SiteID,
 		Home:       c.SiteID + "home",
-		RemoteHome: siteIDToRemoteHome(c.SiteID),
+		RemoteHome: siteIDToRemoteHome(c.SiteID, c.RemoteSiteID),
 	}
 }
 
-// siteIDToRemoteHome maps the local site to the *other* site's home string.
-// Mirror of router/duplicacy_template.go::siteIDToRemoteHome.
-func siteIDToRemoteHome(site string) string {
-	switch site {
-	case "kd":
-		return "site-b"
-	case "ng":
-		return "site-a"
+// siteIDToRemoteHome resolves the {remote_home} placeholder: the home string
+// of the site this one replicates to.
+//
+// The peer site cannot be derived from the local site — it is genuinely
+// deployment configuration — so it comes from the optional REMOTE_SITE_ID env
+// var. When that is unset there is no peer, and {remote_home} degrades to the
+// local site's own home rather than failing, which keeps single-site
+// deployments (the common case) working with no configuration at all.
+func siteIDToRemoteHome(site, remoteSite string) string {
+	if remoteSite != "" {
+		return remoteSite + "home"
 	}
 	return site + "home"
 }
@@ -78,7 +82,7 @@ var unknownPlaceholderRe = regexp.MustCompile(`\{[a-z_][a-z0-9_]*\}`)
 // serverOverride is a per-storage override: when non-empty it wins over
 // ctx.Server for the {server} placeholder only. This lets one credential
 // serve multiple storage aliases on the same node whose URLs differ only by
-// server segment (e.g. nas-side ng-nas-{nuc,pi,nas}-storage trio).
+// server segment (e.g. a NAS-side {nuc,pi,nas}-storage trio).
 func expandStorageURL(template string, ctx tplCtx, serverOverride string) (string, error) {
 	server := ctx.Server
 	if serverOverride != "" {

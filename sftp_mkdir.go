@@ -6,7 +6,7 @@ package main
 // if the directory is missing — preventing a fresh repo from ever starting on
 // a host that hasn't been hand-prepared.
 //
-// We talk SFTP (not SSH-exec) because the typical `duplicacy@host` user is
+// We talk SFTP (not SSH-exec) because the typical backup user is
 // shell-less (e.g. /sbin/nologin) for security: SSH command execution is
 // rejected with "This account is currently not available." even though the
 // SFTP subsystem is enabled. duplicacy itself uses the SFTP protocol, so

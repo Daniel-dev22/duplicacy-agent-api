@@ -213,7 +213,7 @@ func TestParseCheckLine(t *testing.T) {
 	t.Run("bare_lines_without_log_prefix", func(t *testing.T) {
 		// duplicacy WITHOUT `-log` (our default invocation) emits the bare
 		// text — no "INFO SNAPSHOT_CHECK " prefix. Verified against actual
-		// job log on kd-nuc01 2026-05-28. Regex must accept both forms or
+		// job log from a real backup. Regex must accept both forms or
 		// the entire check counter / pool size path silently no-ops.
 		j := &Job{}
 		if !j.parseCheckLine("11 snapshots and 9 revisions") {

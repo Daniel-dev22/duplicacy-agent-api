@@ -77,7 +77,7 @@ type app struct {
 	secrets             *secretCache             // 60s TTL cache of vended bundles
 	compose             *composeIndex            // bounded scan of mounted COMPOSE_SCAN_ROOTS for compose project dirs
 	fleet               *fleetHub                // /ws/fleet broadcaster — pushes snapshot on init / job state change
-	trees               *treeWalker              // 5-min push of repo + node filesystem trees to controller
+	trees               *treeWalker              // 5-min push of repo + node filesystem trees to the controller
 	sizes               *dirSizeCache            // persisted per-directory subtree byte totals (read by the tree push)
 	sizeGatherer        *sizeGatherer            // self-paced background loop that fills `sizes`
 	stop                chan struct{}            // closed in close(); subsystems range on it for shutdown
@@ -286,7 +286,7 @@ func (a *app) startBackgroundWorkers(ctx context.Context) {
 // controller, which converges its duplicacy_jobs rows. This is the safety net
 // for the edge-triggered event path — a lost or out-of-order terminal event
 // can strand a controller row in 'running' forever (witnessed: ng/nas copy
-// a2e80cbe). Reuses the same controller HTTP client as the event outbox
+// witnessed in production). Reuses the same controller HTTP client as the outbox
 // (bearer + Traefik-dial transport); a stateless POST, no socket.
 func (a *app) startJobStateReconcile(ctx context.Context) {
 	reconcile.Run(ctx, reconcile.Config{

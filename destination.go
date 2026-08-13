@@ -14,12 +14,12 @@ import (
 //
 // Examples:
 //
-//	sftp://backup@nas.example.com/mnt/backups/repoA → key "sftp://nas.example.com", label "NAS (example.com)"
-//	s3://us1.storj.io/backup-bucket/path                → key "s3://us1.storj.io/backup-bucket", label "Storj (backup-bucket)"
-//	b2://my-bucket/repo                                 → key "b2://my-bucket", label "B2 (my-bucket)"
-//	/mnt/storage/backups/repoA                     → key "local:///mnt/storage/backups", label "Local (/mnt/storage/backups)"
-//	gcs://my-bucket/repo                                → key "gcs://my-bucket", label "GCS (my-bucket)"
-//	azure://account/container                           → key "azure://account/container", label "Azure (container)"
+//	sftp://backup@nas.example.com/mnt/backups/repoA → key "sftp://nas.example.com", label "NAS (example)"
+//	s3://us1.storj.io/backup-bucket/path            → key "s3://us1.storj.io/backup-bucket", label "Storj (backup-bucket)"
+//	b2://my-bucket/repo                             → key "b2://my-bucket", label "B2 (my-bucket)"
+//	/mnt/storage/backups/repoA                      → key "local:///mnt/storage/backups", label "Local (/mnt/storage/backups)"
+//	gcs://my-bucket/repo                            → key "gcs://my-bucket", label "GCS (my-bucket)"
+//	azure://account/container                       → key "azure://account/container", label "Azure (container)"
 //
 // Unknown/unparseable URLs degrade to ("unknown://<raw>", "Unknown").
 func DestinationKey(storageURL string) (key, label string) {
@@ -46,11 +46,11 @@ func DestinationKey(storageURL string) (key, label string) {
 			return "unknown://" + storageURL, "Unknown"
 		}
 		k := scheme + "://" + host
-		// Friendly label: NAS hosts collapse to the short site name to match
-		// the project's existing terminology (site-a, site-b — the same
-		// strings used in ansible's server_home var). "nas.example.com"
-		// → "NAS (site-a)". Falls back to the full hostname for non-NAS
-		// SFTP destinations.
+		// Friendly label: a NAS host collapses to a short site name derived
+		// from the rest of its domain, which reads better in a chart legend
+		// than the full FQDN — "nas.example.com" → "NAS (example)". Falls
+		// back to the full hostname for non-NAS SFTP destinations. Label
+		// only; the key above always keeps the full host.
 		if strings.HasPrefix(host, "nas.") {
 			return k, "NAS (" + shortSiteName(strings.TrimPrefix(host, "nas.")) + ")"
 		}
@@ -66,8 +66,9 @@ func DestinationKey(storageURL string) (key, label string) {
 		k := scheme + "://" + host + "/" + bucket
 		// Storj exposes S3 gateways under both us1.storj.io / eu1.storj.io
 		// AND gateway.storjshare.io — match on "storj" substring so either
-		// form is recognised. Pre-fix witness 2026-05-28: substring "storj.io"
-		// missed gateway.storjshare.io and the destination rendered "S3 (site-a)".
+		// form is recognised. Pre-fix witness: the substring "storj.io"
+		// missed gateway.storjshare.io and the destination rendered as a
+		// plain "S3 (<bucket>)" instead of "Storj (<bucket>)".
 		if strings.Contains(host, "storj") {
 			return k, "Storj (" + bucket + ")"
 		}
@@ -169,12 +170,17 @@ func extractFirstSegment(s string) string {
 	return s
 }
 
-// shortSiteName collapses a project domain to the canonical short site name
-// used everywhere else in the codebase (site-a / site-b — the same string
-// ansible's server_home var carries). "example.com" → "site-a";
-// "example.net" → "site-b"; anything else returns the input unchanged.
+// shortSiteName reduces a domain to a short, human-readable site name by
+// taking its first DNS label: "example.com" → "example",
+// "site-b.example.net" → "site-b", "example" → "example". A leading dot or an
+// empty first label yields the input unchanged.
+//
+// This is cosmetic only — it feeds the operator-facing destination *label*,
+// never the destination key, so two hosts that share a first label are still
+// distinct destinations.
 func shortSiteName(domain string) string {
-	if i := strings.Index(domain, "apps."); i >= 0 {
+	domain = strings.Trim(domain, ".")
+	if i := strings.IndexByte(domain, '.'); i > 0 {
 		return domain[:i]
 	}
 	return domain

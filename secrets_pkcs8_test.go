@@ -24,11 +24,11 @@ func TestConvertRSAPrivKeyToPKCS1(t *testing.T) {
 	pkcs8PEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8Bytes})
 
 	cases := []struct {
-		name             string
-		input            []byte
-		wantBlockType    string
-		wantConversion   bool
-		wantSameAsInput  bool
+		name            string
+		input           []byte
+		wantBlockType   string
+		wantConversion  bool
+		wantSameAsInput bool
 	}{
 		{
 			name:            "pkcs1 input → returned unchanged",
