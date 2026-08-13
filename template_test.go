@@ -124,20 +124,20 @@ func TestExpandStorageURL(t *testing.T) {
 }
 
 func TestBaseTplCtx(t *testing.T) {
-	cfg := Config{NodeName: "nuc02", SiteID: "site-b", RemoteSiteID: "site-a"}
+	cfg := Config{NodeName: "nuc02", SiteID: "site-b", RemoteSite: "site-a"}
 	ctx := cfg.baseTplCtx()
 	if ctx.Server != "nuc02" || ctx.ServerType != "nuc" || ctx.Site != "site-b" || ctx.Home != "site-bhome" {
 		t.Fatalf("baseTplCtx wrong: %+v", ctx)
 	}
 	if ctx.RemoteHome != "site-ahome" {
-		t.Fatalf("RemoteHome for RemoteSiteID=site-a should be site-ahome, got %q", ctx.RemoteHome)
+		t.Fatalf("RemoteHome for RemoteSite=site-a should be site-ahome, got %q", ctx.RemoteHome)
 	}
 	if ctx.RepoID != "" {
 		t.Fatalf("RepoID should default to empty (caller fills it in), got %q", ctx.RepoID)
 	}
 }
 
-// TestBaseTplCtxNoPeer pins the no-peer case: with REMOTE_SITE_ID unset there
+// TestBaseTplCtxNoPeer pins the no-peer case: with REMOTE_SITE unset there
 // is no peer, so RemoteHome is EMPTY. It must not fall back to the local site's
 // own home — see TestExpandRemoteHomeWithoutPeerErrors for why.
 func TestBaseTplCtxNoPeer(t *testing.T) {
@@ -178,7 +178,7 @@ func TestExpandRemoteHomeWithoutPeerErrors(t *testing.T) {
 
 	tpl := "sftp://backup@nas.example.com:22//mnt/array/{remote_home}/servers/{server}/duplicacy"
 	if _, err := expandStorageURL(tpl, noPeer, ""); err == nil {
-		t.Fatal("expandStorageURL with {remote_home} and no REMOTE_SITE_ID: want error, got nil")
+		t.Fatal("expandStorageURL with {remote_home} and no REMOTE_SITE: want error, got nil")
 	}
 
 	// A template that does not reach for a peer is unaffected.
@@ -187,7 +187,7 @@ func TestExpandRemoteHomeWithoutPeerErrors(t *testing.T) {
 	}
 
 	// With a peer configured it resolves to the PEER's home, not the local one.
-	withPeer := Config{NodeName: "nuc01", SiteID: "site-a", RemoteSiteID: "site-b"}.baseTplCtx()
+	withPeer := Config{NodeName: "nuc01", SiteID: "site-a", RemoteSite: "site-b"}.baseTplCtx()
 	got, err := expandStorageURL(tpl, withPeer, "")
 	if err != nil {
 		t.Fatalf("expandStorageURL with peer configured: %v", err)

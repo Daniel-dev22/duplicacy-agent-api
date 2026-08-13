@@ -13,8 +13,8 @@ package main
 //   {server_type}  — cfg.NodeName with trailing digits stripped (e.g. "nuc")
 //   {site}         — cfg.SiteID                                 (e.g. "site-a")
 //   {home}         — cfg.SiteID + "home"                        (e.g. "site-ahome")
-//   {remote_home}  — the PEER site's home, from REMOTE_SITE_ID
-//                    (e.g. REMOTE_SITE_ID=site-b → "site-bhome")
+//   {remote_home}  — the PEER site's home, from REMOTE_SITE
+//                    (e.g. REMOTE_SITE=site-b → "site-bhome")
 //   {repo_id}      — per-init repo's snapshot id                (e.g. "nuc01-data")
 //
 // Unknown placeholders are NOT silently passed through — expandStorageURL
@@ -43,7 +43,7 @@ func (c Config) baseTplCtx() tplCtx {
 		ServerType: serverTypeFromNode(c.NodeName),
 		Site:       c.SiteID,
 		Home:       c.SiteID + "home",
-		RemoteHome: siteIDToRemoteHome(c.SiteID, c.RemoteSiteID),
+		RemoteHome: siteIDToRemoteHome(c.SiteID, c.RemoteSite),
 	}
 }
 
@@ -51,10 +51,10 @@ func (c Config) baseTplCtx() tplCtx {
 // of the site this one replicates to.
 //
 // The peer site cannot be derived from the local site — it is genuinely
-// deployment configuration — so it comes from the optional REMOTE_SITE_ID env
+// deployment configuration — so it comes from the optional REMOTE_SITE env
 // var.
 //
-// When REMOTE_SITE_ID is unset this returns "", and expandStorageURL then
+// When REMOTE_SITE is unset this returns "", and expandStorageURL then
 // REJECTS any template that uses {remote_home}. It deliberately does not fall
 // back to the local site's home: that would resolve a cross-site path to this
 // site's own, and because the expanded URL is baked into .duplicacy/preferences
@@ -96,7 +96,7 @@ func expandStorageURL(template string, ctx tplCtx, serverOverride string) (strin
 		server = serverOverride
 	}
 	if strings.Contains(template, "{remote_home}") && ctx.RemoteHome == "" {
-		return "", fmt.Errorf("storage_url uses {remote_home} but REMOTE_SITE_ID is not set; refusing to resolve a cross-site path to this site's own home")
+		return "", fmt.Errorf("storage_url uses {remote_home} but REMOTE_SITE is not set; refusing to resolve a cross-site path to this site's own home")
 	}
 	r := strings.NewReplacer(
 		"{server}", server,
