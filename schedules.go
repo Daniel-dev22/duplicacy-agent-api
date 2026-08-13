@@ -71,7 +71,8 @@ func newScheduler(cfg Config, client *http.Client, jobs *jobRegistry, repos *rep
 
 	s, err := kitsched.New(kitsched.Config{
 		// site scopes the pull to THIS agent's site so a cross-site-synced
-		// schedule for the other site's same-named host (e.g. kd-nuc vs ng-nuc)
+		// schedule for another site's same-named host (two sites can both
+		// have a host called "nuc01")
 		// isn't picked up here. Harmless before the controller filters on it
 		// (unknown param ignored); required once schedules sync cross-site.
 		PullURL:    fmt.Sprintf("%s/api/duplicacy/schedules?node=%s&site=%s", cfg.ControlCenterURL, cfg.NodeName, cfg.SiteID),

@@ -20,8 +20,8 @@ import (
 //     the pattern, and no wildcard is needed or wanted.
 //
 // Confirmed empirically against duplicacy's own matchPattern: the absolute form
-// `/home/user/custom_os_isos/` returns false against `custom_os_isos/`, and so
-// does `/home/user/custom_os_isos/*`. Appending a wildcard was never the fix.
+// `/home/user/os-images/` returns false against `os-images/`, and so
+// does `/home/user/os-images/*`. Appending a wildcard was never the fix.
 
 func TestAnchorPattern(t *testing.T) {
 	tests := []struct {
@@ -32,7 +32,7 @@ func TestAnchorPattern(t *testing.T) {
 		wantOK  bool
 	}{
 		// The reported bug: this rule had never matched anything.
-		{"absolute inside repo", "/home/user/custom_os_isos/", "/home/user", "custom_os_isos/", true},
+		{"absolute inside repo", "/home/user/os-images/", "/home/user", "os-images/", true},
 		{"absolute file inside repo", "/mnt/storage/x.iso", "/mnt/storage", "x.iso", true},
 		{"nested", "/srv/containers/homeassistant/home-assistant_v2.db", "/srv/containers",
 			"homeassistant/home-assistant_v2.db", true},
@@ -48,14 +48,14 @@ func TestAnchorPattern(t *testing.T) {
 		{"equals root with slash", "/home/user/", "/home/user", "", false},
 
 		{"trailing slash on root is tolerated", "/home/user/x/", "/home/user/", "x/", true},
-		{"already relative passes through", "custom_os_isos/", "/home/user", "custom_os_isos/", true},
+		{"already relative passes through", "os-images/", "/home/user", "os-images/", true},
 		{"relative wildcard passes through", "*.iso", "/home/user", "*.iso", true},
 		{"repo rooted at /", "/etc/shadow", "/", "etc/shadow", true},
 		{"empty pattern", "", "/home/user", "", false},
 
 		// Not anchorable by prefix. Dropping loses nothing: duplicacy could not
 		// have matched it in absolute form either.
-		{"wildcard in leading component", "/home/*/custom_os_isos/", "/home/user", "", false},
+		{"wildcard in leading component", "/home/*/os-images/", "/home/user", "", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -73,13 +73,13 @@ func TestAnchorPattern(t *testing.T) {
 func TestWriteRulesAnchorsAndAnnotates(t *testing.T) {
 	var b strings.Builder
 	writeRules(&b, []FilterRule{
-		{Position: 0, Action: "exclude", Pattern: "/home/user/custom_os_isos/"},
+		{Position: 0, Action: "exclude", Pattern: "/home/user/os-images/"},
 		{Position: 1, Action: "exclude", Pattern: "/mnt/storage/vms/"}, // other repo
 		{Position: 2, Action: "include", Pattern: "/home/user/keep.txt"},
 	}, "/home/user")
 
 	got := b.String()
-	for _, want := range []string{"-custom_os_isos/\n", "+keep.txt\n"} {
+	for _, want := range []string{"-os-images/\n", "+keep.txt\n"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("rendered file missing %q:\n%s", want, got)
 		}

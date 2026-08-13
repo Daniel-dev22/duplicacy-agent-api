@@ -2,7 +2,7 @@ package main
 
 // Bootstrap endpoint: POST /repos/init.
 //
-// Called by controller after a duplicacy_repos row has been inserted with
+// Called by the controller after a repo row has been inserted with
 // init_status='pending'. Body carries the list of storages and their plaintext
 // secrets (the only time plaintext secrets cross to the agent during bootstrap;
 // subsequent backup/restore/check/prune pulls from the controller).

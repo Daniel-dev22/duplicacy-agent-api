@@ -13,15 +13,15 @@ func TestValidateStorageURL(t *testing.T) {
 		wantErr     string // substring expected in err, "" = no error
 	}{
 		// SFTP
-		{"sftp ok", "sftp", "sftp://backup@nas.example.com:22//mnt/array/site-a_backup/duplicacy", ""},
+		{"sftp ok", "sftp", "sftp://backup@nas.example.com:22//mnt/array/site-ahome_backup/duplicacy", ""},
 		{"sftp ok default port", "sftp", "sftp://backup@nas.example.com//mnt/path", ""},
-		{"sftp missing scheme", "sftp", "duplicacy@host//path", "missing scheme"},
+		{"sftp missing scheme", "sftp", "backup@host//path", "missing scheme"},
 		{"sftp missing user", "sftp", "sftp://host:22//mnt/x", "missing username"},
 		{"sftp missing host", "sftp", "sftp://user@//mnt/x", "missing host"},
 		{"sftp single-slash path (the bug)", "sftp", "sftp://user@host:22/mnt/x", "missing double-slash"},
 		// S3 — Storj
-		{"storj US1 ok", "s3", "s3://US1@gateway.storjshare.io/site-a/kd-nas/duplicacy", ""},
-		{"storj missing region (the bug)", "s3", "s3://@gateway.storjshare.io/site-a/kd-nas/duplicacy", "missing region"},
+		{"storj US1 ok", "s3", "s3://US1@gateway.storjshare.io/site-ahome/site-a-nas/duplicacy", ""},
+		{"storj missing region (the bug)", "s3", "s3://@gateway.storjshare.io/site-ahome/site-a-nas/duplicacy", "missing region"},
 		{"storj typo region", "s3", "s3://us1@gateway.storjshare.io/bucket/path", "not in {US1,EU1,AP1}"},
 		// S3 — custom endpoint requires region
 		{"custom endpoint no region", "s3", "s3://wasabi.example.com/bucket/path", "must include region"},
@@ -42,7 +42,7 @@ func TestValidateStorageURL(t *testing.T) {
 		// reads the resolved URL from .duplicacy/preferences at runtime,
 		// the vended URL is never used as a literal connection target.
 		// Validation skips host/path/bucket shape for templated URLs.
-		{"templated sftp ok", "sftp", "sftp://backup@nas.{remote_home}apps.com:22//mnt/array/{home}_backup/duplicacy", ""},
+		{"templated sftp ok", "sftp", "sftp://backup@nas.example.net:22//mnt/array/{remote_home}/{home}_backup/duplicacy", ""},
 		{"templated b2 ok", "b2", "b2://{home}-bucket/prefix", ""},
 		{"templated gcs ok", "gcs", "gcs://{home}-bucket", ""},
 		// Storj S3 region IS a literal (never templated) — region check

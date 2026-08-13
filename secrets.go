@@ -59,7 +59,7 @@ func convertRSAPrivKeyToPKCS1(input []byte) []byte {
 	})
 }
 
-// SecretsBundle mirrors the JSON returned by controller's
+// SecretsBundle mirrors the JSON returned by the controller's
 // GET /api/duplicacy/credentials/:id/secrets-for-node/:node endpoint.
 type SecretsBundle struct {
 	StorageURL         string            `json:"storage_url"`
@@ -95,7 +95,7 @@ type buildEnvResult struct {
 // and duplicacy's env-var lookup uses preference.Name (utils.go:165-186) — so
 // for the primary we must emit unprefixed DUPLICACY_* even if the controller
 // gave us a non-"default" alias. Without this, a primary registered with
-// alias "kd-nas" would have its DUPLICACY_KD-NAS_SSH_KEY_FILE set but
+// alias "site-a-nas" would have its DUPLICACY_SITE-A-NAS_SSH_KEY_FILE set but
 // duplicacy would look up DUPLICACY_SSH_KEY_FILE — finding nothing, falling
 // to interactive prompt, failing init with "No private key file is provided".
 //

@@ -7,7 +7,7 @@ import (
 
 // TestBuildEnvPrimaryAliasNormalized — duplicacy's `init` command always names
 // the primary preference "default", so even if the controller passes a custom
-// alias for the primary (e.g. "kd-nas"), the env vars must use the bare
+// alias for the primary (e.g. "site-a-nas"), the env vars must use the bare
 // DUPLICACY_ prefix. Otherwise duplicacy looks up DUPLICACY_SSH_KEY_FILE,
 // finds nothing, prompts interactively, and init fails with "No private key
 // file is provided".
@@ -27,10 +27,10 @@ func TestBuildEnvPrimaryAliasNormalized(t *testing.T) {
 		wantKeyVarName string
 	}{
 		{"primary with default alias", "default", true, "DUPLICACY_", "DUPLICACY_SSH_KEY_FILE"},
-		{"primary with custom alias", "kd-nas", true, "DUPLICACY_", "DUPLICACY_SSH_KEY_FILE"},
+		{"primary with custom alias", "site-a-nas", true, "DUPLICACY_", "DUPLICACY_SSH_KEY_FILE"},
 		{"primary with empty alias", "", true, "DUPLICACY_", "DUPLICACY_SSH_KEY_FILE"},
 		{"secondary with default alias", "default", false, "DUPLICACY_", "DUPLICACY_SSH_KEY_FILE"},
-		{"secondary with custom alias", "kd-nas", false, "DUPLICACY_KD-NAS_", "DUPLICACY_KD-NAS_SSH_KEY_FILE"},
+		{"secondary with custom alias", "site-a-nas", false, "DUPLICACY_SITE-A-NAS_", "DUPLICACY_SITE-A-NAS_SSH_KEY_FILE"},
 		{"secondary with empty alias", "", false, "DUPLICACY_", "DUPLICACY_SSH_KEY_FILE"},
 	}
 

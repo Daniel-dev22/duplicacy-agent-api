@@ -133,9 +133,9 @@ func registerRoutes(r *gin.Engine, app *app) {
 	r.GET("/global-filters/cache", app.handleGlobalFiltersCache)
 	r.POST("/global-filters/refresh", app.handleGlobalFiltersRefresh)
 
-	// Internal: controller invalidates the agent's secrets cache when a
+	// Internal: the controller invalidates the agent's secrets cache when a
 	// credential is updated/deleted. Authenticated by the controller's mTLS
-	// client cert at the traefik-internal hop.
+	// client cert at the reverse-proxy hop — see the security note in README.
 	r.POST("/internal/credentials/:id/invalidate", app.handleInvalidateCredential)
 
 	r.GET("/schedules", app.handleListSchedules)

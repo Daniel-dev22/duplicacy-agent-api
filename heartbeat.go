@@ -11,10 +11,10 @@ package main
 // container, so a self-reported "I was down for X seconds" is the
 // closest the agent can get to a restart-cause indicator.
 //
-// Witness: 2026-05-27 02:50 — kd-pi agent restarted ~50 min into a
-// backup, leaving pi-home-user orphaned in 'running' state. There
-// was no log of WHY the agent restarted; without an existing heartbeat
-// file we have no baseline to compare against.
+// Witness: an agent restarted ~50 min into a backup, leaving that repo's
+// job orphaned in 'running' state. There was no log of WHY the agent
+// restarted; without an existing heartbeat file there is no baseline to
+// compare against.
 
 import (
 	"context"

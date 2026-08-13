@@ -27,17 +27,17 @@ type FilterRule struct {
 }
 
 // FilterSet is a named, scoped collection of FilterRules.
-// Pulled from controller; org and site sets apply across many repos.
+// Pulled from the controller; org and site sets apply across many repos.
 type FilterSet struct {
 	ID         string       `json:"id"`
 	Scope      string       `json:"scope"`       // "org" | "site" | "repo"
-	ScopeValue string       `json:"scope_value"` // "" for org, "kd"|"ng" for site, repoID for repo
+	ScopeValue string       `json:"scope_value"` // "" for org, site id for site, repoID for repo
 	Name       string       `json:"name"`
 	Rules      []FilterRule `json:"rules"`
 }
 
 // PerRepoFilters is what we persist locally for repo-specific rules
-// (separate from org/site sets which always come from controller).
+// (separate from org/site sets which always come from the controller).
 type PerRepoFilters struct {
 	RepoID    string       `json:"repo_id"`
 	Rules     []FilterRule `json:"rules"`
@@ -118,7 +118,7 @@ func (f *filterCache) saveCache() error {
 	return os.Rename(tmp, f.cachePath)
 }
 
-// pull fetches org+site filter sets from controller.
+// pull fetches org+site filter sets from the controller.
 func (f *filterCache) pull(ctx context.Context) error {
 	url := fmt.Sprintf("%s/api/duplicacy/filter-sets?node=%s&site=%s",
 		f.cfg.ControlCenterURL, f.cfg.NodeName, f.cfg.SiteID)
@@ -310,11 +310,11 @@ func scopeValueDisplay(v string) string {
 // RELATIVE and never carries a leading slash. Directories additionally get a
 // trailing "/". A stored pattern of
 //
-//	/home/user/custom_os_isos/
+//	/home/user/os-images/
 //
 // is therefore compared against
 //
-//	custom_os_isos/ubuntu/iso-root/sys/bus/workqueue/uevent
+//	os-images/ubuntu/iso-root/sys/bus/workqueue/uevent
 //
 // and cannot match — the very first byte disagrees. Verified against duplicacy's
 // own matcher: the absolute form returns false, and so does the absolute form

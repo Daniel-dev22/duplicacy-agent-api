@@ -1,10 +1,18 @@
 # syntax=docker/dockerfile:1.7
 #
 # BuildKit syntax directive required for the `--mount=type=secret` `go mod
-# download` below. The private agent-kit-go module is fetched using the GitHub
-# App token the build-agent provides as the `ghtoken` secret — a credential
-# helper reads it from the tmpfs mount at fetch time, so the token value never
-# lands in .gitconfig or any layer (the buildcache is pushed to the registry).
+# download` below.
+#
+# github.com/Daniel-dev22/agent-kit-go is a PRIVATE module, so this build needs
+# a GitHub token with read access to it, passed as the BuildKit secret
+# `ghtoken`. An inline credential helper reads it from the tmpfs mount at fetch
+# time, so the token value never lands in .gitconfig or in any image layer —
+# which matters because the build cache is pushed to a registry.
+#
+#   docker buildx build --secret id=ghtoken,env=GITHUB_TOKEN -t duplicacy-agent-api .
+#
+# `go build ./...` and `go test ./...` do not need any of this; only the
+# container build does. See README.md → "Build & run".
 FROM golang:1.26-alpine AS builder
 # Target Intel Haswell+ / AMD Excavator+ for FMA/AVX2 wins. Override
 # with --build-arg GOAMD64=v1 for older CPUs. No-op for arm64 builds.

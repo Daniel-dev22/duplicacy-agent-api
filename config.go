@@ -9,13 +9,18 @@ import (
 )
 
 type Config struct {
-	NodeName    string   // hostname-short this agent runs on (e.g. "nuc02")
-	SiteID      string   // "kd" | "ng"
-	BackupRoots []string // host paths to scan for .duplicacy repos (mirrored: host == container)
+	NodeName string // hostname-short this agent runs on (e.g. "nuc02")
+	SiteID   string // short id of the site this node belongs to (e.g. "site-a")
+	// RemoteSiteID is the peer site this deployment replicates to, used to
+	// expand the {remote_home} storage-URL placeholder. Optional: a
+	// single-site deployment leaves it unset and {remote_home} falls back to
+	// the local site's home. See template.go.
+	RemoteSiteID string
+	BackupRoots  []string // host paths to scan for .duplicacy repos (mirrored: host == container)
 	// BackupExcludePaths are path prefixes the repo scanner and tree walker
 	// skip entirely. Use to suppress dirs that contain a .duplicacy/ but are
 	// not user-managed repos — e.g. the Duplicacy Web Edition data dir
-	// (/srv/containers/duplicacy). The duplicacy-web cache layout
+	// (e.g. /srv/containers/duplicacy). The duplicacy-web cache layout
 	// (…/cache/localhost/N/.duplicacy) is excluded automatically regardless,
 	// so this is only needed to prune additional host-specific paths.
 	BackupExcludePaths []string
@@ -29,11 +34,12 @@ type Config struct {
 	LegacyBackuprootMap map[string]string
 	ComposeScanRoots    []string // bind-mounted (read-only) paths to scan for docker-compose project dirs
 	ConfigDir           string   // persistent state dir (events.sqlite, schedule cache, filter cache)
-	ControlCenterURL    string   // The agent always reaches controller-api via the host's
-	// Traefik (or k3s Traefik on cluster nodes). Traefik handles
-	// mTLS at the boundary; this code does not load or present any
-	// client certificate. Per-node identity is conveyed via the
-	// BearerToken loaded below.
+	// ControlCenterURL is the base URL of the central controller. The agent
+	// always reaches it through a reverse proxy (the host's Traefik, or the
+	// cluster's on Kubernetes nodes). That proxy terminates mTLS at the
+	// boundary; this code does not load or present any client certificate.
+	// Per-node identity is conveyed by the BearerToken loaded below.
+	ControlCenterURL string
 	TraefikDockerDNS string // Docker DNS name to resolve to local Traefik (default "traefik")
 	TraefikDialPort  string // port to dial on the resolved Traefik IP (default "1443")
 	DuplicacyBinary  string // path to duplicacy CLI (default /usr/local/bin/duplicacy)
@@ -114,20 +120,21 @@ func loadConfig() Config {
 	cfg := Config{
 		NodeName:            requireEnv("NODE_NAME"),
 		SiteID:              requireEnv("SITE_ID"),
+		RemoteSiteID:        getEnv("REMOTE_SITE_ID", ""),
 		BackupRoots:         splitCSV(requireEnv("BACKUP_ROOTS")),
 		BackupExcludePaths:  splitCSV(getEnv("BACKUP_EXCLUDE_PATHS", "")),
 		LegacyBackuprootMap: parseMountMap(getEnv("LEGACY_BACKUPROOT_MAP", "")),
 		ComposeScanRoots:    splitCSV(getEnv("COMPOSE_SCAN_ROOTS", "")),
 		ConfigDir:           getEnv("CONFIG_DIR", "/var/lib/duplicacy-agent-api"),
 		ControlCenterURL:    requireEnv("CONTROL_CENTER_URL"),
-		// Empty default — k3s nodes leave this unset and use direct mode
-		// (URL host resolved normally via Docker DNS, kube-proxy DNATs the
-		// cluster ClusterIP). NAS hosts must explicitly set this to
-		// "traefik" in their docker-compose env to opt into rewrite mode
-		// where the dialer ignores the URL and connects to the local
-		// docker Traefik so the host's mTLS ServersTransport can attach.
-		// Earlier default of "traefik" silently broke k3s nodes — every
-		// agent → controller call landed on the local Traefik (which
+		// Empty default — Kubernetes nodes leave this unset and use direct
+		// mode (URL host resolved normally, kube-proxy DNATs the cluster
+		// ClusterIP). A plain Docker host must explicitly set this to the
+		// DNS name of its local Traefik container to opt into rewrite mode,
+		// where the dialer ignores the URL host and connects to that
+		// container so the host's mTLS ServersTransport can attach.
+		// An earlier default of "traefik" silently broke cluster nodes —
+		// every agent → controller call landed on the local Traefik (which
 		// has no route for the cluster service hostname) and returned 404.
 		TraefikDockerDNS:   getEnv("TRAEFIK_DOCKER_DNS", ""),
 		TraefikDialPort:    getEnv("TRAEFIK_DIAL_PORT", "1443"),
@@ -167,8 +174,8 @@ func loadConfig() Config {
 }
 
 // readBearerToken reads the per-host bearer token from disk. The file is
-// provisioned by the duplicacy-agent-api ansible role at deploy time, mode
-// 0600, and bind-mounted into the agent container. Trailing whitespace is
+// provisioned by the deployment automation, mode 0600, and bind-mounted into
+// the agent container. Trailing whitespace is
 // stripped so a trailing newline from `printf` or `tee` doesn't break the
 // HTTP header.
 func readBearerToken(path string) (string, error) {

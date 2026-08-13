@@ -13,7 +13,7 @@ package main
 // bind-mounts a logs directory (LOG_DIR), the agent uses lumberjack to cap
 // file size + roll, and the host always has the same predictable path
 // regardless of Docker logging driver config. Operators can `tail -F
-// /srv/containers/duplicacy-agent-api/logs/agent.log` directly.
+// <LOG_DIR>/agent.log` directly.
 //
 // stderr is preserved — both sinks get the same records. So `docker logs`
 // still works for live debugging.

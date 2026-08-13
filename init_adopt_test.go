@@ -29,8 +29,8 @@ func TestReadPreferenceURLs(t *testing.T) {
 		t.Fatal(err)
 	}
 	prefs := `[
-	  {"name":"default","id":"nas-mnt-fast-storage","storage":"sftp://backup@nas.example.net:22//mnt/array/site-a_backup/servers/nas/duplicacy","encrypted":true},
-	  {"name":"storj","id":"nas-mnt-fast-storage","storage":"s3://US1@gateway.storjshare.io/site-a/kd-nas/duplicacy","encrypted":true}
+	  {"name":"default","id":"nas-mnt-storage","storage":"sftp://backup@nas.example.net:22//mnt/array/site-ahome_backup/servers/nas/duplicacy","encrypted":true},
+	  {"name":"storj","id":"nas-mnt-storage","storage":"s3://US1@gateway.storjshare.io/site-ahome/site-a-nas/duplicacy","encrypted":true}
 	]`
 	if err := os.WriteFile(filepath.Join(dir, ".duplicacy", "preferences"), []byte(prefs), 0o600); err != nil {
 		t.Fatal(err)
@@ -40,10 +40,10 @@ func TestReadPreferenceURLs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readPreferenceURLs: %v", err)
 	}
-	if got := m["default"]; got != "sftp://backup@nas.example.net:22//mnt/array/site-a_backup/servers/nas/duplicacy" {
+	if got := m["default"]; got != "sftp://backup@nas.example.net:22//mnt/array/site-ahome_backup/servers/nas/duplicacy" {
 		t.Errorf("default URL = %q", got)
 	}
-	if got := m["storj"]; got != "s3://US1@gateway.storjshare.io/site-a/kd-nas/duplicacy" {
+	if got := m["storj"]; got != "s3://US1@gateway.storjshare.io/site-ahome/site-a-nas/duplicacy" {
 		t.Errorf("storj URL = %q", got)
 	}
 	if len(m) != 2 {

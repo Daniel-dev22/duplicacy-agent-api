@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite" // pure-Go sqlite driver, works with CGO_ENABLED=0
 )
 
-// EventPayload is the body POSTed to controller.
+// EventPayload is the body POSTed to the controller.
 // Router deserializes into the same shape and writes to duplicacy_jobs / duplicacy_job_events.
 type EventPayload struct {
 	JobID       string    `json:"job_id"`
@@ -36,12 +36,12 @@ type EventPayload struct {
 	// rollup read every node as stale. nil ⇒ omitted ⇒ NULL on the controller.
 	StartedAt   *time.Time `json:"started_at,omitempty"`
 	CompletedAt *time.Time `json:"completed_at,omitempty"`
-	ExitCode    int       `json:"exit_code"`
-	ErrorMsg    string    `json:"error,omitempty"`
-	LineCount   int       `json:"line_count"`
-	ScheduleID  string    `json:"schedule_id,omitempty"`
-	TriggerKey  string    `json:"trigger_key,omitempty"`
-	EmittedAt   time.Time `json:"emitted_at"`
+	ExitCode    int        `json:"exit_code"`
+	ErrorMsg    string     `json:"error,omitempty"`
+	LineCount   int        `json:"line_count"`
+	ScheduleID  string     `json:"schedule_id,omitempty"`
+	TriggerKey  string     `json:"trigger_key,omitempty"`
+	EmittedAt   time.Time  `json:"emitted_at"`
 }
 
 // eventBuffer owns the agent's shared events.sqlite and wires three concerns on
@@ -205,7 +205,7 @@ func (e *eventBuffer) close() {
 
 // handleJobEvent is the JobEventHook registered with jobRegistry. It persists
 // the job to the local jobs table (restart-survival) and enqueues the event for
-// durable delivery to controller.
+// durable delivery to the controller.
 func (e *eventBuffer) handleJobEvent(j *Job, evt JobEvent) {
 	snap := j.snapshot()
 	payload := EventPayload{
@@ -304,10 +304,10 @@ const jobSelectCols = `id, repo_id, repo_path, action, storage_name, state,
 
 func scanJob(s interface{ Scan(...any) error }) (jobPublic, error) {
 	var (
-		jp                       jobPublic
-		action, state           string
-		startedNs, completedNs  int64
-		progress                []byte
+		jp                     jobPublic
+		action, state          string
+		startedNs, completedNs int64
+		progress               []byte
 	)
 	if err := s.Scan(&jp.ID, &jp.RepoID, &jp.RepoPath, &action, &jp.StorageName, &state,
 		&startedNs, &completedNs, &jp.ExitCode, &jp.ErrorMsg, &jp.LineCount,

@@ -8,8 +8,8 @@ import (
 func TestFireJitter(t *testing.T) {
 	cap := 60 * time.Second
 	// Deterministic: same input → same output
-	a := fireJitter("kd-pi", "abc-123", cap)
-	b := fireJitter("kd-pi", "abc-123", cap)
+	a := fireJitter("site-a-pi", "abc-123", cap)
+	b := fireJitter("site-a-pi", "abc-123", cap)
 	if a != b {
 		t.Fatalf("expected deterministic jitter, got %v vs %v", a, b)
 	}
@@ -20,7 +20,7 @@ func TestFireJitter(t *testing.T) {
 	// Different inputs spread across the window — no two of N=20 distinct
 	// (node, schedule) pairs collapse to the same nanosecond.
 	seen := make(map[time.Duration]string)
-	for _, n := range []string{"kd-nuc", "kd-pi", "kd-nas", "ng-nuc", "ng-pi"} {
+	for _, n := range []string{"site-a-nuc", "site-a-pi", "site-a-nas", "site-b-nuc", "site-b-pi"} {
 		for _, s := range []string{"sched-1", "sched-2", "sched-3", "sched-4"} {
 			j := fireJitter(n, s, cap)
 			if prev, ok := seen[j]; ok {

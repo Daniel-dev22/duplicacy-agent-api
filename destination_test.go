@@ -12,22 +12,26 @@ func TestDestinationKey(t *testing.T) {
 		wantKey   string
 		wantLabel string
 	}{
-		// SFTP — NAS host with user + path + the "nas." prefix
+		// SFTP — NAS host with user + path + the "nas." prefix. The label
+		// takes the first DNS label of what follows "nas."; the key keeps the
+		// full host.
 		{
 			"sftp://backup@nas.example.com/mnt/backups/repoA",
 			"sftp://nas.example.com",
-			"NAS (site-a)",
+			"NAS (example)",
 		},
+		// …and the port is dropped from the key, while a multi-label domain
+		// still yields only its first label.
 		{
-			"sftp://backup@nas.example.net:2222/mnt/backups/repoB",
-			"sftp://nas.example.net",
+			"sftp://backup@nas.site-b.example.net:2222/mnt/backups/repoB",
+			"sftp://nas.site-b.example.net",
 			"NAS (site-b)",
 		},
-		// SFTP — non-NAS host falls back to SFTP label
+		// SFTP — non-NAS host falls back to SFTP label with the full hostname
 		{
-			"sftp://backup@example.com/backups",
-			"sftp://example.com",
-			"SFTP (example.com)",
+			"sftp://backup@files.example.com/backups",
+			"sftp://files.example.com",
+			"SFTP (files.example.com)",
 		},
 
 		// S3 — Storj
@@ -41,12 +45,12 @@ func TestDestinationKey(t *testing.T) {
 			"s3://eu1.storj.io/cold-bucket",
 			"Storj (cold-bucket)",
 		},
-		// Storj's S3 gateway uses *.storjshare.io as the host (the form our
-		// actual repos use: s3://US1@gateway.storjshare.io/<bucket>/...).
-		// Pre-2026-05-28 this rendered as "S3 (site-a)" because the
-		// substring check was for "storj.io" not "storj".
+		// Storj's S3 gateway uses *.storjshare.io as the host
+		// (s3://US1@gateway.storjshare.io/<bucket>/...). This once rendered
+		// as a plain "S3 (...)" because the substring check was for
+		// "storj.io" rather than "storj".
 		{
-			"s3://US1@gateway.storjshare.io/site-a/kd-nas/duplicacy",
+			"s3://US1@gateway.storjshare.io/site-a/site-a-nas/duplicacy",
 			"s3://gateway.storjshare.io/site-a",
 			"Storj (site-a)",
 		},

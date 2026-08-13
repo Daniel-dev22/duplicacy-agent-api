@@ -1,4 +1,4 @@
-module duplicacy-agent-api
+module github.com/Daniel-dev22/duplicacy-agent-api
 
 go 1.26
 

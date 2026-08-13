@@ -41,7 +41,7 @@ import (
 func (a *app) prepareEnvForRepo(ctx context.Context, repo *Repo) ([]string, map[string]string, func(), error) {
 	mapping, ok := a.mapping.getByPath(repo.Path)
 	if !ok {
-		return nil, nil, func() {}, fmt.Errorf("no controller mapping for repo at %s — register it via the controller UI", repo.Path)
+		return nil, nil, func() {}, fmt.Errorf("no controller mapping for repo at %s — register it in the controller", repo.Path)
 	}
 	if len(mapping.Storages) == 0 {
 		return nil, nil, func() {}, fmt.Errorf("repo mapping for %s has no storages", repo.Path)

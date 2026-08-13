@@ -8,7 +8,7 @@ import "testing"
 // first `Snapshot … revision 1 …` row is concatenated onto the prompt. An
 // anchored `^Snapshot` regex dropped revision 1 entirely — hiding the oldest
 // revision from the list/retention/restore-picker for every RSA-encrypted
-// storage. (Surfaced by the controller duplicacy restore integration test.)
+// storage. (Surfaced by a restore integration test.)
 func TestParseListOutput(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -26,7 +26,7 @@ func TestParseListOutput(t *testing.T) {
 		},
 		{
 			name: "rsa passphrase prompt prepends revision 1 (no newline)",
-			out: "Storage set to sftp://duplicacy@nas:22//mnt/raid/duplicacy\n" +
+			out: "Storage set to sftp://backup@nas:22//mnt/array/duplicacy\n" +
 				"Enter the passphrase for /dev/shm/duplicacy-rsa-priv-921221753:" +
 				"Snapshot restore-test-nuc revision 1 created at 2026-06-13 21:13 -hash\n" +
 				"Snapshot restore-test-nuc revision 2 created at 2026-06-13 21:13\n" +

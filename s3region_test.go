@@ -9,9 +9,9 @@ func TestS3URLMissingRegion(t *testing.T) {
 		url         string
 		want        bool
 	}{
-		{"storj empty region (the bug, expanded)", "s3", "s3://@gateway.storjshare.io/site-a/kd-nuc/duplicacy", true},
+		{"storj empty region (the bug, expanded)", "s3", "s3://@gateway.storjshare.io/site-ahome/site-a-nuc/duplicacy", true},
 		{"custom endpoint no region no @", "s3", "s3://gateway.storjshare.io/bucket/path", true},
-		{"storj with region", "s3", "s3://US1@gateway.storjshare.io/site-a/kd-nuc/duplicacy", false},
+		{"storj with region", "s3", "s3://US1@gateway.storjshare.io/site-ahome/site-a-nuc/duplicacy", false},
 		{"wasabi with region", "s3", "s3://us-east-1@s3.wasabisys.com/bucket", false},
 		{"aws default host no region", "s3", "s3://amazon.com/bucket/path", false},
 		{"aws region@amazon", "s3", "s3://us-east-1@amazon.com/bucket", false},

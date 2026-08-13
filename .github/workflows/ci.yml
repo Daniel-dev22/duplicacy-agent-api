@@ -1,0 +1,32 @@
+# NOTE: this module depends on github.com/Daniel-dev22/agent-kit-go, which is a
+# private repository. `go vet` / `go test` therefore need a token with read
+# access to it before the module cache can be populated — set a `GOPRIVATE` +
+# credential step (or make agent-kit-go public) if you fork this and want CI to
+# go green.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: vet + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...

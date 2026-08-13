@@ -9,10 +9,11 @@ package main
 // "stat /home/user/path: no such file" which masks the real issue (the
 // path was supposed to be /home/user//abs/path).
 //
-// The agent invokes ValidateAllStorageURLs() once at boot AFTER mapping
-// load + vending; ANY validation failure aborts scheduler start. The
-// HTTP listener stays up so the controller can still reach the agent for
-// reinit / diagnostics.
+// ValidateStorageURL is called on the vend path (network.go), on every
+// credential bundle the controller returns, before the bundle reaches any
+// caller. A bad URL therefore fails fast with a clear, non-retryable error at
+// vend time rather than as a cryptic duplicacy CLI failure minutes later
+// inside a schedule fire.
 
 import (
 	"errors"

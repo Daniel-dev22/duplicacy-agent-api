@@ -74,9 +74,9 @@ func buildControlCenterClient(cfg Config) (*http.Client, error) {
 	}), nil
 }
 
-// fetchSecrets calls controller's vending endpoint for one credential.
+// fetchSecrets calls the controller's vending endpoint for one credential.
 // The bearer-auth round-tripper attaches the Authorization header
-// automatically; controller hashes the token, looks up the row in
+// automatically; the controller hashes the token, looks up the row in
 // duplicacy_node_tokens, and asserts the stored node matches :node.
 //
 // Transient failures (network error, 5xx) are retried with exponential

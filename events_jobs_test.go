@@ -44,7 +44,7 @@ func TestEventPayloadOmitsZeroCompletedAt(t *testing.T) {
 
 func newTestEventBuffer(t *testing.T) *eventBuffer {
 	t.Helper()
-	cfg := Config{ConfigDir: t.TempDir(), ControlCenterURL: "http://127.0.0.1:0", SiteID: "kd", NodeName: "nas"}
+	cfg := Config{ConfigDir: t.TempDir(), ControlCenterURL: "http://127.0.0.1:0", SiteID: "site-a", NodeName: "nas"}
 	e, err := newEventBuffer(cfg, &http.Client{})
 	if err != nil {
 		t.Fatalf("newEventBuffer: %v", err)
