@@ -232,6 +232,76 @@ func (f *filterCache) renderForRepo(repo *Repo) error {
 // here asserted the reverse ("rules later in the file override earlier ones"),
 // which is where the bug came from.
 //
+// AbsoluteExcludePrefixes returns org/site exclude rules that are plain absolute
+// directory prefixes, for the one consumer that matches on ABSOLUTE host paths —
+// the directory-size gatherer — rather than on duplicacy's repo-relative form.
+//
+// This exists because an exclusion the operator had already configured was silently
+// inert for that walker. `/home/daniel/custom_os_isos/` sat at position 0 of the org
+// set, and the gatherer consulted only BACKUP_EXCLUDE_PATHS / TREE_SIZE_EXCLUDE_PATHS
+// (env vars), so it walked into a leaked OS-image chroot every night. The rules were
+// doing their job for backups and nothing at all here.
+//
+// Deliberately conservative — this is a size-walk optimisation, and over-excluding
+// silently under-reports (the failure mode that looks like a correct answer):
+//
+//   - Only "exclude" actions. An include cannot be expressed as a skip.
+//   - Only absolute patterns. A relative pattern is repo-anchored and has no
+//     meaning against an absolute walk root.
+//   - Only glob-free patterns. Honouring `*`/`?`/`[` would require duplicacy's
+//     matcher semantics; a prefix match on a pattern containing a wildcard would
+//     exclude the wrong subtree.
+//   - An exclude is DROPPED if any include rule's literal prefix falls at or under
+//     it. duplicacy's MatchPath is first-match-wins, so an earlier include re-admits
+//     that subtree, and skipping it here would disagree with what the backup does.
+func (f *filterCache) AbsoluteExcludePrefixes() []string {
+	if f == nil {
+		return nil
+	}
+	f.mu.RLock()
+	sets := append([]FilterSet(nil), f.sets...)
+	f.mu.RUnlock()
+
+	var excludes, includes []string
+	for _, s := range sets {
+		for _, r := range s.Rules {
+			if !strings.HasPrefix(r.Pattern, "/") || containsGlob(r.Pattern) {
+				continue
+			}
+			switch r.Action {
+			case "exclude":
+				excludes = append(excludes, filepath.Clean(r.Pattern))
+			case "include":
+				includes = append(includes, filepath.Clean(r.Pattern))
+			}
+		}
+	}
+	if len(includes) == 0 {
+		return excludes
+	}
+	kept := excludes[:0]
+	for _, e := range excludes {
+		if !pathUnderAny2(includes, e) {
+			kept = append(kept, e)
+		}
+	}
+	return kept
+}
+
+// containsGlob reports whether a pattern carries duplicacy wildcard syntax.
+func containsGlob(p string) bool { return strings.ContainsAny(p, "*?[") }
+
+// pathUnderAny2 reports whether any of paths equals or is nested under prefix.
+// (The mirror of pathUnderAny, which asks the question the other way round.)
+func pathUnderAny2(paths []string, prefix string) bool {
+	for _, p := range paths {
+		if p == prefix || strings.HasPrefix(p, prefix+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
 // matchRoot is the repository root every pattern is anchored against; see
 // anchorPattern.
 func (f *filterCache) computeMerged(repoID, matchRoot string) string {
