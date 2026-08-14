@@ -317,3 +317,100 @@ func truncateForLog(b []byte) string {
 	}
 	return string(b)
 }
+
+// -----------------------------------------------------------------------------
+// Display depth is measured from the nearest ANCHOR (a backup root or a repo),
+// not from the walk root.
+//
+// trees.go caps a pushed tree at treeMaxDepth (5) below whatever it is rooted at,
+// and repos are not at the top. Measured on kd-nas01: backup root /mnt, repos at
+// /mnt/raid_array/kdhome_backup/duplicacy-relay (depth 4) and deeper — so a repo
+// tree spans absolute depths 5..9. Measuring from the backup root would drop the
+// sizes for the bottom half of that picker, and the UI renders a directory with
+// no size at all rather than an obviously wrong one, so nobody would notice.
+// -----------------------------------------------------------------------------
+
+func TestAnchorResetsTheDisplayDepthBudget(t *testing.T) {
+	root := t.TempDir()
+	// A repo four levels below the walk root, mirroring the kd-nas01 layout.
+	repo := filepath.Join(root, "raid_array", "kdhome_backup", "duplicacy-relay")
+	// One level below the repo: inside the picker's reach, outside a
+	// walk-root-relative budget of 2.
+	inside := filepath.Join(repo, "chunks")
+	if err := os.MkdirAll(inside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inside, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := boundCfg(2, 1_000_000, 0) // tiny depth budget, no size-based rescue
+	cfg.BackupRoots = []string{root}
+	cache := newDirSizeCache(t.TempDir())
+	g := &sizeGatherer{
+		cfg: cfg, cache: cache,
+		app:         &app{stop: make(chan struct{})},
+		lastAttempt: map[string]time.Time{},
+		anchors:     map[string]struct{}{root: {}, repo: {}}, // as rebuildAnchors would
+	}
+	if _, _, err := g.walk(context.Background(), root, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := cache.get(repo); !ok {
+		t.Error("the repo root itself must be cached")
+	}
+	if _, ok := cache.get(inside); !ok {
+		t.Fatal("a directory one level inside a repo was not cached — the repo " +
+			"picker would show it with no size")
+	}
+}
+
+// Without the anchor the same tree must NOT be cached, or the test above proves
+// nothing (it would pass on depth budget alone).
+func TestWithoutAnchorTheDeepRepoDirIsDropped(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "raid_array", "kdhome_backup", "duplicacy-relay")
+	inside := filepath.Join(repo, "chunks")
+	if err := os.MkdirAll(inside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inside, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := boundCfg(2, 1_000_000, 0)
+	cfg.BackupRoots = []string{root}
+	cache := newDirSizeCache(t.TempDir())
+	g := &sizeGatherer{
+		cfg: cfg, cache: cache,
+		app:         &app{stop: make(chan struct{})},
+		lastAttempt: map[string]time.Time{},
+		anchors:     map[string]struct{}{root: {}}, // repo NOT an anchor
+	}
+	if _, _, err := g.walk(context.Background(), root, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cache.get(inside); ok {
+		t.Fatal("without the repo anchor this dir should fall outside the depth " +
+			"budget; the anchor test would otherwise prove nothing")
+	}
+}
+
+// rebuildAnchors must at minimum promote every backup root, and tolerate a nil
+// repo index (tests and early boot) rather than panicking.
+func TestRebuildAnchorsIncludesRootsAndSurvivesNilRepos(t *testing.T) {
+	cfg := boundCfg(6, 100, 0)
+	cfg.BackupRoots = []string{"/home/daniel", "/docker_container_volumes/"}
+	g := &sizeGatherer{cfg: cfg, app: &app{stop: make(chan struct{})}}
+	g.rebuildAnchors()
+
+	for _, want := range []string{"/home/daniel", "/docker_container_volumes"} {
+		if !g.isAnchor(want) {
+			t.Errorf("%s should be an anchor (got %v)", want, g.anchors)
+		}
+	}
+	if g.isAnchor("/somewhere/else") {
+		t.Error("unrelated path must not be an anchor")
+	}
+}

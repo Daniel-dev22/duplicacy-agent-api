@@ -348,6 +348,9 @@ type sizeGatherer struct {
 	// stepN counts directories since the last throttle pause. Single-goroutine —
 	// the gatherer's loop is the only writer.
 	stepN int
+	// anchors is the set of paths a tree push can be rooted at; see rebuildAnchors.
+	// Refreshed each pass because repos are registered and removed at runtime.
+	anchors map[string]struct{}
 }
 
 func newSizeGatherer(cfg Config, cache *dirSizeCache, a *app) *sizeGatherer {
@@ -525,6 +528,9 @@ func (g *sizeGatherer) runPass(ctx context.Context) {
 		slog.Warn("dir size gatherer: mount guard unavailable, walking unguarded", "error", err)
 	}
 	g.guard = guard
+	// Repos come and go at runtime, so the anchor set is rebuilt per pass rather
+	// than captured once at construction.
+	g.rebuildAnchors()
 	// Log on the first pass and on every CHANGE thereafter, never every pass: a new
 	// leaked image mount must be visible in the agent log the night it appears, but
 	// a steady state must not reprint hourly.
@@ -604,6 +610,41 @@ func (g *sizeGatherer) summary() (int, int64) {
 //   - Its subtree is big enough that reusing it skips real work — either by file
 //     count, or because it was slow enough to have earned the daily cadence, which
 //     is precisely the signal that re-descending it is expensive.
+//
+// anchors are the paths a tree push can be ROOTED AT: every backup root and every
+// registered repo. Depth for the display test is measured from the nearest
+// enclosing anchor, not from the walk root.
+//
+// This is not a refinement, it is a correctness requirement. trees.go caps a
+// pushed tree at treeMaxDepth (5) BELOW WHATEVER IT IS ROOTED AT, and repos are
+// not at the top: on kd-nas01 the backup root is /mnt while repos sit at
+// /mnt/raid_array/kdhome_backup/duplicacy-relay (depth 4) and deeper. A repo tree
+// there spans absolute depths 5..9, so measuring from the backup root and keeping
+// six levels would silently drop the sizes for the bottom half of that picker —
+// the UI would render directories with no size at all.
+func (g *sizeGatherer) rebuildAnchors() {
+	a := make(map[string]struct{}, 8)
+	for _, r := range g.roots() {
+		a[filepath.Clean(r)] = struct{}{}
+	}
+	if g.app != nil && g.app.repos != nil {
+		for _, r := range g.app.repos.list() {
+			if r.Path != "" {
+				a[filepath.Clean(r.Path)] = struct{}{}
+			}
+			if r.SourcePath != "" {
+				a[filepath.Clean(r.SourcePath)] = struct{}{}
+			}
+		}
+	}
+	g.anchors = a
+}
+
+func (g *sizeGatherer) isAnchor(dir string) bool {
+	_, ok := g.anchors[dir]
+	return ok
+}
+
 func (g *sizeGatherer) worthCaching(depth int, e dirSize) bool {
 	if depth <= g.cfg.TreeSizeKeepDepth {
 		return true
@@ -627,6 +668,11 @@ func (g *sizeGatherer) worthCaching(depth int, e dirSize) bool {
 func (g *sizeGatherer) walk(ctx context.Context, dir string, depth int) (int64, int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, 0, err
+	}
+	// Entering a path a tree can be rooted at restarts the display-depth budget, so
+	// every node the picker can show from that root stays cached.
+	if g.isAnchor(dir) {
+		depth = 0
 	}
 	now := time.Now()
 	if e, ok := g.cache.get(dir); ok && now.Sub(e.computedAt()) < g.cadence(e) {
