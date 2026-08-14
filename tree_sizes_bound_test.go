@@ -265,14 +265,31 @@ func TestLegacyCacheIsNotReadAndIsReclaimed(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A VALID v2 file must coexist and win. Without this the test passes for the
+	// wrong reason: if `path` were (wrongly) the legacy name, load() would delete
+	// that file and then fail to read it, producing the same cold start and the
+	// same "legacy gone" — verifying the deletion rather than the versioning. A
+	// negative control caught exactly that.
+	v2 := filepath.Join(dir, dirSizeCacheFile)
+	if err := os.WriteFile(v2, []byte(`{"/b":{"b":777,"f":5,"t":1700000000}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	c := newDirSizeCache(dir)
 	c.load()
 
 	if _, ok := c.get("/a"); ok {
-		t.Fatal("v1 entry was loaded: Size() would report ok=true with bytes=0")
+		t.Error("v1 entry was loaded: Size() would report ok=true with bytes=0")
 	}
-	if c.len() != 0 {
-		t.Fatalf("expected a cold start, got %d entries", c.len())
+	got, ok := c.get("/b")
+	if !ok {
+		t.Fatal("the v2 file was not loaded — the cache is reading the wrong filename")
+	}
+	if got.Bytes != 777 || got.FileCount != 5 {
+		t.Errorf("v2 entry decoded wrong: %+v", got)
+	}
+	if c.len() != 1 {
+		t.Errorf("expected exactly the v2 entry, got %d", c.len())
 	}
 	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
 		t.Error("legacy cache file was not reclaimed (295 MB on kd-nas01)")
