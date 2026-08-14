@@ -14,15 +14,15 @@ import (
 
 // --- real lines, kd-pi, after the remediation reboot -------------------------------
 const (
-	realRootExt4    = `32 2 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw`
-	realBootVfat    = `127 32 8:1 / /boot/firmware rw,relatime shared:172 - vfat /dev/sda1 rw,fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,errors=remount-ro`
-	realSysfs       = `27 32 0:24 / /sys rw,nosuid,nodev,noexec,relatime shared:6 - sysfs sysfs rw`
-	realProc        = `28 32 0:25 / /proc rw,nosuid,nodev,noexec,relatime shared:11 - proc proc rw`
-	realDevtmpfs    = `29 32 0:6 / /dev rw,nosuid,relatime shared:2 - devtmpfs udev rw,size=3687656k,nr_inodes=921914,mode=755,inode64`
-	realRunTmpfs    = `31 32 0:27 / /run rw,nosuid,nodev,noexec,relatime shared:5 - tmpfs tmpfs rw,size=798504k,mode=755,inode64`
-	realDockerOvl   = `941 32 0:65 / /var/lib/docker/overlay2/e70266a669f228ed76b94c683dad5d320fdba8434d6796653862d50c6602abc8/merged rw,relatime shared:464 - overlay overlay rw,lowerdir=/x,upperdir=/y,workdir=/z,nouserxattr`
-	realNsfs        = `934 239 0:4 mnt:[4026532568] /run/snapd/ns/lxd.mnt rw - nsfs nsfs rw`
-	realSnapSquash  = `49 32 7:0 / /snap/core22/2340 ro,nodev,relatime shared:92 - squashfs /dev/loop0 ro,errors=continue,threads=single`
+	realRootExt4   = `32 2 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw`
+	realBootVfat   = `127 32 8:1 / /boot/firmware rw,relatime shared:172 - vfat /dev/sda1 rw,fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,errors=remount-ro`
+	realSysfs      = `27 32 0:24 / /sys rw,nosuid,nodev,noexec,relatime shared:6 - sysfs sysfs rw`
+	realProc       = `28 32 0:25 / /proc rw,nosuid,nodev,noexec,relatime shared:11 - proc proc rw`
+	realDevtmpfs   = `29 32 0:6 / /dev rw,nosuid,relatime shared:2 - devtmpfs udev rw,size=3687656k,nr_inodes=921914,mode=755,inode64`
+	realRunTmpfs   = `31 32 0:27 / /run rw,nosuid,nodev,noexec,relatime shared:5 - tmpfs tmpfs rw,size=798504k,mode=755,inode64`
+	realDockerOvl  = `941 32 0:65 / /var/lib/docker/overlay2/e70266a669f228ed76b94c683dad5d320fdba8434d6796653862d50c6602abc8/merged rw,relatime shared:464 - overlay overlay rw,lowerdir=/x,upperdir=/y,workdir=/z,nouserxattr`
+	realNsfs       = `934 239 0:4 mnt:[4026532568] /run/snapd/ns/lxd.mnt rw - nsfs nsfs rw`
+	realSnapSquash = `49 32 7:0 / /snap/core22/2340 ro,nodev,relatime shared:92 - squashfs /dev/loop0 ro,errors=continue,threads=single`
 )
 
 // --- real lines, ng-pi, captured from the duplicacy-agent container's namespace ----

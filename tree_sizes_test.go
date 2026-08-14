@@ -55,7 +55,7 @@ func TestDirSizeWalkAccumulates(t *testing.T) {
 	cache := newDirSizeCache(dir)
 	g := newSizeGatherer(testSizeConfig(dir), cache, nil)
 
-	gotB, gotC, err := g.walk(context.Background(), root)
+	gotB, gotC, err := g.walk(context.Background(), root, 0)
 	if err != nil {
 		t.Fatalf("walk: %v", err)
 	}
@@ -108,9 +108,9 @@ func TestDirSizeWalkReusesNotDue(t *testing.T) {
 
 	// Seed `sub` with a fresh, deliberately-wrong cached total. Because it's
 	// within the small cadence window, the parent walk must reuse it verbatim.
-	cache.put(sub, dirSize{Bytes: 999, FileCount: 7, ComputedAt: time.Now()})
+	cache.put(sub, dirSize{Bytes: 999, FileCount: 7, ComputedAtS: time.Now().Unix()})
 
-	gotB, gotC, err := g.walk(context.Background(), root)
+	gotB, gotC, err := g.walk(context.Background(), root, 0)
 	if err != nil {
 		t.Fatalf("walk: %v", err)
 	}
@@ -146,15 +146,15 @@ func TestDirSizeDue(t *testing.T) {
 	if !g.due("/never/computed", now) {
 		t.Error("uncached path should be due")
 	}
-	cache.put("/fresh", dirSize{FileCount: 10, ComputedAt: now})
+	cache.put("/fresh", dirSize{FileCount: 10, ComputedAtS: now.Unix()})
 	if g.due("/fresh", now) {
 		t.Error("freshly computed small dir should not be due")
 	}
-	cache.put("/stale", dirSize{FileCount: 10, ComputedAt: now.Add(-7 * time.Hour)})
+	cache.put("/stale", dirSize{FileCount: 10, ComputedAtS: now.Add(-7 * time.Hour).Unix()})
 	if !g.due("/stale", now) {
 		t.Error("small dir older than 6h should be due")
 	}
-	cache.put("/bigrecent", dirSize{FileCount: 60000, ComputedAt: now.Add(-7 * time.Hour)})
+	cache.put("/bigrecent", dirSize{FileCount: 60000, ComputedAtS: now.Add(-7 * time.Hour).Unix()})
 	if g.due("/bigrecent", now) {
 		t.Error("large dir within 24h should not be due")
 	}
@@ -163,8 +163,8 @@ func TestDirSizeDue(t *testing.T) {
 func TestDirSizeCachePersistRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	c := newDirSizeCache(dir)
-	c.put("/a", dirSize{Bytes: 100, FileCount: 3, ComputedAt: time.Now().Truncate(time.Second)})
-	c.put("/b", dirSize{Bytes: 200, FileCount: 9, ComputedAt: time.Now().Truncate(time.Second)})
+	c.put("/a", dirSize{Bytes: 100, FileCount: 3, ComputedAtS: time.Now().Unix()})
+	c.put("/b", dirSize{Bytes: 200, FileCount: 9, ComputedAtS: time.Now().Unix()})
 	if err := c.save(); err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestDirSizeCachePersistRoundTrip(t *testing.T) {
 			t.Errorf("reloaded cache missing %s", p)
 			continue
 		}
-		if got.Bytes != want.Bytes || got.FileCount != want.FileCount || !got.ComputedAt.Equal(want.ComputedAt) {
+		if got.Bytes != want.Bytes || got.FileCount != want.FileCount || got.ComputedAtS != want.ComputedAtS {
 			t.Errorf("%s round-trip mismatch: got %+v want %+v", p, got, want)
 		}
 	}
@@ -210,7 +210,7 @@ func TestSizeGathererExcludePaths(t *testing.T) {
 	}
 
 	// Walking the parent must skip the excluded subtree (size + count).
-	b, c, err := g.walk(context.Background(), dir)
+	b, c, err := g.walk(context.Background(), dir, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
