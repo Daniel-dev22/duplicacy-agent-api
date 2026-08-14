@@ -58,10 +58,15 @@ import (
 var pseudoFSTypes = map[string]struct{}{
 	"autofs": {}, "binfmt_misc": {}, "bpf": {}, "cgroup": {}, "cgroup2": {},
 	"configfs": {}, "debugfs": {}, "devpts": {}, "devtmpfs": {}, "efivarfs": {},
-	"fusectl": {}, "hugetlbfs": {}, "mqueue": {}, "nsfs": {}, "overlay": {},
-	"proc": {}, "pstore": {}, "ramfs": {}, "rpc_pipefs": {}, "securityfs": {},
-	"selinuxfs": {}, "squashfs": {}, "sysfs": {}, "tmpfs": {}, "tracefs": {},
+	"fusectl": {}, "hugetlbfs": {}, "mqueue": {}, "nfsd": {}, "nsfs": {},
+	"overlay": {}, "proc": {}, "pstore": {}, "ramfs": {}, "resctrl": {},
+	"rpc_pipefs": {}, "securityfs": {}, "selinuxfs": {}, "squashfs": {},
+	"sysfs": {}, "tmpfs": {}, "tracefs": {},
 }
+
+// NOTE on what is deliberately ABSENT: nfs, cifs, zfs, btrfs, xfs, ext*, vfat and
+// fuse.* are real data filesystems and must stay walkable. The rule is "kernel
+// synthetic or container overlay", not "unfamiliar".
 
 // mountEntry is one line of /proc/self/mountinfo, reduced to what the guard needs.
 type mountEntry struct {
