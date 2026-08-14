@@ -182,6 +182,16 @@ type sizeGatherer struct {
 	// restart we simply re-attempt, which is correct.
 	lastAttempt map[string]time.Time
 	firstPass   bool
+
+	// guard classifies foreign mounts (pseudo filesystems, mounted disk images,
+	// orphaned dm targets) so the walk never descends into one. Rebuilt at the
+	// start of every pass because the mount table changes between passes — that is
+	// the whole point, an image build can leak a mount at any time. Nil is safe and
+	// means "no mount is skipped"; see runPass for why that degradation is correct.
+	guard *mountGuard
+	// lastGuardSig is the previous pass's skip set, so the summary logs on change
+	// rather than every pass.
+	lastGuardSig string
 }
 
 func newSizeGatherer(cfg Config, cache *dirSizeCache, a *app) *sizeGatherer {
@@ -207,13 +217,42 @@ func (g *sizeGatherer) roots() []string {
 		if _, ok := seen[r]; ok {
 			continue
 		}
-		if pathUnderAny(r, g.cfg.TreeSizeExcludePaths) {
-			continue // size-excluded mount (e.g. /var/lib/rancher/k3s)
+		if pathUnderAny(r, g.excludePaths()) {
+			continue // size-excluded (env var, or a controller-pushed filter rule)
 		}
 		seen[r] = struct{}{}
 		out = append(out, r)
 	}
 	return out
+}
+
+// excludePaths is the single exclusion list the gatherer honours: the two env-var
+// lists plus the absolute exclude rules from the controller-pushed filter sets.
+//
+// Merging them here rather than at each call site is the point. There were three
+// separate exclusion checks in walk() and two more in roots()/Start(), all reading
+// only the env vars — which is how a rule the operator set in the UI ended up
+// applying to backups but not to this walker.
+func (g *sizeGatherer) excludePaths() []string {
+	env := len(g.cfg.BackupExcludePaths) + len(g.cfg.TreeSizeExcludePaths)
+	var pushed []string
+	if g.app != nil {
+		pushed = g.app.filters.AbsoluteExcludePrefixes()
+	}
+	out := make([]string, 0, env+len(pushed))
+	out = append(out, g.cfg.BackupExcludePaths...)
+	out = append(out, g.cfg.TreeSizeExcludePaths...)
+	return append(out, pushed...)
+}
+
+// isDeadMountErr reports whether err means the backing store is gone rather than
+// the file being absent — a detached loop device, a dead NFS/CIFS server. These are
+// leaks worth naming: ENOENT is routine, EIO is not.
+func isDeadMountErr(err error) bool {
+	return errors.Is(err, unix.EIO) ||
+		errors.Is(err, unix.ESTALE) ||
+		errors.Is(err, unix.ENOTCONN) ||
+		errors.Is(err, unix.ENODEV)
 }
 
 // cadence returns the refresh interval for a cached entry: the daily interval
@@ -241,10 +280,16 @@ func (g *sizeGatherer) Start(ctx context.Context) {
 		return
 	}
 	g.cache.load()
-	// Drop any cached entries for now-excluded mounts (e.g. k3s sized before the
+	// Drop any cached entries for now-excluded paths (e.g. k3s sized before the
 	// exclude was added) so the picker stops showing their stale sizes.
-	if pruned := g.cache.prune(g.cfg.TreeSizeExcludePaths); pruned > 0 {
-		slog.Info("dir size cache: pruned size-excluded entries", "count", pruned, "excludes", g.cfg.TreeSizeExcludePaths)
+	//
+	// This now also covers the controller-pushed rules, which makes it self-healing:
+	// the 142,066 phantom keys under the leaked image chroot on ng-pi were already
+	// covered by an org exclude, so a boot after this change drops them without an
+	// operator deleting dir_sizes.json by hand.
+	excludes := g.excludePaths()
+	if pruned := g.cache.prune(excludes); pruned > 0 {
+		slog.Info("dir size cache: pruned size-excluded entries", "count", pruned, "excludes", excludes)
 		if err := g.cache.save(); err != nil {
 			slog.Warn("dir size cache save after prune failed", "error", err)
 		}
@@ -301,6 +346,24 @@ func (g *sizeGatherer) untilNextDue(now time.Time) time.Duration {
 // reusing cached totals for not-due subtrees. Persists after each root.
 func (g *sizeGatherer) runPass(ctx context.Context) {
 	now := time.Now()
+
+	// Rebuild the mount view for this pass. A failure here must NOT stop the pass:
+	// sizes are advisory (the tree push omits what it lacks), so degrading to
+	// "skip nothing" keeps the picker populated. It is logged at WARN because the
+	// walk is then unguarded, which is the state that produced the EXT4 errors.
+	guard, err := newMountGuard()
+	if err != nil {
+		slog.Warn("dir size gatherer: mount guard unavailable, walking unguarded", "error", err)
+	}
+	g.guard = guard
+	// Log on the first pass and on every CHANGE thereafter, never every pass: a new
+	// leaked image mount must be visible in the agent log the night it appears, but
+	// a steady state must not reprint hourly.
+	if sig := guard.signature(); g.firstPass || sig != g.lastGuardSig {
+		guard.logSummary()
+		g.lastGuardSig = sig
+	}
+
 	var walked int
 	for _, root := range g.roots() {
 		select {
@@ -368,6 +431,15 @@ func (g *sizeGatherer) walk(ctx context.Context, dir string) (int64, int64, erro
 	if err != nil {
 		// Unreadable (permissions, vanished). Record an empty entry so the
 		// scheduler backs off to cadence rather than retrying every minute.
+		//
+		// EIO/ESTALE/ENOTCONN mean the BACKING STORE is gone, not that a file was
+		// removed — a detached loop device, a dead NFS server. That is a leak worth
+		// naming: it is how the orphaned kpartx maps announced themselves, and it
+		// previously surfaced only as a kernel EXT4 error with no agent-side trace.
+		if isDeadMountErr(err) {
+			slog.Warn("dir size: unreadable mount, skipping subtree",
+				"dir", dir, "error", err)
+		}
 		g.cache.put(dir, dirSize{ComputedAt: now, LastWalkMS: time.Since(t0).Milliseconds()})
 		return 0, 0, nil
 	}
@@ -384,10 +456,16 @@ func (g *sizeGatherer) walk(ctx context.Context, dir string) (int64, int64, erro
 			continue // never follow symlinks (cycles / double-walks), like the tree walk
 		}
 		child := filepath.Join(dir, name)
-		if isDuplicacyWebCache(child) || pathUnderAny(child, g.cfg.BackupExcludePaths) || pathUnderAny(child, g.cfg.TreeSizeExcludePaths) {
+		if isDuplicacyWebCache(child) || pathUnderAny(child, g.excludePaths()) {
 			continue
 		}
 		if e.IsDir() {
+			// A foreign mount: pseudo filesystem, mounted disk image, or an
+			// orphaned dm target whose backing device is gone. Never descend.
+			if reason, skip := g.guard.SkipReason(child); skip {
+				slog.Debug("dir size: skipping mount", "dir", child, "reason", reason)
+				continue
+			}
 			cb, cc, cerr := g.walk(ctx, child)
 			if cerr != nil {
 				f.Close()
