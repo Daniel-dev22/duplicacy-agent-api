@@ -109,6 +109,24 @@ type Config struct {
 	TreeSizeSmallRefresh       time.Duration // cadence for normal dirs (≈4×/day)
 	TreeSizeWalkTimeout        time.Duration // per-root walk ceiling (resumes progressively next cadence)
 	TreeSizeStepSleep          time.Duration // gentle pause per directory to avoid hammering slow disks
+	// TreeSizeStepEvery spreads TreeSizeStepSleep over N directories instead of
+	// pausing after every one. The per-directory pause is a FIXED FLOOR on the walk:
+	// kd-nas01 has 1,248,152 directories, so 2ms each is ~42 minutes of pure sleep
+	// — past TreeSizeWalkTimeout (30m) before a single byte is read, which is why
+	// that walk could never finish in one pass. Sleeping once per 16 dirs keeps the
+	// same duty cycle against the disk while cutting the floor to ~2.6 minutes.
+	TreeSizeStepEvery int
+	// TreeSizeKeepDepth / TreeSizeKeepMinFiles bound the cache: an entry is kept
+	// only if it is shallow enough for the UI to read (annotateSizes cannot see
+	// past trees.go's treeMaxDepth=5) or big enough that reusing it skips real
+	// work. Measured on kd-nas01: 81.1% of 1,248,152 entries covered subtrees of
+	// under ten files, and 95.3% under a hundred.
+	TreeSizeKeepDepth    int
+	TreeSizeKeepMinFiles int64
+	// TreeSizeMaxEntries is the hard backstop. The filters above bound the cache in
+	// practice; this bounds it in principle. Eviction drops the smallest subtrees
+	// first and is always logged.
+	TreeSizeMaxEntries int
 	// TreeSizeExcludePaths are path prefixes the size gatherer skips entirely.
 	// Size-only: these still appear in the tree picker and are still backed up;
 	// they're just not walked for a recursive size. Use for large/churny mounts
@@ -158,6 +176,10 @@ func loadConfig() Config {
 		TreeSizeSmallRefresh:       getEnvDuration("TREE_SIZE_SMALL_REFRESH", 6*time.Hour),
 		TreeSizeWalkTimeout:        getEnvDuration("TREE_SIZE_WALK_TIMEOUT", 30*time.Minute),
 		TreeSizeStepSleep:          getEnvDuration("TREE_SIZE_STEP_SLEEP", 2*time.Millisecond),
+		TreeSizeStepEvery:          getEnvInt("TREE_SIZE_STEP_EVERY", 16),
+		TreeSizeKeepDepth:          getEnvInt("TREE_SIZE_KEEP_DEPTH", 6),
+		TreeSizeKeepMinFiles:       int64(getEnvInt("TREE_SIZE_KEEP_MIN_FILES", 100)),
+		TreeSizeMaxEntries:         getEnvInt("TREE_SIZE_MAX_ENTRIES", 200000),
 		TreeSizeExcludePaths:       splitCSV(getEnv("TREE_SIZE_EXCLUDE_PATHS", "")),
 	}
 	// Load bearer token from file once at startup. Missing/empty token is
