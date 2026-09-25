@@ -26,12 +26,26 @@ package main
 //   - All paths in emitted TreeNodes are the host-visible paths (reverse-
 //     translated from the container backup-root mount), so what the UI shows
 //     matches what the operator sees in a shell.
+//
+// Wire protocol — manifest first, then only what the controller lacks:
+//   1. POST <lane>/manifest with {key…, sha256} per tree. The controller
+//      touches every row it already holds byte for byte and answers `need`.
+//   2. POST <lane> with only the needed trees, gzip-encoded.
+// Before this every tree went up every 5 minutes: ~48 MB per tick from one
+// host (a 24 MB tree pushed as both a repo and a node tree) when one tree in
+// thirteen had changed. The hash is over the exact bytes sent in step 2 — the
+// controller stores the SHA-256 of what it receives, so any other encoding
+// would mismatch and re-send every tree forever.
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -343,15 +357,12 @@ func (w *treeWalker) annotateSizes(n *treeNode) {
 // -----------------------------------------------------------------------------
 
 type repoTreeOut struct {
-	Node       string    `json:"node"`
-	Site       string    `json:"site"`
-	RepoID     string    `json:"repo_id"`
-	SourcePath string    `json:"source_path"`
-	Tree       *treeNode `json:"tree"`
-}
-
-type repoTreesPushReq struct {
-	Trees []repoTreeOut `json:"trees"`
+	Node       string          `json:"node"`
+	Site       string          `json:"site"`
+	RepoID     string          `json:"repo_id"`
+	SourcePath string          `json:"source_path"`
+	SHA256     string          `json:"sha256,omitempty"`
+	Tree       json.RawMessage `json:"tree,omitempty"`
 }
 
 func (w *treeWalker) pushRepoTrees(ctx context.Context) error {
@@ -385,7 +396,10 @@ func (w *treeWalker) pushRepoTrees(ctx context.Context) error {
 			continue
 		}
 		w.annotateSizes(root)
-		sourcePath := source
+		raw, err := json.Marshal(root)
+		if err != nil {
+			return fmt.Errorf("encode repo tree %s: %w", source, err)
+		}
 		// Repo identity on the central side is the snapshot id (HostPath-derived
 		// resource), not the agent's short hash — match what the controller's
 		// duplicacy_repos table stores in repo_id.
@@ -397,15 +411,14 @@ func (w *treeWalker) pushRepoTrees(ctx context.Context) error {
 			Node:       w.cfg.NodeName,
 			Site:       w.cfg.SiteID,
 			RepoID:     repoID,
-			SourcePath: sourcePath,
-			Tree:       root,
+			SourcePath: source,
+			SHA256:     sha256Hex(raw),
+			Tree:       raw,
 		})
 	}
-	if len(out) == 0 {
-		return nil
-	}
-
-	return w.post(ctx, "/api/duplicacy/repo-trees", repoTreesPushReq{Trees: out})
+	return pushTreeLane(ctx, w.post, "/api/duplicacy/repo-trees", out,
+		func(t repoTreeOut) string { return t.RepoID },
+		func(t repoTreeOut) repoTreeOut { t.Tree = nil; return t })
 }
 
 // -----------------------------------------------------------------------------
@@ -413,14 +426,11 @@ func (w *treeWalker) pushRepoTrees(ctx context.Context) error {
 // -----------------------------------------------------------------------------
 
 type nodeTreeOut struct {
-	Node     string    `json:"node"`
-	Site     string    `json:"site"`
-	RootPath string    `json:"root_path"`
-	Tree     *treeNode `json:"tree"`
-}
-
-type nodeTreesPushReq struct {
-	Trees []nodeTreeOut `json:"trees"`
+	Node     string          `json:"node"`
+	Site     string          `json:"site"`
+	RootPath string          `json:"root_path"`
+	SHA256   string          `json:"sha256,omitempty"`
+	Tree     json.RawMessage `json:"tree,omitempty"`
 }
 
 func (w *treeWalker) pushNodeTrees(ctx context.Context) error {
@@ -435,28 +445,104 @@ func (w *treeWalker) pushNodeTrees(ctx context.Context) error {
 			continue
 		}
 		w.annotateSizes(root)
+		raw, err := json.Marshal(root)
+		if err != nil {
+			return fmt.Errorf("encode node tree %s: %w", hostRoot, err)
+		}
 		out = append(out, nodeTreeOut{
 			Node:     w.cfg.NodeName,
 			Site:     w.cfg.SiteID,
 			RootPath: hostRoot,
-			Tree:     root,
+			SHA256:   sha256Hex(raw),
+			Tree:     raw,
 		})
 	}
-	if len(out) == 0 {
+	return pushTreeLane(ctx, w.post, "/api/duplicacy/node-trees", out,
+		func(t nodeTreeOut) string { return t.RootPath },
+		func(t nodeTreeOut) nodeTreeOut { t.Tree = nil; return t })
+}
+
+// -----------------------------------------------------------------------------
+// Manifest-first lane push
+// -----------------------------------------------------------------------------
+
+func sha256Hex(b []byte) string {
+	s := sha256.Sum256(b)
+	return hex.EncodeToString(s[:])
+}
+
+// postFunc is treeWalker.post's shape, so the lane logic is testable against
+// a stub controller.
+type postFunc func(ctx context.Context, path string, body any, out any, gz bool) error
+
+// pushTreeLane sends the manifest (every item, hashes only), then only the
+// items the controller answered it needs, trees included, gzip-encoded.
+//
+// Every item stays in the manifest even when unchanged: that call is what
+// moves the row's last_seen_at, and the controller's reaper deletes a tree
+// nobody has reported for 30 minutes.
+//
+// manifestOf returns an item's manifest form: the same row with its tree
+// dropped (omitempty), so the manifest is a few hundred bytes.
+func pushTreeLane[T any](ctx context.Context, post postFunc, base string, items []T,
+	key func(T) string, manifestOf func(T) T) error {
+	if len(items) == 0 {
 		return nil
 	}
-
-	return w.post(ctx, "/api/duplicacy/node-trees", nodeTreesPushReq{Trees: out})
+	manifest := make([]T, len(items))
+	for i, it := range items {
+		manifest[i] = manifestOf(it)
+	}
+	var reply struct {
+		Need []json.RawMessage `json:"need"`
+	}
+	if err := post(ctx, base+"/manifest", map[string]any{"trees": manifest}, &reply, false); err != nil {
+		return fmt.Errorf("manifest: %w", err)
+	}
+	if len(reply.Need) == 0 {
+		return nil
+	}
+	want := make(map[string]struct{}, len(reply.Need))
+	for _, n := range reply.Need {
+		var e T
+		if err := json.Unmarshal(n, &e); err != nil {
+			return fmt.Errorf("manifest reply: %w", err)
+		}
+		want[key(e)] = struct{}{}
+	}
+	send := make([]T, 0, len(want))
+	for _, it := range items {
+		if _, ok := want[key(it)]; ok {
+			send = append(send, it)
+		}
+	}
+	if len(send) == 0 {
+		return nil
+	}
+	return post(ctx, base, map[string]any{"trees": send}, nil, true)
 }
 
 // -----------------------------------------------------------------------------
 // HTTP push
 // -----------------------------------------------------------------------------
 
-func (w *treeWalker) post(ctx context.Context, path string, body any) error {
+// post sends body as JSON (gzip-encoded when gz) and, when out is non-nil,
+// decodes the JSON reply into it.
+func (w *treeWalker) post(ctx context.Context, path string, body any, out any, gz bool) error {
 	buf := &bytes.Buffer{}
-	if err := json.NewEncoder(buf).Encode(body); err != nil {
+	var enc io.Writer = buf
+	var zw *gzip.Writer
+	if gz {
+		zw = gzip.NewWriter(buf)
+		enc = zw
+	}
+	if err := json.NewEncoder(enc).Encode(body); err != nil {
 		return fmt.Errorf("encode: %w", err)
+	}
+	if zw != nil {
+		if err := zw.Close(); err != nil {
+			return fmt.Errorf("gzip: %w", err)
+		}
 	}
 	url := strings.TrimRight(w.cfg.ControlCenterURL, "/") + path
 
@@ -468,6 +554,9 @@ func (w *treeWalker) post(ctx context.Context, path string, body any) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if gz {
+		req.Header.Set("Content-Encoding", "gzip")
+	}
 
 	resp, err := w.app.controlCenterClient.Do(req)
 	if err != nil {
@@ -476,6 +565,12 @@ func (w *treeWalker) post(ctx context.Context, path string, body any) error {
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("HTTP %d from %s", resp.StatusCode, path)
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out); err != nil {
+		return fmt.Errorf("decode reply from %s: %w", path, err)
 	}
 	return nil
 }
