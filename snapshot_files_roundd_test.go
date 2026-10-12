@@ -499,7 +499,7 @@ func TestCapEvictedMarkerIsReadmittedWhenTheCapChanges(t *testing.T) {
 	if want() {
 		t.Fatal("same cap, no room: must stay marked")
 	}
-	c.maxBytes = 9000
+	c.maxBytes = 3100 // changed, yet still no room for the 3000-byte row
 	if !want() {
 		t.Fatal("a changed cap must re-admit a cap_evicted marker")
 	}
