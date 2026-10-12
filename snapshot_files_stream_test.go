@@ -31,6 +31,7 @@ import (
 //	LISTSZ    bytes of repeated listing text to emit (default 1024)
 //	LISTSEQ   emit `seq 1 N` instead
 //	LISTRAND  emit ~N bytes of deterministic pseudo-random digits (poorly compressible)
+//	LISTIGNOREPIPE survive a closed output pipe (so only a kill ends the run)
 //	LISTFD    print which pipes stdout and stderr are
 //	LISTLOG   append "<files> <id> <storage>" per invocation
 //	LISTREVS  discovery `list` prints revisions 1..N for -id (FAILSTORAGE fails one storage)
@@ -51,6 +52,7 @@ if [ "$files" = 0 ] && [ -n "$LISTREVS" ]; then
   while [ "$i" -le "$LISTREVS" ]; do echo "Snapshot ${id:-snapX} revision $i created at 2026-06-02 12:00 -hash"; i=$((i+1)); done
   exit 0
 fi
+[ -n "$LISTIGNOREPIPE" ] && trap '' PIPE
 [ -n "$LISTFD" ] && echo "fd1=$(readlink /proc/$$/fd/1) fd2=$(readlink /proc/$$/fd/2)"
 echo "first-line-on-stderr" >&2
 if [ -n "$LISTRAND" ]; then

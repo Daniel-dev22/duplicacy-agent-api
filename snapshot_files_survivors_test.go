@@ -129,7 +129,7 @@ func TestSpoolWriteFailureStopsTheProcess(t *testing.T) {
 	setVar(t, &listSpoolFileMax, int64(4<<10))
 	setVar(t, &listWaitDelay, 300*time.Millisecond)
 	dir := filepath.Join(t.TempDir(), "sp")
-	inv := cliInvocation{RepoRoot: t.TempDir(), Args: []string{"list", "-files"}, EnvAdds: []string{"LISTRAND=3000000", "LISTSLEEP=20"}}
+	inv := cliInvocation{RepoRoot: t.TempDir(), Args: []string{"list", "-files"}, EnvAdds: []string{"LISTRAND=3000000", "LISTSLEEP=20", "LISTIGNOREPIPE=1"}}
 	t0 := time.Now()
 	_, _, err := runListFiles(context.Background(), bin, inv, time.Minute, dir, int(listSpoolMemMax))
 	if el := time.Since(t0); el > 6*time.Second {
@@ -343,7 +343,7 @@ func TestWarmSweepProtectsRowsOfReposThatDidNotFullyList(t *testing.T) {
 		{"repoA", "a", "snapA", []string{"default", "s2"}, true}, // default lists, s2 FAILS
 		{"repoB", "b", "snapB", []string{"default", "sB"}, true}, // lists everything
 		{"repoC", "c", "snapC", []string{"default"}, false},      // vend FAILS
-		{"repoD", "d", "snapD", []string{"default"}, true},       // lists, but never sB
+		{"repoD", "a0", "snapD", []string{"default"}, true},      // lists, but never sB; sorts BEFORE B
 	})
 	big := bytes.Repeat([]byte("seeded row text /a/b/c\n"), 300)
 	seed := func(snap string, rev int, storage, repo string) {
@@ -440,5 +440,24 @@ func TestResetListSpoolWiredAtStartup(t *testing.T) {
 	resetListSpool(dir)
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatal("leftover spool files survived startup reset")
+	}
+}
+
+func TestWarmerHoldsMaintSlotWhileListing(t *testing.T) {
+	bin := writeFakeList(t)
+	a, repo := newListTestApp(t, bin, 1, time.Second)
+	done := make(chan error, 1)
+	go func() {
+		done <- a.warmOneListing(context.Background(), repo, "default", "", "snapW", 5, []string{"LISTSZ=100", "LISTSLEEP=0.8"})
+	}()
+	time.Sleep(300 * time.Millisecond) // child is running
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if rel, ok := a.jobs.acquireMaint(ctx); ok {
+		rel()
+		t.Fatal("warm `list -files` ran without a maintenance slot")
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
