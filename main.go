@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -27,8 +28,17 @@ func main() {
 	// Derive the Go soft memory limit from the container cgroup limit so the GC
 	// tightens before the kernel OOM-killer acts. Before any DB or server starts.
 	if _, err := memlimit.Apply(ctx, slog.Default()); err != nil {
+		// A malformed reserve or a cgroup too small to derive a limit from would
+		// leave the process with no soft limit under a hard cap: refuse to start.
+		if errors.Is(err, memlimit.ErrInvalidConfig) {
+			slog.Error("memlimit: invalid configuration", "error", err)
+			os.Exit(1)
+		}
 		slog.Warn("memlimit: not applied", "error", err)
 	}
+	// Peak anonymous memory of the whole container (agent + every duplicacy
+	// child), exposed on /health/ready for sizing the cgroup cap.
+	anonPeak = memlimit.StartPeakAnon(ctx, slog.Default(), memlimit.PeakOptions{})
 
 	cfg := loadConfig()
 	slog.Info("duplicacy-agent-api starting",

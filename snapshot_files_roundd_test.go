@@ -159,6 +159,22 @@ func TestMarkerProblemsNeverSilenceWarmerOrReconcile(t *testing.T) {
 	}
 }
 
+func TestBrokenMarkerTableNeverSkipsRowReconcile(t *testing.T) {
+	ctx := context.Background()
+	c := newTestFilesCache(t, 0, 5)
+	putRaw(c, ctx, "snapA", 9, "default", "repoA", []byte("pruned\n"))
+	c.db.Exec(`DROP TABLE snapshot_files_uncacheable`)
+	c.db.Exec(`CREATE TABLE snapshot_files_uncacheable (x INTEGER)`) // wrong shape: scans fail, not "no such table"
+	st := newSweepState()
+	st.known["repoA"] = struct{}{}
+	st.swept[repoStorage{"repoA", "default"}] = struct{}{}
+	st.sweptStorage["default"] = struct{}{}
+	n, err := c.reconcileAgainstKeep(ctx, st)
+	if err != nil || n != 1 {
+		t.Fatalf("a broken marker table skipped the row reconcile: n=%d err=%v", n, err)
+	}
+}
+
 func TestRowCapMarkerIsReevaluatedWhenTheCapChanges(t *testing.T) {
 	ctx := context.Background()
 	c := newTestFilesCache(t, 0, 5)

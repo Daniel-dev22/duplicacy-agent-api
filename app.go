@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Daniel-dev22/agent-kit-go/jobstore"
+	"github.com/Daniel-dev22/agent-kit-go/memlimit"
 	"github.com/Daniel-dev22/agent-kit-go/reconcile"
 	kitsched "github.com/Daniel-dev22/agent-kit-go/scheduler"
 	"github.com/gin-gonic/gin"
@@ -320,8 +321,18 @@ func (a *app) startJobStateReconcile(ctx context.Context) {
 // --- placeholder handlers; real implementations replace these in subsequent tasks ---
 
 func (a *app) handleLiveness(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "alive"}) }
+
+// anonPeak samples the container's anonymous memory; set once in main.
+var anonPeak *memlimit.PeakAnon
+
 func (a *app) handleReadiness(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"status": "ready", "child_peak_rss_kb": childRSS.snapshot()})
+	body := gin.H{"status": "ready", "child_peak_rss_kb": childRSS.snapshot()}
+	if anonPeak != nil {
+		st := anonPeak.Stats()
+		body["anon_bytes"] = st.CurrentBytes
+		body["anon_peak_bytes"] = st.MaxBytes
+	}
+	c.JSON(http.StatusOK, body)
 }
 
 func notImplemented(c *gin.Context) {
