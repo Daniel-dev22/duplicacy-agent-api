@@ -18,6 +18,11 @@ type childRSSStats struct {
 	max map[string]int64 // kind -> max peak RSS KiB seen since start
 }
 
+// Caveat: Linux seeds a new process's ru_maxrss with the parent's RSS at fork, so a
+// child's figure is never below the agent's own RSS at spawn. Treat it as an upper
+// bound; the container's anonymous-memory peak (anon_peak_bytes on /health/ready)
+// is the number to size the cgroup cap from.
+//
 // childMaxRSSKB returns the child's peak RSS in KiB, or 0 if unknown.
 func childMaxRSSKB(ps *os.ProcessState) int64 {
 	if ps == nil {

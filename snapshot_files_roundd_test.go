@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -225,8 +226,17 @@ func TestChildRSSUnitsAreKiB(t *testing.T) {
 	a, repo := newListTestApp(t, bin, 1, time.Second)
 	serve(a, repo, 1, "", []string{"LISTSZ=100"}, nil)
 	kb := childRSS.snapshot()["list-files"]
-	if kb < 100 || kb > 200_000 { // a /bin/sh child: tens of MB at most, never GB
-		t.Fatalf("peak rss %d KiB is outside a plausible range (units wrong?)", kb)
+	// Linux seeds a child's ru_maxrss with the PARENT's RSS at fork, so the
+	// ceiling is the parent's own high-water mark, not a few MB.
+	var hwm int64
+	st, _ := os.ReadFile("/proc/self/status")
+	for _, l := range strings.Split(string(st), "\n") {
+		if f := strings.Fields(l); len(f) >= 2 && f[0] == "VmHWM:" {
+			hwm, _ = strconv.ParseInt(f[1], 10, 64)
+		}
+	}
+	if kb < 100 || kb > 2*hwm+100_000 {
+		t.Fatalf("peak rss %d KiB is outside a plausible range (parent VmHWM %d KiB): units wrong?", kb, hwm)
 	}
 }
 
