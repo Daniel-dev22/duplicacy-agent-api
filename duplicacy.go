@@ -381,11 +381,8 @@ func (a *app) serveSnapshotFiles(c *gin.Context, repo *Repo, rev int, vend func(
 		Args:     args,
 		EnvAdds:  env,
 	}, listFilesTimeout, a.listSpoolDir(), a.listSpoolMemMax())
-	// The child is gone and the spool is complete: free the slot BEFORE talking
-	// to the client, so a reader that stalls cannot block other misses, the
-	// warmer, or (through the warmer) maintenance.
-	release()
 	if err != nil {
+		release() // nothing more to hold the slot for
 		switch {
 		case errors.Is(err, errSpoolCeiling):
 			if a.filesCache != nil && snapID != "" {
@@ -401,15 +398,19 @@ func (a *app) serveSnapshotFiles(c *gin.Context, repo *Repo, rev int, vend func(
 		return
 	}
 	defer res.close()
-	if _, werr := writeListing(c.Writer, res.spool.reader(), res.raw); werr != nil {
-		slog.Warn("list-files response aborted", append([]any{"error", werr}, logAttrs...)...)
-	}
-	// The listing is complete and immutable, so cache it even if the client left.
-	// Done after the response so the client does not wait for the SQLite write.
+	// The child is gone and the spool is complete. Cache it first (immutable, so
+	// worth keeping even if the client leaves, and a queued duplicate must find
+	// it), then free the slot BEFORE talking to the client so a reader that
+	// stalls cannot block other misses, the warmer, or (through the warmer)
+	// maintenance.
 	putCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 30*time.Second)
 	defer cancel()
 	if err := a.storeListing(putCtx, snapID, rev, storageKey, repo.ID, res); err != nil {
 		slog.Warn("list-files cache put failed", append([]any{"error", err}, logAttrs...)...)
+	}
+	release()
+	if _, werr := writeListing(c.Writer, res.spool.reader(), res.raw); werr != nil {
+		slog.Warn("list-files response aborted", append([]any{"error", werr}, logAttrs...)...)
 	}
 }
 

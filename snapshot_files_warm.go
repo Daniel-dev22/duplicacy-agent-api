@@ -113,8 +113,15 @@ func (a *app) warmListCacheSweep(ctx context.Context) {
 	// reconcileAgainstKeep). A repo whose vend or list failed goes in st.failed:
 	// its rows are exempt from reconcile and size eviction this sweep.
 	st := newSweepState()
+	repos := a.repos.list()
+	ids := make([]string, len(repos))
+	for i, r := range repos {
+		ids[i] = r.ID
+	}
+	a.filesCache.sweepBegin(ids)
+	defer a.filesCache.sweepEnd()
 
-	for _, repo := range a.repos.list() {
+	for _, repo := range repos {
 		if ctx.Err() != nil {
 			return
 		}
@@ -179,7 +186,12 @@ func (a *app) warmListCacheSweep(ctx context.Context) {
 			}
 		}
 		cleanup()
+		if _, bad := st.failed[repo.ID]; !bad {
+			a.filesCache.sweepRepoDone(repo.ID)
+		}
 	}
+	// From here only st.failed protects rows; no repo is "still pending".
+	a.filesCache.sweepEnd()
 
 	// One reconcile against the whole sweep's keep-set: removes pruned revisions
 	// AND any snapshot this node no longer warms (e.g. foreign snapshots an edge

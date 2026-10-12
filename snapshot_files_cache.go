@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 )
 
@@ -28,6 +29,59 @@ type snapshotFilesCacheStore struct {
 	db        *sql.DB
 	maxBytes  int64 // size cap on SUM(gz_bytes); <=0 disables size eviction
 	warmKeepN int   // newest-N revisions per (snapshot_id, storage) pinned from size eviction
+
+	// pendingRepos are repos a running warm sweep has not finished with: until
+	// a repo's listing succeeds its outcome is unknown, so size eviction (which
+	// every put triggers) must not touch its rows.
+	pendingMu    sync.Mutex
+	pendingRepos map[string]struct{}
+}
+
+func (s *snapshotFilesCacheStore) sweepBegin(repoIDs []string) {
+	if s == nil {
+		return
+	}
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	s.pendingRepos = make(map[string]struct{}, len(repoIDs))
+	for _, id := range repoIDs {
+		s.pendingRepos[id] = struct{}{}
+	}
+}
+
+func (s *snapshotFilesCacheStore) sweepRepoDone(repoID string) {
+	if s == nil {
+		return
+	}
+	s.pendingMu.Lock()
+	delete(s.pendingRepos, repoID)
+	s.pendingMu.Unlock()
+}
+
+func (s *snapshotFilesCacheStore) sweepEnd() {
+	if s == nil {
+		return
+	}
+	s.pendingMu.Lock()
+	s.pendingRepos = nil
+	s.pendingMu.Unlock()
+}
+
+// evictExempt is the caller's exempt set plus the sweep's pending repos.
+func (s *snapshotFilesCacheStore) evictExempt(extra map[string]struct{}) map[string]struct{} {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	if len(s.pendingRepos) == 0 {
+		return extra
+	}
+	out := make(map[string]struct{}, len(s.pendingRepos)+len(extra))
+	for k := range s.pendingRepos {
+		out[k] = struct{}{}
+	}
+	for k := range extra {
+		out[k] = struct{}{}
+	}
+	return out
 }
 
 func newSnapshotFilesCacheStore(db *sql.DB, maxBytes int64, warmKeepN int) *snapshotFilesCacheStore {
@@ -252,6 +306,7 @@ func (s *snapshotFilesCacheStore) evictBySize(ctx context.Context, exemptRepos m
 		return nil
 	}
 	need := total - s.maxBytes
+	exemptRepos = s.evictExempt(exemptRepos)
 	pinN := s.effectivePinN(ctx)
 	hardKeep := min(maxPinRelaxedKeep, s.warmKeepN)
 
@@ -264,9 +319,9 @@ func (s *snapshotFilesCacheStore) evictBySize(ctx context.Context, exemptRepos m
 			       ) AS rn
 			FROM snapshot_files_cache
 		)
-		SELECT rid, gz_bytes, repo_id, rn <= ? AS pinned FROM ranked
-		 WHERE rn > ? ORDER BY pinned ASC, rn DESC, last_access ASC`,
-		pinN, hardKeep)
+		SELECT rid, gz_bytes, repo_id, rn FROM ranked
+		 WHERE rn > ? ORDER BY rn DESC, last_access ASC`,
+		hardKeep)
 	if err != nil {
 		return fmt.Errorf("cache evict scan: %w", err)
 	}
@@ -278,14 +333,14 @@ func (s *snapshotFilesCacheStore) evictBySize(ctx context.Context, exemptRepos m
 	for rows.Next() {
 		var rid, gzBytes int64
 		var repo string
-		var pinned bool
-		if err := rows.Scan(&rid, &gzBytes, &repo, &pinned); err != nil {
+		var rn int
+		if err := rows.Scan(&rid, &gzBytes, &repo, &rn); err != nil {
 			return fmt.Errorf("cache evict row: %w", err)
 		}
 		if _, ok := exemptRepos[repo]; ok {
 			continue
 		}
-		if pinned {
+		if rn <= pinN {
 			relaxed++
 		}
 		victims = append(victims, rid)

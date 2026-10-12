@@ -29,12 +29,33 @@ import (
 // stdout (so a split pipe would reorder bytes) and is driven through env:
 //
 //	LISTSZ    bytes of repeated listing text to emit (default 1024)
-//	LISTSEQ   emit `seq 1 N` instead (incompressible-ish)
+//	LISTSEQ   emit `seq 1 N` instead
+//	LISTRAND  emit ~N bytes of deterministic pseudo-random digits (poorly compressible)
+//	LISTFD    print which pipes stdout and stderr are
+//	LISTLOG   append "<files> <id> <storage>" per invocation
+//	LISTREVS  discovery `list` prints revisions 1..N for -id (FAILSTORAGE fails one storage)
 //	LISTSLEEP seconds to sleep after the first output
 //	LISTEXIT  exit status (default 0)
 const fakeListScript = `#!/bin/sh
+files=0; id=""; st=""; prev=""
+for a in "$@"; do
+  [ "$a" = "-files" ] && files=1
+  [ "$prev" = "-id" ] && id="$a"
+  [ "$prev" = "-storage" ] && st="$a"
+  prev="$a"
+done
+[ -n "$LISTLOG" ] && echo "$files $id $st" >> "$LISTLOG"
+if [ "$files" = 0 ] && [ -n "$LISTREVS" ]; then
+  if [ -n "$FAILSTORAGE" ] && [ "$st" = "$FAILSTORAGE" ]; then echo "storage unreachable" >&2; exit 1; fi
+  i=1
+  while [ "$i" -le "$LISTREVS" ]; do echo "Snapshot ${id:-snapX} revision $i created at 2026-06-02 12:00 -hash"; i=$((i+1)); done
+  exit 0
+fi
+[ -n "$LISTFD" ] && echo "fd1=$(readlink /proc/$$/fd/1) fd2=$(readlink /proc/$$/fd/2)"
 echo "first-line-on-stderr" >&2
-if [ -n "$LISTSEQ" ]; then
+if [ -n "$LISTRAND" ]; then
+  awk 'BEGIN{srand(42); n=int(ENVIRON["LISTRAND"]/10); for(i=0;i<n;i++) printf "%d\n", rand()*999999999}'
+elif [ -n "$LISTSEQ" ]; then
   seq 1 "$LISTSEQ"
 else
   yes "1234 2026-06-02 12:00:00 0123456789abcdef /some/path/to/a/file/in/the/revision" | head -c "${LISTSZ:-1024}"
@@ -56,11 +77,13 @@ func writeFakeList(t *testing.T) string {
 
 // hashRW is a ResponseWriter that retains nothing: SHA-256 and a byte count.
 type hashRW struct {
-	h      hash.Hash
-	hdr    http.Header
-	status int
-	n      int64
-	body   bytes.Buffer // only kept for non-200 (small JSON errors)
+	h       hash.Hash
+	hdr     http.Header
+	status  int
+	n       int64
+	body    bytes.Buffer // kept for non-200 (small JSON errors), or when keep is set
+	keep    bool
+	onWrite func()
 }
 
 func newHashRW() *hashRW { return &hashRW{h: sha256.New(), hdr: http.Header{}} }
@@ -72,8 +95,14 @@ func (w *hashRW) Write(p []byte) (int, error) {
 		w.status = 200
 	}
 	w.n += int64(len(p))
+	if w.onWrite != nil {
+		w.onWrite()
+	}
 	if w.status == 200 {
 		w.h.Write(p)
+		if w.keep {
+			w.body.Write(p)
+		}
 	} else {
 		w.body.Write(p)
 	}
@@ -171,44 +200,65 @@ func peakHeap() (stop func() uint64) {
 func TestListingMemoryIndependentOfSize(t *testing.T) {
 	bin := writeFakeList(t)
 	const bound = 24 << 20
+	// Poorly compressible input, with the RAM spool lowered so the gz really
+	// spills to disk (compressible text never reaches the spill path).
+	old := listSpoolMemMax
+	listSpoolMemMax = 1 << 20
+	t.Cleanup(func() { listSpoolMemMax = old })
+
 	var deltas []uint64
-	for _, size := range []int{8 << 20, 64 << 20} {
-		env := []string{"LISTSZ=" + strconv.Itoa(size)}
+	for _, tc := range []struct {
+		size   int
+		cached bool
+	}{{8 << 20, true}, {48 << 20, false}} {
+		env := []string{"LISTRAND=" + strconv.Itoa(tc.size)}
 		wantSum, wantN := referenceSum(t, bin, env...)
 		a, repo := newListTestApp(t, bin, 1, time.Second)
+		a.cfg.ListCacheRowMaxBytes = 6 << 20 // 8MB fits (gz ~3.5MB), 48MB does not
 
 		stop := peakHeap()
 		w := serve(a, repo, 3, "", env, nil)
 		delta := stop()
 
 		if w.status != 200 {
-			t.Fatalf("size %d: status %d body %s", size, w.status, w.body.String())
+			t.Fatalf("size %d: status %d body %s", tc.size, w.status, w.body.String())
 		}
 		if w.sum() != wantSum {
-			t.Fatalf("size %d: response sha != raw output sha", size)
+			t.Fatalf("size %d: response sha != raw output sha", tc.size)
 		}
 		if got := w.hdr.Get("Content-Length"); got != strconv.FormatInt(wantN, 10) || w.n != wantN {
-			t.Fatalf("size %d: Content-Length %s, body %d, want %d", size, got, w.n, wantN)
+			t.Fatalf("size %d: Content-Length %s, body %d, want %d", tc.size, got, w.n, wantN)
 		}
 		if delta > bound {
-			t.Fatalf("size %d: miss path peak heap growth %d MB > %d MB", size, delta>>20, bound>>20)
+			t.Fatalf("size %d: miss path peak heap growth %d MB > %d MB", tc.size, delta>>20, bound>>20)
 		}
 		deltas = append(deltas, delta)
-
-		// The same listing again is a cache hit: identical bytes, still bounded.
+		// The spill really happened (the dir exists) and was cleaned up.
+		ents, err := os.ReadDir(a.listSpoolDir())
+		if err != nil || len(ents) != 0 {
+			t.Fatalf("size %d: spill dir must exist (spill exercised) and be empty after: err=%v files=%d", tc.size, err, len(ents))
+		}
+		has, _ := a.filesCache.has(context.Background(), "snapA", 3, "default")
+		if has != tc.cached {
+			t.Fatalf("size %d: cached=%v, want %v", tc.size, has, tc.cached)
+		}
+		if !tc.cached {
+			continue
+		}
+		// A cache hit: identical bytes, still bounded.
 		stop = peakHeap()
 		w2 := serve(a, repo, 3, "", []string{"LISTEXIT=9"}, nil) // would fail if it ran
 		hitDelta := stop()
 		if w2.status != 200 || w2.sum() != wantSum || w2.n != wantN || w2.hdr.Get("Content-Length") != strconv.FormatInt(wantN, 10) {
-			t.Fatalf("size %d: hit path mismatch (status %d)", size, w2.status)
+			t.Fatalf("size %d: hit path mismatch (status %d)", tc.size, w2.status)
 		}
 		if hitDelta > bound {
-			t.Fatalf("size %d: hit path peak heap growth %d MB > %d MB", size, hitDelta>>20, bound>>20)
+			t.Fatalf("size %d: hit path peak heap growth %d MB > %d MB", tc.size, hitDelta>>20, bound>>20)
 		}
 	}
 	diff := int64(deltas[1]) - int64(deltas[0])
 	if diff > 32<<20 || diff < -(32<<20) {
-		t.Fatalf("heap growth depends on listing size: 8MB=%d 64MB=%d", deltas[0], deltas[1])
+		t.Fatalf("heap growth depends on listing size: 8MB=%d 48MB=%d", deltas[0], deltas[1])
 	}
 }
 
@@ -217,6 +267,7 @@ func TestKilledOrFailedListingNeverCached(t *testing.T) {
 	old := listFilesTimeout
 	listFilesTimeout = 400 * time.Millisecond
 	t.Cleanup(func() { listFilesTimeout = old })
+	setVar(t, &listWaitDelay, 300*time.Millisecond)
 
 	a, repo := newListTestApp(t, bin, 1, time.Second)
 	// Killed mid-run (timeout): partial output was produced, must not be a 200.

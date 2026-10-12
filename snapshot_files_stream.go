@@ -26,13 +26,18 @@ import (
 // inflated back out of the spool only after the process exited 0.
 
 const (
-	listSpoolMemMax = 32 << 20 // gz bytes kept in RAM before spilling to disk
 	listTailBytes   = 64 << 10 // output tail kept for error messages
 	listSpoolSubdir = "list-spool"
-	listWaitDelay   = 5 * time.Second
 )
 
 var (
+	// listSpoolMemMax is how many gz bytes stay in RAM before a listing spills
+	// to disk.
+	listSpoolMemMax int64 = 32 << 20
+	// listWaitDelay bounds how long Run waits for output pipes after the child
+	// was killed (a grandchild may still hold them).
+	listWaitDelay = 5 * time.Second
+
 	// listSpoolFileMax is the hard ceiling on one spilled gz listing.
 	listSpoolFileMax int64 = 2 << 30
 	// listFilesTimeout bounds one `list -files` run (var so tests can shrink it).
@@ -304,7 +309,7 @@ func (a *app) listSpoolMemMax() int {
 	if m := a.cfg.ListCacheRowMaxBytes; m > 0 && m < listSpoolMemMax {
 		return int(m)
 	}
-	return listSpoolMemMax
+	return int(listSpoolMemMax)
 }
 
 // storeListing caches a COMPLETE listing unless its gz exceeds the row cap,
