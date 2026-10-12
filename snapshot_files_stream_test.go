@@ -978,7 +978,14 @@ func liveCalls(body *ast.BlockStmt) map[string]bool {
 	out := map[string]bool{}
 	ast.Inspect(body, func(n ast.Node) bool {
 		if is, ok := n.(*ast.IfStmt); ok {
-			if id, ok := is.Cond.(*ast.Ident); ok && id.Name == "false" {
+			dead := false
+			ast.Inspect(is.Cond, func(n ast.Node) bool { // `if false`, `if false && x`
+				if id, ok := n.(*ast.Ident); ok && id.Name == "false" {
+					dead = true
+				}
+				return true
+			})
+			if dead {
 				if is.Else != nil {
 					for k := range liveCalls(&ast.BlockStmt{List: []ast.Stmt{is.Else}}) {
 						out[k] = true

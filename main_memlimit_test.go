@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"go/token"
 	"net/http"
 	"net/http/httptest"
@@ -48,12 +50,8 @@ func TestMainStartsPeakAnonAndTreatsInvalidConfigAsFatal(t *testing.T) {
 		t.Fatal("main must start the peak-anon sampler as a top-level statement")
 	}
 	live := liveCalls(body)
-	if !live["errors.Is"] || !live["Exit"] {
-		t.Fatal("main must errors.Is(err, memlimit.ErrInvalidConfig) and exit")
-	}
-	src, _ := os.ReadFile("main.go")
-	if !strings.Contains(string(src), "memlimit.ErrInvalidConfig") {
-		t.Fatal("fatal check must test memlimit.ErrInvalidConfig")
+	if !live["memlimitFatal"] || !live["Exit"] {
+		t.Fatal("main must exit when memlimitFatal(err)")
 	}
 	df, _ := os.ReadFile("Dockerfile")
 	if !strings.Contains(string(df), `LABEL agent.memlimit="1"`) {
@@ -80,5 +78,14 @@ func TestReadinessExposesAnonPeak(t *testing.T) {
 	}
 	if got["anon_bytes"] != float64(4096) || got["anon_peak_bytes"] != float64(4096) {
 		t.Fatalf("readiness lacks anon fields: %s", rec.Body.String())
+	}
+}
+
+func TestMemlimitFatalOnlyForInvalidConfig(t *testing.T) {
+	if !memlimitFatal(fmt.Errorf("wrapped: %w", memlimit.ErrInvalidConfig)) {
+		t.Fatal("ErrInvalidConfig (even wrapped) must be fatal")
+	}
+	if memlimitFatal(errors.New("cgroup file unreadable")) || memlimitFatal(nil) {
+		t.Fatal("environmental errors must not be fatal")
 	}
 }

@@ -30,7 +30,7 @@ func main() {
 	if _, err := memlimit.Apply(ctx, slog.Default()); err != nil {
 		// A malformed reserve or a cgroup too small to derive a limit from would
 		// leave the process with no soft limit under a hard cap: refuse to start.
-		if errors.Is(err, memlimit.ErrInvalidConfig) {
+		if memlimitFatal(err) {
 			slog.Error("memlimit: invalid configuration", "error", err)
 			os.Exit(1)
 		}
@@ -101,6 +101,9 @@ func main() {
 		slog.Error("HTTP shutdown error", "error", err)
 	}
 }
+
+// memlimitFatal reports whether a memlimit.Apply error must stop startup.
+func memlimitFatal(err error) bool { return errors.Is(err, memlimit.ErrInvalidConfig) }
 
 func registerRoutes(r *gin.Engine, app *app) {
 	r.GET("/health/live", app.handleLiveness)
