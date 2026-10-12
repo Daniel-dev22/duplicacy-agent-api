@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -109,26 +110,34 @@ func (a *app) warmListCacheSweep(ctx context.Context) {
 	var warmed int
 	capped := false
 	// Accumulated across the whole sweep, then reconciled ONCE at the end (see
-	// reconcileAgainstKeep): swept = storages we successfully listed; keep =
-	// every currently-existing (storage, snapshot_id, revision) discovered.
-	swept := map[string]struct{}{}
-	keep := map[string]struct{}{}
+	// reconcileAgainstKeep). A repo whose vend or list failed goes in st.failed:
+	// its rows are exempt from reconcile and size eviction this sweep.
+	st := newSweepState()
+	repos := a.repos.list()
+	ids := make([]string, len(repos))
+	for i, r := range repos {
+		ids[i] = r.ID
+	}
+	a.filesCache.sweepBegin(ctx, ids)
+	defer a.filesCache.sweepEnd()
 
-	for _, repo := range a.repos.list() {
+	for _, repo := range repos {
 		if ctx.Err() != nil {
 			return
 		}
+		st.known[repo.ID] = struct{}{}
 		env, rsaPriv, cleanup, err := a.prepareEnvForRepo(ctx, repo)
 		if err != nil {
 			slog.Warn("list-cache warm: vend secrets failed", "repo", repo.ID, "error", err)
+			st.failed[repo.ID] = struct{}{}
 			continue
 		}
-		for _, st := range repo.Storages {
+		for _, stg := range repo.Storages {
 			if ctx.Err() != nil {
 				cleanup()
 				return
 			}
-			storage := st.Name
+			storage := stg.Name
 			if storage == "" {
 				storage = "default"
 			}
@@ -140,29 +149,32 @@ func (a *app) warmListCacheSweep(ctx context.Context) {
 			live, err := a.warmListSnapshots(ctx, repo, storage, keyPath, env)
 			if err != nil {
 				slog.Warn("list-cache warm: list failed", "repo", repo.ID, "storage", storage, "error", err)
+				st.failed[repo.ID] = struct{}{}
 				continue
 			}
 			// Record what exists so the end-of-sweep reconcile keeps it. Only a
 			// successfully-listed storage is marked swept (a transient list error
 			// never purges that storage's cache).
-			swept[storage] = struct{}{}
+			st.swept[repoStorage{repo.ID, storage}] = struct{}{}
+			st.sweptStorage[storage] = struct{}{}
 			for _, sn := range live {
-				keep[storageSnapRevKey(storage, sn.SnapshotID, sn.Revision)] = struct{}{}
+				st.keep[storageSnapRevKey(storage, sn.SnapshotID, sn.Revision)] = struct{}{}
 			}
 
 			// 2. Warm the newest-N revisions per snapshot id that aren't cached.
+			ranks := map[string]int{}
 			for _, rev := range newestRevisionsPerSnapshot(live, keepN) {
 				if warmed >= maxWarmListsPerSweep {
 					capped = true
 					break
 				}
-				has, herr := a.filesCache.has(ctx, rev.SnapshotID, rev.Revision, storage)
-				if herr != nil {
-					slog.Warn("list-cache warm: has check failed", "error", herr)
+				want, werr := a.warmWanted(ctx, ranks, rev, repo.ID, storage)
+				if werr != nil {
+					slog.Warn("list-cache warm: check failed", "error", werr)
 					continue
 				}
-				if has {
-					continue // immutable ⇒ already correct
+				if !want {
+					continue
 				}
 				if werr := a.warmOneListing(ctx, repo, storage, keyPath, rev.SnapshotID, rev.Revision, env); werr != nil {
 					slog.Warn("list-cache warm: pre-list failed",
@@ -174,22 +186,72 @@ func (a *app) warmListCacheSweep(ctx context.Context) {
 			}
 		}
 		cleanup()
+		if _, bad := st.failed[repo.ID]; !bad {
+			a.filesCache.sweepRepoDone(repo.ID)
+		}
 	}
+	// From here only st.failed protects rows; no repo is "still pending".
+	a.filesCache.sweepEnd()
 
 	// One reconcile against the whole sweep's keep-set: removes pruned revisions
 	// AND any snapshot this node no longer warms (e.g. foreign snapshots an edge
 	// node used to over-warm via -all), without multi-repo thrashing.
-	reconciled, rerr := a.filesCache.reconcileAgainstKeep(ctx, swept, keep)
+	reconciled, rerr := a.filesCache.reconcileAgainstKeep(ctx, st)
 	if rerr != nil {
 		slog.Warn("list-cache reconcile failed", "error", rerr)
 	}
-	if err := a.filesCache.evictBySize(ctx); err != nil {
+	if err := a.filesCache.evictBySize(ctx, st.failed); err != nil {
 		slog.Warn("list-cache evict failed", "error", err)
 	}
 	rows, gzBytes, _ := a.filesCache.stats(ctx)
 	slog.Info("list-files cache warm sweep done",
 		"warmed", warmed, "reconciled", reconciled, "capped", capped,
 		"rows", rows, "gz_bytes", gzBytes)
+}
+
+// warmWanted decides whether to list one candidate (candidates arrive newest
+// first per snapshot; ranks counts them). It applies the SAME pinPolicy the
+// evictor protects with, re-read each time because every warmed listing can move
+// it, skips immutable revisions already cached, and skips revisions marked
+// permanently uncacheable.
+func (a *app) warmWanted(ctx context.Context, ranks map[string]int, rev Snapshot, repoID, storage string) (bool, error) {
+	rank := ranks[rev.SnapshotID]
+	ranks[rev.SnapshotID] = rank + 1
+	if rank >= a.filesCache.effectivePinN(ctx) {
+		return false, nil
+	}
+	has, err := a.filesCache.has(ctx, rev.SnapshotID, rev.Revision, storage)
+	if err != nil || has {
+		return false, err // immutable => already correct
+	}
+	m, err := a.filesCache.uncacheableInfo(ctx, repoID, storage, rev.SnapshotID, rev.Revision)
+	if err != nil {
+		// A marker lookup problem must not silence the warmer: list as if unmarked.
+		slog.Warn("list-cache warm: marker lookup failed, treating as unmarked", "error", err)
+		return true, nil
+	}
+	switch m.reason {
+	case "":
+		return true, nil
+	case uncacheableRowCap:
+		// the cap was raised since the marker was written
+		return m.gzBytes > 0 && m.gzBytes <= a.cfg.ListCacheRowMaxBytes, nil
+	case uncacheableCapEvicted:
+		// The size cap evicted it from the window. It is re-admitted when the cap
+		// changed, or when the cache has since shrunk enough (a snapshot was
+		// pruned) that the row fits under the cap again. The room test uses the
+		// actual total, so a row evicted for lack of room stays marked until room
+		// really appears and the warmer cannot flap.
+		if m.capBytes != a.filesCache.maxBytes {
+			return true, nil
+		}
+		_, total, serr := a.filesCache.stats(ctx)
+		return serr == nil && total+m.gzBytes <= a.filesCache.maxBytes, nil
+	case uncacheableCeiling:
+		// the spool ceiling was raised since the marker was written
+		return m.capBytes != listSpoolFileMax, nil
+	}
+	return false, nil
 }
 
 // warmListArgs builds the discovery `duplicacy list` args that decide WHICH
@@ -251,13 +313,50 @@ func (a *app) warmOneListing(ctx context.Context, repo *Repo, storage, keyPath, 
 	if storage != "" && storage != "default" {
 		args = append(args, "-storage", storage)
 	}
-	out, err := a.runListGated(ctx, cliInvocation{
-		RepoRoot: repo.Path, Args: args, EnvAdds: env,
-	}, 5*time.Minute)
+	res, err := a.runWarmListing(ctx, repo, storage, snapshotID, rev, args, env)
 	if err != nil {
+		if errors.Is(err, errSpoolCeiling) {
+			// Permanent for this revision: stop re-running it every sweep.
+			if merr := a.filesCache.markUncacheable(ctx, repo.ID, storage, snapshotID, rev, uncacheableCeiling, 0, listSpoolFileMax); merr != nil {
+				slog.Warn("list-cache warm: marking uncacheable failed", "error", merr)
+			}
+		}
 		return err
 	}
-	return a.filesCache.put(ctx, snapshotID, rev, storage, repo.ID, out)
+	defer res.close()
+	return a.storeListing(ctx, snapshotID, rev, storage, repo.ID, res)
+}
+
+// runWarmListing runs one `list -files` while holding a maintenance slot AND a
+// listing slot. It never waits for the listing gate while holding the
+// maintenance slot (that would park check/prune behind an interactive miss):
+// the gate wait is bounded, and on timeout the maintenance slot is given back
+// before retrying. Both are released as soon as the child has exited.
+func (a *app) runWarmListing(ctx context.Context, repo *Repo, storage, snapshotID string, rev int, args, env []string) (*listResult, error) {
+	for {
+		relMaint, ok := a.jobs.acquireMaint(ctx)
+		if !ok {
+			return nil, ctx.Err()
+		}
+		relGate, err := a.listGate.acquire(ctx, true)
+		if err == nil {
+			defer relMaint()
+			defer relGate()
+			res, _, rerr := runListFiles(ctx, a.cfg.DuplicacyBinary, cliInvocation{
+				RepoRoot: repo.Path, Args: args, EnvAdds: env,
+			}, listFilesTimeout, a.listSpoolDir(), a.listSpoolMemMax())
+			return res, rerr
+		}
+		relMaint()
+		if !errors.Is(err, errListQueueTimeout) {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 // newestRevisionsPerSnapshot returns the newest keepN revisions for each

@@ -2,14 +2,39 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"testing"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+// getAll and putRaw are test conveniences over the streaming API (production
+// never materialises a listing).
+func getAll(c *snapshotFilesCacheStore, ctx context.Context, snap string, rev int, storage string) ([]byte, bool, error) {
+	l, hit, err := c.open(ctx, snap, rev, storage)
+	if err != nil || !hit {
+		return nil, false, err
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(l.gz))
+	if err != nil {
+		return nil, false, err
+	}
+	raw, err := io.ReadAll(zr)
+	return raw, err == nil, err
+}
+
+func putRaw(c *snapshotFilesCacheStore, ctx context.Context, snap string, rev int, storage, repoID string, raw []byte) error {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	zw.Write(raw)
+	zw.Close()
+	return c.putGzipped(ctx, snap, rev, storage, repoID, buf.Bytes(), int64(len(raw)))
+}
 
 func newTestFilesCache(t *testing.T, maxBytes int64, warmKeepN int) *snapshotFilesCacheStore {
 	t.Helper()
@@ -49,13 +74,13 @@ func TestFilesCacheRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	raw := []byte("1234 2026-06-02 12:00:00 abc /etc/passwd\n5678 2026-06-02 12:00:00 def /etc/hosts\n")
 
-	if _, hit, err := c.get(ctx, "snapA", 3, "default"); err != nil || hit {
+	if _, hit, err := getAll(c, ctx, "snapA", 3, "default"); err != nil || hit {
 		t.Fatalf("expected clean miss, got hit=%v err=%v", hit, err)
 	}
-	if err := c.put(ctx, "snapA", 3, "default", "repo1", raw); err != nil {
+	if err := putRaw(c, ctx, "snapA", 3, "default", "repo1", raw); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	got, hit, err := c.get(ctx, "snapA", 3, "default")
+	got, hit, err := getAll(c, ctx, "snapA", 3, "default")
 	if err != nil || !hit {
 		t.Fatalf("expected hit, got hit=%v err=%v", hit, err)
 	}
@@ -70,7 +95,7 @@ func TestFilesCacheRoundTrip(t *testing.T) {
 	if ok, _ := c.has(ctx, "snapA", 3, "storj"); ok {
 		t.Fatalf("has should be false for different storage")
 	}
-	if _, hit, _ := c.get(ctx, "snapA", 4, "default"); hit {
+	if _, hit, _ := getAll(c, ctx, "snapA", 4, "default"); hit {
 		t.Fatalf("different revision should miss")
 	}
 }
@@ -93,13 +118,13 @@ func TestFilesCacheEvictPinsNewestN(t *testing.T) {
 
 	base := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 	for rev := 1; rev <= 3; rev++ {
-		if err := c.put(ctx, "snapA", rev, "default", "repo1", append([]byte(fmt.Sprintf("rev%d\n", rev)), big...)); err != nil {
+		if err := putRaw(c, ctx, "snapA", rev, "default", "repo1", append([]byte(fmt.Sprintf("rev%d\n", rev)), big...)); err != nil {
 			t.Fatalf("put rev%d: %v", rev, err)
 		}
 		// Older revision = older access; rev3 (newest) accessed most recently.
 		setLastAccess(t, c, "snapA", rev, "default", base.Add(time.Duration(rev)*time.Hour))
 	}
-	if err := c.evictBySize(ctx); err != nil {
+	if err := c.evictBySize(ctx, nil); err != nil {
 		t.Fatalf("evict: %v", err)
 	}
 
@@ -119,7 +144,7 @@ func TestReconcileAgainstKeep(t *testing.T) {
 	c := newTestFilesCache(t, 0, 5)
 	ctx := context.Background()
 	put := func(snap string, rev int, storage string) {
-		if err := c.put(ctx, snap, rev, storage, "repo", []byte(fmt.Sprintf("%s-%d\n", snap, rev))); err != nil {
+		if err := putRaw(c, ctx, snap, rev, storage, "repo", []byte(fmt.Sprintf("%s-%d\n", snap, rev))); err != nil {
 			t.Fatalf("put %s r%d %s: %v", snap, rev, storage, err)
 		}
 	}
@@ -134,8 +159,13 @@ func TestReconcileAgainstKeep(t *testing.T) {
 	// A storage NOT swept this round must be untouched even if absent from keep.
 	put("snapA", 1, "remote-nas")
 
-	swept := map[string]struct{}{"storj": {}, "default": {}}
-	keep := map[string]struct{}{}
+	st := newSweepState()
+	st.known["repo"] = struct{}{}
+	st.swept[repoStorage{"repo", "storj"}] = struct{}{}
+	st.swept[repoStorage{"repo", "default"}] = struct{}{}
+	st.sweptStorage["storj"] = struct{}{}
+	st.sweptStorage["default"] = struct{}{}
+	keep := st.keep
 	for _, k := range []struct {
 		st, sn string
 		rev    int
@@ -147,7 +177,7 @@ func TestReconcileAgainstKeep(t *testing.T) {
 		keep[storageSnapRevKey(k.st, k.sn, k.rev)] = struct{}{}
 	}
 
-	n, err := c.reconcileAgainstKeep(ctx, swept, keep)
+	n, err := c.reconcileAgainstKeep(ctx, st)
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}

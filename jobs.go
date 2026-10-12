@@ -922,7 +922,10 @@ func (r *jobRegistry) spawn(jobCtx context.Context, cancel context.CancelFunc, j
 		default:
 			r.emit(j, EventFailed)
 		}
-		slog.Info("job terminal", "job", j.ID, "state", string(state))
+		pub := j.snapshot()
+		slog.Info("job terminal", "job", j.ID, "state", string(state),
+			"action", string(pub.Action), "repo", pub.RepoID,
+			"child_peak_rss_kb", childRSS.record("job:"+string(pub.Action), pub.RepoID, cmd.ProcessState, false))
 	}()
 
 	return nil

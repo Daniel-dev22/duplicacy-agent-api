@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -42,9 +44,9 @@ type cliInvocation struct {
 func (i cliInvocation) command(ctx context.Context, binary string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, binary, i.Args...)
 	cmd.Dir = i.RepoRoot
-	if len(i.EnvAdds) > 0 {
-		cmd.Env = append(os.Environ(), i.EnvAdds...)
-	}
+	// The agent's own GOMEMLIMIT must not reach a (Go) duplicacy child: each
+	// child would apply the parent's whole limit to itself.
+	cmd.Env = append(childBaseEnv(), i.EnvAdds...)
 	cmd.Stdin = strings.NewReader("\n")
 	return cmd
 }
@@ -60,10 +62,25 @@ func runSync(ctx context.Context, binary string, inv cliInvocation, timeout time
 	}
 	cmd := inv.command(ctx, binary)
 	out, err := cmd.CombinedOutput()
+	if len(inv.Args) > 0 {
+		childRSS.record("sync:"+inv.Args[0], inv.RepoRoot, cmd.ProcessState, false)
+	}
 	if err != nil {
 		return out, fmt.Errorf("duplicacy %s: %w (output: %s)", strings.Join(inv.Args, " "), err, truncate(string(out), 400))
 	}
 	return out, nil
+}
+
+// childBaseEnv is the agent's environment minus GOMEMLIMIT.
+func childBaseEnv() []string {
+	env := os.Environ()
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, "GOMEMLIMIT=") {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 func truncate(s string, n int) string {
@@ -246,6 +263,19 @@ func (a *app) handleSnapshotFiles(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "revision must be a positive integer"})
 		return
 	}
+	a.serveSnapshotFiles(c, repo, rev, func() ([]string, map[string]string, func(), error) {
+		return a.prepareEnvForRepo(c.Request.Context(), repo)
+	})
+}
+
+// serveSnapshotFiles answers a listing request. vend is called only on a cache
+// miss that won a listing slot.
+//
+// Memory: a listing is never held raw. A hit inflates the stored gz straight to
+// the client; a miss gzips into a spool while the process runs and inflates to
+// the client only after exit 0, so a killed listing is never served as a 200 nor
+// cached, and Content-Length is exact.
+func (a *app) serveSnapshotFiles(c *gin.Context, repo *Repo, rev int, vend func() ([]string, map[string]string, func(), error)) {
 	storage := c.Query("storage")
 
 	// Cache key uses the IMMUTABLE identity of the listing: the effective
@@ -261,16 +291,76 @@ func (a *app) handleSnapshotFiles(c *gin.Context) {
 	if snapID == "" {
 		snapID = repo.SnapshotID
 	}
+	logAttrs := []any{"repo", repo.ID, "snapshot_id", snapID, "rev", rev, "storage", storageKey}
+	// serveCached answers a hit and reports whether the request is finished.
+	// Hits are not behind the listing gate, but each holds one stored row in RAM
+	// while it inflates, so they have their own small bound.
+	serveCached := func() bool {
+		if a.filesCache == nil || snapID == "" {
+			return false
+		}
+		if has, herr := a.filesCache.has(c.Request.Context(), snapID, rev, storageKey); herr != nil || !has {
+			return false
+		}
+		rel, aerr := a.hitGate.acquire(c.Request.Context(), true)
+		if aerr != nil {
+			a.queueRefused(c, aerr)
+			return true
+		}
+		defer rel()
+		l, hit, cerr := a.filesCache.open(c.Request.Context(), snapID, rev, storageKey)
+		if cerr != nil {
+			slog.Warn("list-files cache get failed", append([]any{"error", cerr}, logAttrs...)...)
+			return false
+		}
+		if !hit {
+			return false
+		}
+		started, werr := writeListing(c.Writer, bytes.NewReader(l.gz), l.rawBytes)
+		if werr == nil {
+			return true
+		}
+		slog.Warn("list-files cache row unreadable, dropped", append([]any{"error", werr}, logAttrs...)...)
+		a.filesCache.drop(c.Request.Context(), snapID, rev, storageKey)
+		return started // headers already sent: the short body closes the connection
+	}
+	if serveCached() {
+		return
+	}
+
+	// Misses only are gated; hits above are not.
+	var release func()
+	for attempt := 0; ; attempt++ {
+		rel, gerr := a.listGate.acquire(c.Request.Context(), true)
+		if gerr != nil {
+			a.queueRefused(c, gerr)
+			return
+		}
+		// Another request may have cached it while we queued. A hit streams to
+		// the client, so give the listing slot back BEFORE serving it: a stalled
+		// reader of a duplicate open must not hold the only slot.
+		if attempt < 3 && a.filesCache != nil && snapID != "" {
+			if has, _ := a.filesCache.has(c.Request.Context(), snapID, rev, storageKey); has {
+				rel()
+				if serveCached() {
+					return
+				}
+				continue // evicted in between: queue again
+			}
+		}
+		release = rel
+		break
+	}
+	defer release()
 	if a.filesCache != nil && snapID != "" {
-		if raw, hit, cerr := a.filesCache.get(c.Request.Context(), snapID, rev, storageKey); cerr != nil {
-			slog.Warn("list-files cache get failed", "error", cerr, "repo", repo.ID, "snapshot_id", snapID, "rev", rev, "storage", storageKey)
-		} else if hit {
-			c.Data(http.StatusOK, "text/plain; charset=utf-8", raw)
+		// A ceiling marker is void once the ceiling has been raised.
+		if m, _ := a.filesCache.uncacheableInfo(c.Request.Context(), repo.ID, storageKey, snapID, rev); m.reason == uncacheableCeiling && m.capBytes == listSpoolFileMax {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "listing exceeds the spool ceiling and cannot be served"})
 			return
 		}
 	}
 
-	env, rsaPriv, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	env, rsaPriv, cleanup, err := vend()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
 		return
@@ -300,29 +390,51 @@ func (a *app) handleSnapshotFiles(c *gin.Context) {
 	if storage != "" {
 		args = append(args, "-storage", storage)
 	}
-	out, err := runSync(c.Request.Context(), a.cfg.DuplicacyBinary, cliInvocation{
+	res, tail, err := runListFiles(c.Request.Context(), a.cfg.DuplicacyBinary, cliInvocation{
 		RepoRoot: repo.Path,
 		Args:     args,
 		EnvAdds:  env,
-	}, 5*time.Minute)
+	}, listFilesTimeout, a.listSpoolDir(), a.listSpoolMemMax())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "output": string(out)})
+		release() // nothing more to hold the slot for
+		switch {
+		case errors.Is(err, errSpoolCeiling):
+			if a.filesCache != nil && snapID != "" {
+				_ = a.filesCache.markUncacheable(c.Request.Context(), repo.ID, storageKey, snapID, rev, uncacheableCeiling, 0, listSpoolFileMax)
+			}
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
+		case errors.Is(err, errSpoolFailed):
+			c.Header("Retry-After", "30")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "output": tail})
+		}
 		return
 	}
-	// Populate the cache off the hot path with a detached context (the request
-	// context is cancelled the moment we return c.Data, which would abort the
-	// write). Immutable key ⇒ safe to store unconditionally.
-	if a.filesCache != nil && snapID != "" {
-		cached := out
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := a.filesCache.put(ctx, snapID, rev, storageKey, repo.ID, cached); err != nil {
-				slog.Warn("list-files cache put failed", "error", err, "repo", repo.ID, "snapshot_id", snapID, "rev", rev, "storage", storageKey)
-			}
-		}()
+	defer res.close()
+	// The child is gone and the spool is complete. Cache it first (immutable, so
+	// worth keeping even if the client leaves, and a queued duplicate must find
+	// it), then free the slot BEFORE talking to the client so a reader that
+	// stalls cannot block other misses, the warmer, or (through the warmer)
+	// maintenance.
+	putCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 30*time.Second)
+	defer cancel()
+	if err := a.storeListing(putCtx, snapID, rev, storageKey, repo.ID, res); err != nil {
+		slog.Warn("list-files cache put failed", append([]any{"error", err}, logAttrs...)...)
 	}
-	c.Data(http.StatusOK, "text/plain; charset=utf-8", out)
+	release()
+	if _, werr := writeListing(c.Writer, res.spool.reader(), res.raw); werr != nil {
+		slog.Warn("list-files response aborted", append([]any{"error", werr}, logAttrs...)...)
+	}
+}
+
+// queueRefused answers a gate that did not admit the request: 503 + Retry-After
+// on a queue timeout; nothing when the client already left.
+func (a *app) queueRefused(c *gin.Context, err error) {
+	if errors.Is(err, errListQueueTimeout) {
+		c.Header("Retry-After", strconv.Itoa(max(1, int(a.cfg.ListQueueWait/time.Second))))
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "listing queue is full, retry shortly"})
+	}
 }
 
 // --- helpers used by the jobs subsystem ---

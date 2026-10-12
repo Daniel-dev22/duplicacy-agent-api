@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Daniel-dev22/agent-kit-go/logging"
+	"github.com/Daniel-dev22/agent-kit-go/memlimit"
 	"github.com/gin-gonic/gin"
 )
 
@@ -19,6 +21,24 @@ func main() {
 	// alongside stderr. See logging_setup.go for the rotation policy. No-op
 	// otherwise — stderr-only path is preserved for legacy deploys.
 	attachRotatingLogFile(os.Getenv("LOG_LEVEL"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Derive the Go soft memory limit from the container cgroup limit so the GC
+	// tightens before the kernel OOM-killer acts. Before any DB or server starts.
+	if _, err := memlimit.Apply(ctx, slog.Default()); err != nil {
+		// A malformed reserve or a cgroup too small to derive a limit from would
+		// leave the process with no soft limit under a hard cap: refuse to start.
+		if memlimitFatal(err) {
+			slog.Error("memlimit: invalid configuration", "error", err)
+			os.Exit(1)
+		}
+		slog.Warn("memlimit: not applied", "error", err)
+	}
+	// Peak anonymous memory of the whole container (agent + every duplicacy
+	// child), exposed on /health/ready for sizing the cgroup cap.
+	anonPeak = memlimit.StartPeakAnon(ctx, slog.Default(), memlimit.PeakOptions{})
 
 	cfg := loadConfig()
 	slog.Info("duplicacy-agent-api starting",
@@ -31,9 +51,6 @@ func main() {
 	// any DB so a "first boot" / "clean shutdown" / "long downtime" line
 	// is the very first record we emit for this boot.
 	reportBootGap(cfg)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	app, err := newApp(ctx, cfg)
 	if err != nil {
@@ -84,6 +101,9 @@ func main() {
 		slog.Error("HTTP shutdown error", "error", err)
 	}
 }
+
+// memlimitFatal reports whether a memlimit.Apply error must stop startup.
+func memlimitFatal(err error) bool { return errors.Is(err, memlimit.ErrInvalidConfig) }
 
 func registerRoutes(r *gin.Engine, app *app) {
 	r.GET("/health/live", app.handleLiveness)

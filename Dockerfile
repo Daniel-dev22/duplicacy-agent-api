@@ -62,4 +62,5 @@ COPY --from=builder /app/duplicacy-agent-api /usr/local/bin/duplicacy-agent-api
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
   CMD curl -sf http://localhost:8080/health/ready || exit 1
+LABEL agent.memlimit="1"
 ENTRYPOINT ["duplicacy-agent-api"]
