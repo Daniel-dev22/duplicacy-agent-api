@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -246,6 +248,19 @@ func (a *app) handleSnapshotFiles(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "revision must be a positive integer"})
 		return
 	}
+	a.serveSnapshotFiles(c, repo, rev, func() ([]string, map[string]string, func(), error) {
+		return a.prepareEnvForRepo(c.Request.Context(), repo)
+	})
+}
+
+// serveSnapshotFiles answers a listing request. vend is called only on a cache
+// miss that won a listing slot.
+//
+// Memory: a listing is never held raw. A hit inflates the stored gz straight to
+// the client; a miss gzips into a spool while the process runs and inflates to
+// the client only after exit 0, so a killed listing is never served as a 200 nor
+// cached, and Content-Length is exact.
+func (a *app) serveSnapshotFiles(c *gin.Context, repo *Repo, rev int, vend func() ([]string, map[string]string, func(), error)) {
 	storage := c.Query("storage")
 
 	// Cache key uses the IMMUTABLE identity of the listing: the effective
@@ -261,16 +276,47 @@ func (a *app) handleSnapshotFiles(c *gin.Context) {
 	if snapID == "" {
 		snapID = repo.SnapshotID
 	}
-	if a.filesCache != nil && snapID != "" {
-		if raw, hit, cerr := a.filesCache.get(c.Request.Context(), snapID, rev, storageKey); cerr != nil {
-			slog.Warn("list-files cache get failed", "error", cerr, "repo", repo.ID, "snapshot_id", snapID, "rev", rev, "storage", storageKey)
-		} else if hit {
-			c.Data(http.StatusOK, "text/plain; charset=utf-8", raw)
-			return
+	logAttrs := []any{"repo", repo.ID, "snapshot_id", snapID, "rev", rev, "storage", storageKey}
+	serveCached := func() bool {
+		if a.filesCache == nil || snapID == "" {
+			return false
 		}
+		l, hit, cerr := a.filesCache.open(c.Request.Context(), snapID, rev, storageKey)
+		if cerr != nil {
+			slog.Warn("list-files cache get failed", append([]any{"error", cerr}, logAttrs...)...)
+			return false
+		}
+		if !hit {
+			return false
+		}
+		started, werr := writeListing(c.Writer, bytes.NewReader(l.gz), l.rawBytes)
+		if werr == nil {
+			return true
+		}
+		slog.Warn("list-files cache row unreadable, dropped", append([]any{"error", werr}, logAttrs...)...)
+		a.filesCache.drop(c.Request.Context(), snapID, rev, storageKey)
+		return started // headers already sent: the short body closes the connection
+	}
+	if serveCached() {
+		return
 	}
 
-	env, rsaPriv, cleanup, err := a.prepareEnvForRepo(c.Request.Context(), repo)
+	// Misses only are gated; hits above are not.
+	release, gerr := a.listGate.acquire(c.Request.Context(), true)
+	if gerr != nil {
+		if errors.Is(gerr, errListQueueTimeout) {
+			c.Header("Retry-After", strconv.Itoa(max(1, int(a.cfg.ListQueueWait/time.Second))))
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "listing queue is full, retry shortly"})
+		}
+		return // client gone
+	}
+	defer release()
+	// Another request may have cached it while we queued.
+	if serveCached() {
+		return
+	}
+
+	env, rsaPriv, cleanup, err := vend()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "vend secrets: " + err.Error()})
 		return
@@ -300,29 +346,31 @@ func (a *app) handleSnapshotFiles(c *gin.Context) {
 	if storage != "" {
 		args = append(args, "-storage", storage)
 	}
-	out, err := runSync(c.Request.Context(), a.cfg.DuplicacyBinary, cliInvocation{
+	res, tail, err := runListFiles(c.Request.Context(), a.cfg.DuplicacyBinary, cliInvocation{
 		RepoRoot: repo.Path,
 		Args:     args,
 		EnvAdds:  env,
-	}, 5*time.Minute)
+	}, listFilesTimeout, a.listSpoolDir(), a.listSpoolMemMax())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "output": string(out)})
+		if errors.Is(err, errSpoolFailed) {
+			c.Header("Retry-After", "30")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "output": tail})
 		return
 	}
-	// Populate the cache off the hot path with a detached context (the request
-	// context is cancelled the moment we return c.Data, which would abort the
-	// write). Immutable key ⇒ safe to store unconditionally.
-	if a.filesCache != nil && snapID != "" {
-		cached := out
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := a.filesCache.put(ctx, snapID, rev, storageKey, repo.ID, cached); err != nil {
-				slog.Warn("list-files cache put failed", "error", err, "repo", repo.ID, "snapshot_id", snapID, "rev", rev, "storage", storageKey)
-			}
-		}()
+	defer res.close()
+	if _, werr := writeListing(c.Writer, res.spool.reader(), res.raw); werr != nil {
+		slog.Warn("list-files response aborted", append([]any{"error", werr}, logAttrs...)...)
 	}
-	c.Data(http.StatusOK, "text/plain; charset=utf-8", out)
+	// The listing is complete and immutable, so cache it even if the client left.
+	// Done after the response so the client does not wait for the SQLite write.
+	putCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 30*time.Second)
+	defer cancel()
+	if err := a.storeListing(putCtx, snapID, rev, storageKey, repo.ID, res); err != nil {
+		slog.Warn("list-files cache put failed", append([]any{"error", err}, logAttrs...)...)
+	}
 }
 
 // --- helpers used by the jobs subsystem ---

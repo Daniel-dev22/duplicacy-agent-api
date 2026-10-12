@@ -2,12 +2,11 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
+	"log/slog"
 	"time"
 )
 
@@ -38,38 +37,47 @@ func newSnapshotFilesCacheStore(db *sql.DB, maxBytes int64, warmKeepN int) *snap
 	return &snapshotFilesCacheStore{db: db, maxBytes: maxBytes, warmKeepN: warmKeepN}
 }
 
-// get returns the decompressed `list -files` output for the immutable key, or
-// (nil, false, nil) on a miss. On a hit it best-effort touches last_access so
-// the size-LRU keeps recently-used trees.
-func (s *snapshotFilesCacheStore) get(ctx context.Context, snapshotID string, rev int, storage string) ([]byte, bool, error) {
+// cachedListing is a stored row: the gzip stream plus the exact uncompressed
+// length (the response's Content-Length).
+type cachedListing struct {
+	gz       []byte
+	rawBytes int64
+}
+
+// open returns the stored row for the immutable key, or (nil, false, nil) on a
+// miss. It never inflates: the caller streams gunzip(gz) to the client. On a hit
+// it best-effort touches last_access so the size-LRU keeps recently-used trees.
+func (s *snapshotFilesCacheStore) open(ctx context.Context, snapshotID string, rev int, storage string) (*cachedListing, bool, error) {
 	if s == nil || s.db == nil {
 		return nil, false, nil
 	}
-	var gz []byte
+	var l cachedListing
 	err := s.db.QueryRowContext(ctx,
-		`SELECT gz_output FROM snapshot_files_cache
+		`SELECT gz_output, raw_bytes FROM snapshot_files_cache
 		  WHERE snapshot_id = ? AND revision = ? AND storage_name = ?`,
-		snapshotID, rev, storage).Scan(&gz)
+		snapshotID, rev, storage).Scan(&l.gz, &l.rawBytes)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("cache get: %w", err)
 	}
-	raw, err := gunzip(gz)
-	if err != nil {
-		// A corrupt blob is not a hit — drop it so the caller re-lists and
-		// re-caches cleanly rather than serving garbage.
-		_, _ = s.db.ExecContext(ctx,
-			`DELETE FROM snapshot_files_cache WHERE snapshot_id=? AND revision=? AND storage_name=?`,
-			snapshotID, rev, storage)
-		return nil, false, fmt.Errorf("cache gunzip: %w", err)
-	}
 	_, _ = s.db.ExecContext(ctx,
 		`UPDATE snapshot_files_cache SET last_access = ?
 		  WHERE snapshot_id = ? AND revision = ? AND storage_name = ?`,
 		time.Now().UTC(), snapshotID, rev, storage)
-	return raw, true, nil
+	return &l, true, nil
+}
+
+// drop removes a row that failed to inflate so the caller re-lists and
+// re-caches cleanly rather than serving garbage.
+func (s *snapshotFilesCacheStore) drop(ctx context.Context, snapshotID string, rev int, storage string) {
+	if s == nil || s.db == nil {
+		return
+	}
+	_, _ = s.db.ExecContext(ctx,
+		`DELETE FROM snapshot_files_cache WHERE snapshot_id=? AND revision=? AND storage_name=?`,
+		snapshotID, rev, storage)
 }
 
 // has reports whether the key is already cached (used by the warm sweep to
@@ -92,15 +100,11 @@ func (s *snapshotFilesCacheStore) has(ctx context.Context, snapshotID string, re
 	return true, nil
 }
 
-// put gzips and UPSERTs the listing, then enforces the size cap. raw is the
-// raw `duplicacy list -files` stdout exactly as served to clients.
-func (s *snapshotFilesCacheStore) put(ctx context.Context, snapshotID string, rev int, storage, repoID string, raw []byte) error {
+// putGzipped UPSERTs an already-gzipped COMPLETE listing, then enforces the
+// size cap. rawBytes is the uncompressed length of the listing as served.
+func (s *snapshotFilesCacheStore) putGzipped(ctx context.Context, snapshotID string, rev int, storage, repoID string, gz []byte, rawBytes int64) error {
 	if s == nil || s.db == nil {
 		return nil
-	}
-	gz, err := gzipBytes(raw)
-	if err != nil {
-		return fmt.Errorf("cache gzip: %w", err)
 	}
 	now := time.Now().UTC()
 	if _, err := s.db.ExecContext(ctx, `
@@ -114,18 +118,25 @@ func (s *snapshotFilesCacheStore) put(ctx context.Context, snapshotID string, re
 			gz_bytes    = excluded.gz_bytes,
 			cached_at   = excluded.cached_at,
 			last_access = excluded.last_access`,
-		snapshotID, rev, storage, repoID, gz, int64(len(raw)), int64(len(gz)), now, now,
+		snapshotID, rev, storage, repoID, gz, rawBytes, int64(len(gz)), now, now,
 	); err != nil {
 		return fmt.Errorf("cache put: %w", err)
 	}
-	return s.evictBySize(ctx)
+	return s.evictBySize(ctx, nil)
 }
 
+// maxPinRelaxedKeep is how many newest revisions per (snapshot_id, storage)
+// survive even when the pinned set alone exceeds the cap.
+const maxPinRelaxedKeep = 2
+
 // evictBySize deletes least-recently-accessed rows until SUM(gz_bytes) is back
-// under maxBytes, NEVER touching the newest-warmKeepN revisions per
-// (snapshot_id, storage_name) (the pinned warm set). Returns the number of
-// rows evicted. A no-op when the cap is disabled or not exceeded.
-func (s *snapshotFilesCacheStore) evictBySize(ctx context.Context) (err error) {
+// under maxBytes. Rows outside the newest-warmKeepN revisions per
+// (snapshot_id, storage_name) go first; if the pinned warm set alone still
+// exceeds the cap the pin is relaxed down to the newest maxPinRelaxedKeep (and
+// logged) so the cap is a real ceiling. Rows of exemptRepos (a repo whose
+// listing failed this sweep) are never evicted. A no-op when the cap is
+// disabled or not exceeded.
+func (s *snapshotFilesCacheStore) evictBySize(ctx context.Context, exemptRepos map[string]struct{}) (err error) {
 	if s == nil || s.db == nil || s.maxBytes <= 0 {
 		return nil
 	}
@@ -138,21 +149,22 @@ func (s *snapshotFilesCacheStore) evictBySize(ctx context.Context) (err error) {
 		return nil
 	}
 	need := total - s.maxBytes
+	hardKeep := min(maxPinRelaxedKeep, s.warmKeepN)
 
-	// Eligible = NOT in the newest-warmKeepN per (snapshot_id, storage_name),
-	// oldest last_access first. ROW_NUMBER ranks revisions newest-first so
-	// rn > warmKeepN is everything outside the pinned warm window.
+	// rn ranks revisions newest-first per (snapshot_id, storage_name). Eligible =
+	// rn > hardKeep; unpinned (rn > warmKeepN) ordered before relaxed-pinned.
 	rows, err := s.db.QueryContext(ctx, `
 		WITH ranked AS (
-			SELECT rowid AS rid, gz_bytes, last_access,
+			SELECT rowid AS rid, gz_bytes, last_access, repo_id,
 			       ROW_NUMBER() OVER (
 			           PARTITION BY snapshot_id, storage_name
 			           ORDER BY revision DESC
 			       ) AS rn
 			FROM snapshot_files_cache
 		)
-		SELECT rid, gz_bytes FROM ranked WHERE rn > ? ORDER BY last_access ASC`,
-		s.warmKeepN)
+		SELECT rid, gz_bytes, repo_id, rn <= ? AS pinned FROM ranked
+		 WHERE rn > ? ORDER BY pinned ASC, last_access ASC`,
+		s.warmKeepN, hardKeep)
 	if err != nil {
 		return fmt.Errorf("cache evict scan: %w", err)
 	}
@@ -160,10 +172,19 @@ func (s *snapshotFilesCacheStore) evictBySize(ctx context.Context) (err error) {
 
 	var victims []int64
 	var freed int64
+	relaxed := 0
 	for rows.Next() {
 		var rid, gzBytes int64
-		if err := rows.Scan(&rid, &gzBytes); err != nil {
+		var repo string
+		var pinned bool
+		if err := rows.Scan(&rid, &gzBytes, &repo, &pinned); err != nil {
 			return fmt.Errorf("cache evict row: %w", err)
+		}
+		if _, ok := exemptRepos[repo]; ok {
+			continue
+		}
+		if pinned {
+			relaxed++
 		}
 		victims = append(victims, rid)
 		freed += gzBytes
@@ -178,35 +199,51 @@ func (s *snapshotFilesCacheStore) evictBySize(ctx context.Context) (err error) {
 	if len(victims) == 0 {
 		return nil
 	}
+	if relaxed > 0 {
+		slog.Warn("list-files cache: pinned set exceeds cap, pin relaxed",
+			"max_bytes", s.maxBytes, "total_bytes", total, "pinned_rows_evicted", relaxed, "kept_per_snapshot", hardKeep)
+	}
 	return s.deleteByRowID(ctx, victims)
 }
 
-// reconcileAgainstKeep deletes cache rows that the warm sweep did NOT decide to
-// keep, scoped to the storages the sweep actually listed. It runs ONCE at the
-// end of a sweep against the union keep-set, rather than per-(repo,storage),
-// for two reasons:
+// repoStorage identifies one (repo, storage) listing target of a sweep.
+type repoStorage struct{ repoID, storage string }
+
+// sweepState is what a warm sweep learned, input to reconcileAgainstKeep.
+type sweepState struct {
+	swept        map[repoStorage]struct{} // (repo, storage) pairs successfully listed
+	sweptStorage map[string]struct{}      // storages some repo listed (for rows of repos no longer known)
+	failed       map[string]struct{}      // repos whose vend or list failed: rows are exempt from reconcile AND size eviction
+	known        map[string]struct{}      // repos present this sweep
+	keep         map[string]struct{}      // storageSnapRevKey for every discovered live revision
+}
+
+func newSweepState() *sweepState {
+	return &sweepState{
+		swept:        map[repoStorage]struct{}{},
+		sweptStorage: map[string]struct{}{},
+		failed:       map[string]struct{}{},
+		known:        map[string]struct{}{},
+		keep:         map[string]struct{}{},
+	}
+}
+
+// reconcileAgainstKeep deletes cache rows the warm sweep found no longer live,
+// run ONCE at the end of a sweep against the union keep-set (a per-repo
+// reconcile on a shared storage would delete the other repos' fresh rows).
 //
-//   - Correctness: a per-storage reconcile keyed on one repo's scoped `list`
-//     would delete other repos' entries on the same shared storage (default),
-//     so on a multi-repo node each repo's reconcile would nuke the others'
-//     freshly-warmed rows — the warm cache would thrash down to the
-//     last-processed repo every sweep.
-//   - Cleanup: a row in a swept storage that's in nobody's keep-set is either a
-//     pruned revision OR a snapshot this node no longer warms (e.g. an edge
-//     node that used to over-warm the whole shared pool). Both should go, so the
-//     node converges to exactly what it warms today.
-//
-// `swept` is the set of storages successfully listed this sweep (a storage whose
-// `list` errored is absent, so its rows are left untouched rather than wrongly
-// purged on a transient failure). `keep` holds storageSnapRevKey(...) for every
-// currently-existing (storage, snapshot_id, revision) discovered. Returns the
-// number of rows evicted.
-func (s *snapshotFilesCacheStore) reconcileAgainstKeep(ctx context.Context, swept, keep map[string]struct{}) (int, error) {
-	if s == nil || s.db == nil || len(swept) == 0 {
+// Deletion is scoped to (repo_id, storage): a row is judged only if ITS repo
+// listed ITS storage successfully this sweep. Cache rows are immutable, so a
+// transient failure (vend timeout, SFTP DNS) must never purge a repo's rows
+// just because another repo listed the same storage — those repos are in
+// st.failed and also exempt. Rows of a repo no longer known to the agent are
+// judged against any successful listing of their storage. Returns rows evicted.
+func (s *snapshotFilesCacheStore) reconcileAgainstKeep(ctx context.Context, st *sweepState) (int, error) {
+	if s == nil || s.db == nil || st == nil || len(st.sweptStorage) == 0 {
 		return 0, nil
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT rowid, storage_name, snapshot_id, revision FROM snapshot_files_cache`)
+		`SELECT rowid, repo_id, storage_name, snapshot_id, revision FROM snapshot_files_cache`)
 	if err != nil {
 		return 0, fmt.Errorf("reconcile scan: %w", err)
 	}
@@ -215,15 +252,22 @@ func (s *snapshotFilesCacheStore) reconcileAgainstKeep(ctx context.Context, swep
 	var victims []int64
 	for rows.Next() {
 		var rid int64
-		var storage, sid string
+		var repo, storage, sid string
 		var rev int
-		if err := rows.Scan(&rid, &storage, &sid, &rev); err != nil {
+		if err := rows.Scan(&rid, &repo, &storage, &sid, &rev); err != nil {
 			return 0, fmt.Errorf("reconcile row: %w", err)
 		}
-		if _, ok := swept[storage]; !ok {
-			continue // storage not listed this sweep — leave it alone
+		if _, bad := st.failed[repo]; bad {
+			continue
 		}
-		if _, ok := keep[storageSnapRevKey(storage, sid, rev)]; !ok {
+		if _, known := st.known[repo]; known {
+			if _, ok := st.swept[repoStorage{repo, storage}]; !ok {
+				continue // this repo did not list this storage — leave it alone
+			}
+		} else if _, ok := st.sweptStorage[storage]; !ok {
+			continue
+		}
+		if _, ok := st.keep[storageSnapRevKey(storage, sid, rev)]; !ok {
 			victims = append(victims, rid)
 		}
 	}
@@ -280,26 +324,4 @@ func (s *snapshotFilesCacheStore) stats(ctx context.Context) (rows int, gzBytes 
 // its storage + snapshot id + revision (the same tuple the cache is keyed on).
 func storageSnapRevKey(storage, snapshotID string, rev int) string {
 	return storage + "\x00" + snapshotID + "\x00" + fmt.Sprint(rev)
-}
-
-func gzipBytes(raw []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	if _, err := zw.Write(raw); err != nil {
-		zw.Close()
-		return nil, err
-	}
-	if err := zw.Close(); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-func gunzip(gz []byte) ([]byte, error) {
-	zr, err := gzip.NewReader(bytes.NewReader(gz))
-	if err != nil {
-		return nil, err
-	}
-	defer zr.Close()
-	return io.ReadAll(zr)
 }

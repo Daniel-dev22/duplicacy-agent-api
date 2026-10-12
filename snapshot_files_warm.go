@@ -38,6 +38,7 @@ const (
 // slot (see runListGated) so warming queues behind/beside check+prune rather
 // than piling onto the wave.
 func (a *app) runListCacheWarmer(ctx context.Context) {
+	cleanStaleSpool(a.listSpoolDir(), 15*time.Minute)
 	startup := time.NewTimer(listWarmStartupDelay)
 	defer startup.Stop()
 
@@ -109,26 +110,27 @@ func (a *app) warmListCacheSweep(ctx context.Context) {
 	var warmed int
 	capped := false
 	// Accumulated across the whole sweep, then reconciled ONCE at the end (see
-	// reconcileAgainstKeep): swept = storages we successfully listed; keep =
-	// every currently-existing (storage, snapshot_id, revision) discovered.
-	swept := map[string]struct{}{}
-	keep := map[string]struct{}{}
+	// reconcileAgainstKeep). A repo whose vend or list failed goes in st.failed:
+	// its rows are exempt from reconcile and size eviction this sweep.
+	st := newSweepState()
 
 	for _, repo := range a.repos.list() {
 		if ctx.Err() != nil {
 			return
 		}
+		st.known[repo.ID] = struct{}{}
 		env, rsaPriv, cleanup, err := a.prepareEnvForRepo(ctx, repo)
 		if err != nil {
 			slog.Warn("list-cache warm: vend secrets failed", "repo", repo.ID, "error", err)
+			st.failed[repo.ID] = struct{}{}
 			continue
 		}
-		for _, st := range repo.Storages {
+		for _, stg := range repo.Storages {
 			if ctx.Err() != nil {
 				cleanup()
 				return
 			}
-			storage := st.Name
+			storage := stg.Name
 			if storage == "" {
 				storage = "default"
 			}
@@ -140,14 +142,16 @@ func (a *app) warmListCacheSweep(ctx context.Context) {
 			live, err := a.warmListSnapshots(ctx, repo, storage, keyPath, env)
 			if err != nil {
 				slog.Warn("list-cache warm: list failed", "repo", repo.ID, "storage", storage, "error", err)
+				st.failed[repo.ID] = struct{}{}
 				continue
 			}
 			// Record what exists so the end-of-sweep reconcile keeps it. Only a
 			// successfully-listed storage is marked swept (a transient list error
 			// never purges that storage's cache).
-			swept[storage] = struct{}{}
+			st.swept[repoStorage{repo.ID, storage}] = struct{}{}
+			st.sweptStorage[storage] = struct{}{}
 			for _, sn := range live {
-				keep[storageSnapRevKey(storage, sn.SnapshotID, sn.Revision)] = struct{}{}
+				st.keep[storageSnapRevKey(storage, sn.SnapshotID, sn.Revision)] = struct{}{}
 			}
 
 			// 2. Warm the newest-N revisions per snapshot id that aren't cached.
@@ -179,11 +183,11 @@ func (a *app) warmListCacheSweep(ctx context.Context) {
 	// One reconcile against the whole sweep's keep-set: removes pruned revisions
 	// AND any snapshot this node no longer warms (e.g. foreign snapshots an edge
 	// node used to over-warm via -all), without multi-repo thrashing.
-	reconciled, rerr := a.filesCache.reconcileAgainstKeep(ctx, swept, keep)
+	reconciled, rerr := a.filesCache.reconcileAgainstKeep(ctx, st)
 	if rerr != nil {
 		slog.Warn("list-cache reconcile failed", "error", rerr)
 	}
-	if err := a.filesCache.evictBySize(ctx); err != nil {
+	if err := a.filesCache.evictBySize(ctx, st.failed); err != nil {
 		slog.Warn("list-cache evict failed", "error", err)
 	}
 	rows, gzBytes, _ := a.filesCache.stats(ctx)
@@ -251,13 +255,26 @@ func (a *app) warmOneListing(ctx context.Context, repo *Repo, storage, keyPath, 
 	if storage != "" && storage != "default" {
 		args = append(args, "-storage", storage)
 	}
-	out, err := a.runListGated(ctx, cliInvocation{
-		RepoRoot: repo.Path, Args: args, EnvAdds: env,
-	}, 5*time.Minute)
+	// Takes the listing gate IN ADDITION to the maintenance slot: the warmer and
+	// interactive misses together never exceed the listing budget.
+	release, ok := a.jobs.acquireMaint(ctx)
+	if !ok {
+		return ctx.Err()
+	}
+	defer release()
+	relGate, err := a.listGate.acquire(ctx, false)
 	if err != nil {
 		return err
 	}
-	return a.filesCache.put(ctx, snapshotID, rev, storage, repo.ID, out)
+	defer relGate()
+	res, _, err := runListFiles(ctx, a.cfg.DuplicacyBinary, cliInvocation{
+		RepoRoot: repo.Path, Args: args, EnvAdds: env,
+	}, listFilesTimeout, a.listSpoolDir(), a.listSpoolMemMax())
+	if err != nil {
+		return err
+	}
+	defer res.close()
+	return a.storeListing(ctx, snapshotID, rev, storage, repo.ID, res)
 }
 
 // newestRevisionsPerSnapshot returns the newest keepN revisions for each

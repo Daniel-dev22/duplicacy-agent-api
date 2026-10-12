@@ -73,6 +73,7 @@ type app struct {
 	snapshotStats       *snapshotStatsStore      // per-snapshot dedup rows from `check -tabular`
 	filesCache          *snapshotFilesCacheStore // persistent `list -files` cache (nil when disabled)
 	warmDirty           chan struct{}            // buffered(1) nudge → debounced list-cache warm sweep
+	listGate            *listGate                // bounds concurrent cache-missing `list -files` runs
 	mapping             *repoMappingStore        // controller-managed repo↔credential mapping
 	secrets             *secretCache             // 60s TTL cache of vended bundles
 	compose             *composeIndex            // bounded scan of mounted COMPOSE_SCAN_ROOTS for compose project dirs
@@ -142,6 +143,7 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 		secrets:             newSecretCache(),
 		compose:             newComposeIndex(cfg.ComposeScanRoots),
 		warmDirty:           make(chan struct{}, 1),
+		listGate:            newListGate(cfg.ListMaxConcurrent, cfg.ListQueueWait),
 		stop:                make(chan struct{}),
 	}
 	// Persistent `list -files` cache (snapshot_files_cache.go). Shares the
