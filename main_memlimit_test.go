@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Daniel-dev22/agent-kit-go/memlimit"
 	"github.com/gin-gonic/gin"
@@ -87,5 +88,33 @@ func TestMemlimitFatalOnlyForInvalidConfig(t *testing.T) {
 	}
 	if memlimitFatal(errors.New("cgroup file unreadable")) || memlimitFatal(nil) {
 		t.Fatal("environmental errors must not be fatal")
+	}
+}
+
+func TestReadinessDistinguishesPeakFromCurrent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dir := t.TempDir()
+	os.WriteFile(dir+"/self", []byte("0::/\n"), 0o644)
+	os.WriteFile(dir+"/memory.stat", []byte("anon 8192\n"), 0o644)
+	tick := make(chan time.Time)
+	old := anonPeak
+	anonPeak = memlimit.StartPeakAnon(ctx, nil, memlimit.PeakOptions{Root: dir, SelfCgroup: dir + "/self", Tick: tick})
+	t.Cleanup(func() { anonPeak = old })
+	os.WriteFile(dir+"/memory.stat", []byte("anon 4096\n"), 0o644) // usage fell
+	tick <- time.Now()
+	for i := 0; i < 400 && anonPeak.Stats().CurrentBytes != 4096; i++ {
+		time.Sleep(5 * time.Millisecond)
+	}
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/health/ready", nil)
+	(&app{}).handleReadiness(c)
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["anon_bytes"] != float64(4096) || got["anon_peak_bytes"] != float64(8192) {
+		t.Fatalf("peak must be the max seen (8192) and anon_bytes the latest (4096): %s", rec.Body.String())
 	}
 }

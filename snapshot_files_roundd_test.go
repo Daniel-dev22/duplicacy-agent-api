@@ -102,7 +102,7 @@ func TestSweepOnASingleRepoStillRespectsTheCap(t *testing.T) {
 	ctx := context.Background()
 	c := newTestFilesCache(t, 0, 2)
 	row := make([]byte, 1000)
-	for rev := 1; rev <= 4; rev++ { // existed before the sweep
+	for rev := 4; rev >= 1; rev-- { // existed before the sweep; rev 1 (rank 4) has the MAX rowid
 		c.putGzipped(ctx, "old", rev, "default", "repoA", row, 1)
 	}
 	c.maxBytes = 3000
@@ -143,7 +143,7 @@ func TestMarkerProblemsNeverSilenceWarmerOrReconcile(t *testing.T) {
 	if err != nil || !want {
 		t.Fatalf("warmer silenced by a missing marker table: want=%v err=%v", want, err)
 	}
-	if err := c.markUncacheable(ctx, "repoA", "default", "snapA", 2, uncacheableRowCap, 5); err != nil {
+	if err := c.markUncacheable(ctx, "repoA", "default", "snapA", 2, uncacheableRowCap, 5, 0); err != nil {
 		t.Fatalf("marker table must be recreated on demand: %v", err)
 	}
 	if r, _ := c.uncacheable(ctx, "repoA", "default", "snapA", 2); r != uncacheableRowCap {
@@ -180,8 +180,8 @@ func TestRowCapMarkerIsReevaluatedWhenTheCapChanges(t *testing.T) {
 	ctx := context.Background()
 	c := newTestFilesCache(t, 0, 5)
 	a := &app{filesCache: c, cfg: Config{ListCacheRowMaxBytes: 1 << 20}}
-	c.markUncacheable(ctx, "repoA", "default", "snapA", 3, uncacheableRowCap, 5<<20)
-	c.markUncacheable(ctx, "repoA", "default", "snapA", 4, uncacheableCeiling, 0)
+	c.markUncacheable(ctx, "repoA", "default", "snapA", 3, uncacheableRowCap, 5<<20, 0)
+	c.markUncacheable(ctx, "repoA", "default", "snapA", 4, uncacheableCeiling, 0, listSpoolFileMax)
 	rev := func(n int) Snapshot { return Snapshot{SnapshotID: "snapA", Revision: n} }
 	if w, _ := a.warmWanted(ctx, map[string]int{}, rev(3), "repoA", "default"); w {
 		t.Fatal("marker still valid at the old cap")
@@ -198,7 +198,7 @@ func TestRowCapMarkerIsReevaluatedWhenTheCapChanges(t *testing.T) {
 func TestMarkerReconcileOnlyJudgesReposThatListedTheStorage(t *testing.T) {
 	ctx := context.Background()
 	c := newTestFilesCache(t, 0, 5)
-	c.markUncacheable(ctx, "repoX", "s1", "snapX", 1, uncacheableRowCap, 9)
+	c.markUncacheable(ctx, "repoX", "s1", "snapX", 1, uncacheableRowCap, 9, 0)
 	st := newSweepState()
 	st.known["repoX"], st.known["repoY"] = struct{}{}, struct{}{}
 	st.swept[repoStorage{"repoY", "s1"}] = struct{}{} // only Y listed s1
@@ -423,4 +423,124 @@ func TestStalledClientIsCutOffAndFreesItsHitSlot(t *testing.T) {
 		t.Fatalf("the stalled client still holds the hit slot after 1.5s: %v", aerr)
 	}
 	rel()
+}
+
+func TestCapEvictedMarkerIsClearedWhenThePinDepthGrows(t *testing.T) {
+	ctx := context.Background()
+	c := newTestFilesCache(t, 0, 5)
+	a := &app{filesCache: c}
+	for rev := 1; rev <= 5; rev++ {
+		putRaw(c, ctx, "snapA", rev, "default", "repoA", make([]byte, 1000))
+	}
+	// Re-write as exact-size gz rows so the arithmetic below is exact.
+	c.db.Exec(`UPDATE snapshot_files_cache SET gz_bytes = 1000`)
+	if err := c.putGzipped(ctx, "snapB", 1, "default", "repoB", make([]byte, 2000), 1); err != nil {
+		t.Fatal(err)
+	}
+	c.db.Exec(`UPDATE snapshot_files_cache SET gz_bytes = 2000 WHERE snapshot_id = 'snapB'`)
+	c.maxBytes = 6000
+	if err := c.evictBySize(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := c.has(ctx, "snapA", 1, "default"); ok {
+		t.Fatal("setup: rank-5 revision should have been evicted under pinN=4")
+	}
+	want := func() bool {
+		w, _ := a.warmWanted(ctx, map[string]int{"snapA": 4}, Snapshot{SnapshotID: "snapA", Revision: 1}, "repoA", "default")
+		return w
+	}
+	if want() {
+		t.Fatal("marker must hold while the pressure that wrote it persists")
+	}
+	// snapB is pruned: the pin depth recovers, so the marked revision is a hole.
+	c.db.Exec(`DELETE FROM snapshot_files_cache WHERE snapshot_id = 'snapB'`)
+	if !want() {
+		t.Fatal("cap_evicted marker outlived the pressure: permanent hole in the warm window")
+	}
+}
+
+func TestMarkerTableMigratesFromOldSchema(t *testing.T) {
+	ctx := context.Background()
+	c := newTestFilesCache(t, 0, 5)
+	c.db.Exec(`DROP TABLE snapshot_files_uncacheable`)
+	if _, err := c.db.Exec(`CREATE TABLE snapshot_files_uncacheable (
+		repo_id TEXT NOT NULL, storage_name TEXT NOT NULL, snapshot_id TEXT NOT NULL, revision INTEGER NOT NULL,
+		reason TEXT NOT NULL, gz_bytes INTEGER NOT NULL, marked_at TIMESTAMP NOT NULL,
+		PRIMARY KEY (repo_id, storage_name, snapshot_id, revision))`); err != nil {
+		t.Fatal(err)
+	}
+	c.db.Exec(`INSERT INTO snapshot_files_uncacheable VALUES ('repoA','default','snapA',1,'row_cap',77,'2026-01-01 00:00:00')`)
+	for i := 0; i < 2; i++ { // idempotent
+		if err := c.ensureSchema(ctx); err != nil {
+			t.Fatalf("migration run %d: %v", i, err)
+		}
+	}
+	m, err := c.uncacheableInfo(ctx, "repoA", "default", "snapA", 1)
+	if err != nil || m.reason != uncacheableRowCap || m.gzBytes != 77 {
+		t.Fatalf("old row not readable after migration: %+v err=%v", m, err)
+	}
+	c.markCapEvicted(ctx, []evictedRow{{"repoA", "default", "snapA", 2, 5}})
+	m, err = c.uncacheableInfo(ctx, "repoA", "default", "snapA", 2)
+	if err != nil || m.reason != uncacheableCapEvicted {
+		t.Fatalf("new-column marker not stored: %+v err=%v", m, err)
+	}
+}
+
+func TestCapEvictedMarkerIsReadmittedWhenTheCapChanges(t *testing.T) {
+	ctx := context.Background()
+	c := newTestFilesCache(t, 3000, 5)
+	a := &app{filesCache: c}
+	c.putGzipped(ctx, "other", 1, "default", "repoB", make([]byte, 500), 1)
+	c.markCapEvicted(ctx, []evictedRow{{"repoA", "default", "snapA", 3, 3000}})
+	want := func() bool {
+		w, _ := a.warmWanted(ctx, map[string]int{}, Snapshot{SnapshotID: "snapA", Revision: 3}, "repoA", "default")
+		return w
+	}
+	if want() {
+		t.Fatal("same cap, no room: must stay marked")
+	}
+	c.maxBytes = 9000
+	if !want() {
+		t.Fatal("a changed cap must re-admit a cap_evicted marker")
+	}
+}
+
+func TestSpoolCeilingMarkerIsVoidWhenTheCeilingChanges(t *testing.T) {
+	bin := writeFakeList(t)
+	ctx := context.Background()
+	a, repo := newListTestApp(t, bin, 1, time.Second)
+	a.filesCache.markUncacheable(ctx, "repoA", "default", "snapA", 8, uncacheableCeiling, 0, listSpoolFileMax)
+	w := func() bool {
+		ok, _ := a.warmWanted(ctx, map[string]int{}, Snapshot{SnapshotID: "snapA", Revision: 8}, "repoA", "default")
+		return ok
+	}
+	if w() {
+		t.Fatal("marker valid at the same ceiling")
+	}
+	if got := serve(a, repo, 8, "", []string{"LISTSZ=500"}, nil); got.status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("handler should short-circuit 413, got %d", got.status)
+	}
+	setVar(t, &listSpoolFileMax, listSpoolFileMax*2) // a later release raised the ceiling
+	if !w() {
+		t.Fatal("warmer must retry once the ceiling was raised")
+	}
+	if got := serve(a, repo, 8, "", []string{"LISTSZ=500"}, nil); got.status != 200 {
+		t.Fatalf("handler must serve again after the ceiling was raised, got %d", got.status)
+	}
+}
+
+func TestPolicyBoundaries(t *testing.T) {
+	// a prefix sum exactly equal to the cap fits
+	if got := pinPolicy([]int64{300, 300, 300, 300, 300}, 5, 1500); got != 5 {
+		t.Fatalf("prefix == cap must fit: %d", got)
+	}
+	// a row_cap marker whose gz equals the (raised) cap is admitted: the cache
+	// rule is "gz > cap is uncacheable"
+	ctx := context.Background()
+	c := newTestFilesCache(t, 0, 5)
+	a := &app{filesCache: c, cfg: Config{ListCacheRowMaxBytes: 1 << 20}}
+	c.markUncacheable(ctx, "repoA", "default", "snapA", 3, uncacheableRowCap, 1<<20, 0)
+	if w, _ := a.warmWanted(ctx, map[string]int{}, Snapshot{SnapshotID: "snapA", Revision: 3}, "repoA", "default"); !w {
+		t.Fatal("gz exactly equal to the cap is cacheable and must be re-admitted")
+	}
 }

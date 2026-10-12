@@ -353,7 +353,8 @@ func (a *app) serveSnapshotFiles(c *gin.Context, repo *Repo, rev int, vend func(
 	}
 	defer release()
 	if a.filesCache != nil && snapID != "" {
-		if reason, _ := a.filesCache.uncacheable(c.Request.Context(), repo.ID, storageKey, snapID, rev); reason == uncacheableCeiling {
+		// A ceiling marker is void once the ceiling has been raised.
+		if m, _ := a.filesCache.uncacheableInfo(c.Request.Context(), repo.ID, storageKey, snapID, rev); m.reason == uncacheableCeiling && m.capBytes == listSpoolFileMax {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "listing exceeds the spool ceiling and cannot be served"})
 			return
 		}
@@ -399,7 +400,7 @@ func (a *app) serveSnapshotFiles(c *gin.Context, repo *Repo, rev int, vend func(
 		switch {
 		case errors.Is(err, errSpoolCeiling):
 			if a.filesCache != nil && snapID != "" {
-				_ = a.filesCache.markUncacheable(c.Request.Context(), repo.ID, storageKey, snapID, rev, uncacheableCeiling, 0)
+				_ = a.filesCache.markUncacheable(c.Request.Context(), repo.ID, storageKey, snapID, rev, uncacheableCeiling, 0, listSpoolFileMax)
 			}
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
 		case errors.Is(err, errSpoolFailed):

@@ -237,8 +237,19 @@ func (a *app) warmWanted(ctx context.Context, ranks map[string]int, rev Snapshot
 		// the cap was raised since the marker was written
 		return m.gzBytes > 0 && m.gzBytes <= a.cfg.ListCacheRowMaxBytes, nil
 	case uncacheableCapEvicted:
-		// the size cap evicted it from the window; only a changed cap re-admits it
-		return m.capBytes != a.filesCache.maxBytes, nil
+		// The size cap evicted it from the window. It is re-admitted when the cap
+		// changed, or when the cache has since shrunk enough (a snapshot was
+		// pruned) that the row fits under the cap again. The room test uses the
+		// actual total, so a row evicted for lack of room stays marked until room
+		// really appears and the warmer cannot flap.
+		if m.capBytes != a.filesCache.maxBytes {
+			return true, nil
+		}
+		_, total, serr := a.filesCache.stats(ctx)
+		return serr == nil && total+m.gzBytes <= a.filesCache.maxBytes, nil
+	case uncacheableCeiling:
+		// the spool ceiling was raised since the marker was written
+		return m.capBytes != listSpoolFileMax, nil
 	}
 	return false, nil
 }
@@ -306,7 +317,7 @@ func (a *app) warmOneListing(ctx context.Context, repo *Repo, storage, keyPath, 
 	if err != nil {
 		if errors.Is(err, errSpoolCeiling) {
 			// Permanent for this revision: stop re-running it every sweep.
-			if merr := a.filesCache.markUncacheable(ctx, repo.ID, storage, snapshotID, rev, uncacheableCeiling, 0); merr != nil {
+			if merr := a.filesCache.markUncacheable(ctx, repo.ID, storage, snapshotID, rev, uncacheableCeiling, 0, listSpoolFileMax); merr != nil {
 				slog.Warn("list-cache warm: marking uncacheable failed", "error", merr)
 			}
 		}

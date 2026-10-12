@@ -123,7 +123,43 @@ func (s *snapshotFilesCacheStore) ensureSchema(ctx context.Context) error {
 			cap_bytes     INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (repo_id, storage_name, snapshot_id, revision)
 		)`)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.migrateMarkerColumns(ctx)
+}
+
+// migrateMarkerColumns adds columns an older build's table lacks. Idempotent:
+// each ALTER runs only when PRAGMA table_info does not list the column.
+func (s *snapshotFilesCacheStore) migrateMarkerColumns(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(snapshot_files_uncacheable)`)
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		have[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, col := range []string{"cap_bytes"} {
+		if have[col] {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE snapshot_files_uncacheable ADD COLUMN `+col+` INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add column %s: %w", col, err)
+		}
+	}
+	return nil
 }
 
 const (
@@ -134,16 +170,16 @@ const (
 	uncacheableCapEvicted = "cap_evicted"
 )
 
-func (s *snapshotFilesCacheStore) markUncacheable(ctx context.Context, repoID, storage, snapshotID string, rev int, reason string, gzBytes int64) error {
+func (s *snapshotFilesCacheStore) markUncacheable(ctx context.Context, repoID, storage, snapshotID string, rev int, reason string, gzBytes, capBytes int64) error {
 	if s == nil || s.db == nil {
 		return nil
 	}
 	err := s.retryMissingTable(ctx, func() error {
 		_, e := s.db.ExecContext(ctx, `
 			INSERT OR REPLACE INTO snapshot_files_uncacheable
-				(repo_id, storage_name, snapshot_id, revision, reason, gz_bytes, marked_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			repoID, storage, snapshotID, rev, reason, gzBytes, time.Now().UTC())
+				(repo_id, storage_name, snapshot_id, revision, reason, gz_bytes, marked_at, cap_bytes)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			repoID, storage, snapshotID, rev, reason, gzBytes, time.Now().UTC(), capBytes)
 		return e
 	})
 	if err != nil {
@@ -156,7 +192,7 @@ func (s *snapshotFilesCacheStore) markUncacheable(ctx context.Context, repoID, s
 type uncacheableMarker struct {
 	reason   string
 	gzBytes  int64
-	capBytes int64 // cache cap when a cap_evicted marker was written
+	capBytes int64 // cap_evicted: the cache cap when written; spool_ceiling: the ceiling
 }
 
 // uncacheable reports the marker reason for a revision ("" when unmarked).

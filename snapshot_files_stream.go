@@ -327,7 +327,7 @@ func (a *app) storeListing(ctx context.Context, snapID string, rev int, storage,
 	if m := a.cfg.ListCacheRowMaxBytes; m > 0 && res.spool.n > m {
 		slog.Info("list-files listing exceeds row cap, not cached",
 			"repo", repoID, "snapshot_id", snapID, "rev", rev, "storage", storage, "gz_bytes", res.spool.n, "cap", m)
-		return a.filesCache.markUncacheable(ctx, repoID, storage, snapID, rev, uncacheableRowCap, res.spool.n)
+		return a.filesCache.markUncacheable(ctx, repoID, storage, snapID, rev, uncacheableRowCap, res.spool.n, 0)
 	}
 	gz, err := res.spool.bytes()
 	if err != nil {

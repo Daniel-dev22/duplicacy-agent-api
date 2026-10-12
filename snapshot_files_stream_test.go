@@ -784,7 +784,7 @@ func TestRowCapMarkerSurvivesAndReconcileDropsIt(t *testing.T) {
 		t.Fatal("marker survived its revision being pruned")
 	}
 	// A failed repo's markers are exempt, like its rows.
-	a.filesCache.markUncacheable(ctx, "repoA", "default", "snapA", 5, uncacheableRowCap, 1)
+	a.filesCache.markUncacheable(ctx, "repoA", "default", "snapA", 5, uncacheableRowCap, 1, 0)
 	st.failed["repoA"] = struct{}{}
 	a.filesCache.reconcileAgainstKeep(ctx, st)
 	if r, _ := a.filesCache.uncacheable(ctx, "repoA", "default", "snapA", 5); r == "" {
