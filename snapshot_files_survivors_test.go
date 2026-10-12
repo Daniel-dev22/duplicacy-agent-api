@@ -351,7 +351,11 @@ func TestWarmSweepProtectsRowsOfReposThatDidNotFullyList(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	seed("snapA", 9, "default", "repoA") // pruned, but A did not fully list -> must stay
+	for rev := 5; rev <= 9; rev++ {
+		// A's rows beyond the pin (rn>2): rev 9 is pruned, but A did not fully
+		// list, and they must survive every put of A's own default warming.
+		seed("snapA", rev, "default", "repoA")
+	}
 	for rev := 5; rev <= 9; rev++ {
 		seed("snapC", rev, "default", "repoC") // vend failed; over cap and rn>2 -> must stay
 	}
@@ -365,8 +369,10 @@ func TestWarmSweepProtectsRowsOfReposThatDidNotFullyList(t *testing.T) {
 		ok, _ := a.filesCache.has(ctx, snap, rev, storage)
 		return ok
 	}
-	if !has("snapA", 9, "default") {
-		t.Fatal("repo A listed one storage and failed another: its rows must not be reconciled or evicted")
+	for rev := 5; rev <= 9; rev++ {
+		if !has("snapA", rev, "default") {
+			t.Fatalf("repo A listed one storage and failed another: snapA rev%d must not be reconciled or evicted", rev)
+		}
 	}
 	for rev := 5; rev <= 9; rev++ {
 		if !has("snapC", rev, "default") {

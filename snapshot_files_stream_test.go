@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ import (
 //	LISTSEQ   emit `seq 1 N` instead
 //	LISTRAND  emit ~N bytes of deterministic pseudo-random digits (poorly compressible)
 //	LISTIGNOREPIPE survive a closed output pipe (so only a kill ends the run)
+//	LISTTRACE append "S|E <ns>" at child start / end
 //	LISTFD    print which pipes stdout and stderr are
 //	LISTLOG   append "<files> <id> <storage>" per invocation
 //	LISTREVS  discovery `list` prints revisions 1..N for -id (FAILSTORAGE fails one storage)
@@ -46,6 +48,7 @@ for a in "$@"; do
   prev="$a"
 done
 [ -n "$LISTLOG" ] && echo "$files $id $st" >> "$LISTLOG"
+[ -n "$LISTTRACE" ] && echo "S $(date +%s%N)" >> "$LISTTRACE"
 if [ "$files" = 0 ] && [ -n "$LISTREVS" ]; then
   if [ -n "$FAILSTORAGE" ] && [ "$st" = "$FAILSTORAGE" ]; then echo "storage unreachable" >&2; exit 1; fi
   i=1
@@ -65,6 +68,7 @@ fi
 echo "mid-line-on-stderr" >&2
 if [ -n "$LISTSLEEP" ]; then sleep "$LISTSLEEP"; fi
 echo "last-line-on-stderr" >&2
+[ -n "$LISTTRACE" ] && echo "E $(date +%s%N)" >> "$LISTTRACE"
 exit "${LISTEXIT:-0}"
 `
 
@@ -298,35 +302,53 @@ func TestKilledOrFailedListingNeverCached(t *testing.T) {
 
 func TestListGateBoundsConcurrentMisses(t *testing.T) {
 	bin := writeFakeList(t)
-	a, repo := newListTestApp(t, bin, 2, 10*time.Second)
-	var cur, peak atomic.Int32
+	trace := filepath.Join(t.TempDir(), "trace")
+	a, repo := newListTestApp(t, bin, 2, 30*time.Second)
 	var wg sync.WaitGroup
 	statuses := make([]int, 8)
 	for i := range statuses {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			w := serve(a, repo, 10+i, "", []string{"LISTSZ=2048", "LISTSLEEP=0.2"}, func() func() {
-				n := cur.Add(1)
-				for {
-					p := peak.Load()
-					if n <= p || peak.CompareAndSwap(p, n) {
-						break
-					}
-				}
-				return func() { cur.Add(-1) }
-			})
-			statuses[i] = w.status
+			statuses[i] = serve(a, repo, 10+i, "", []string{"LISTSZ=2048", "LISTSLEEP=0.2", "LISTTRACE=" + trace}, nil).status
 		}()
 	}
 	wg.Wait()
-	for i, s := range statuses {
-		if s != 200 {
-			t.Fatalf("request %d status %d", i, s)
+	for i, st := range statuses {
+		if st != 200 {
+			t.Fatalf("request %d status %d", i, st)
 		}
 	}
-	if p := peak.Load(); p > 2 || p < 1 {
-		t.Fatalf("peak concurrent listings %d, want 1..2", p)
+	// Concurrency of the CHILDREN, measured by the children themselves: each
+	// logs its start and end, so there is no handler-timing window to race.
+	b, _ := os.ReadFile(trace)
+	type ev struct {
+		ns   int64
+		diff int
+	}
+	var evs []ev
+	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		f := strings.Fields(l)
+		ns, _ := strconv.ParseInt(f[1], 10, 64)
+		d := 1
+		if f[0] == "E" {
+			d = -1
+		}
+		evs = append(evs, ev{ns, d})
+	}
+	sort.Slice(evs, func(i, j int) bool {
+		if evs[i].ns != evs[j].ns {
+			return evs[i].ns < evs[j].ns
+		}
+		return evs[i].diff < evs[j].diff // an end sorts before a start at the same instant
+	})
+	cur, peak := 0, 0
+	for _, e := range evs {
+		cur += e.diff
+		peak = max(peak, cur)
+	}
+	if len(evs) != 16 || peak != 2 {
+		t.Fatalf("children: %d events, peak concurrency %d, want 16 events and exactly the 2 slots", len(evs), peak)
 	}
 }
 
@@ -826,16 +848,24 @@ func TestWarmerAndEvictorSettle(t *testing.T) {
 }
 
 func TestPinPolicy(t *testing.T) {
-	if got := pinPolicy(100, 5, 1000); got != 5 {
+	// perRank[i] = bytes of rank i+1 summed over all snapshots.
+	if got := pinPolicy([]int64{100, 100, 100, 100, 100}, 5, 1000); got != 5 {
 		t.Fatalf("fits: %d", got)
 	}
-	if got := pinPolicy(300, 5, 1000); got != maxPinRelaxedKeep {
-		t.Fatalf("over cap: %d", got)
+	if got := pinPolicy([]int64{300, 300, 300, 300, 300}, 5, 1000); got != 3 {
+		t.Fatalf("largest prefix that fits: %d", got)
 	}
-	if got := pinPolicy(300, 1, 10); got != 1 {
-		t.Fatalf("warmN below relaxed keep: %d", got)
+	if got := pinPolicy([]int64{900, 900, 900, 900, 900}, 5, 1000); got != maxPinRelaxedKeep {
+		t.Fatalf("floor: %d", got)
 	}
-	if got := pinPolicy(300, 5, 0); got != 5 {
+	// Older ranks larger than the newest: a newest-only projection says 5.
+	if got := pinPolicy([]int64{1000, 1500, 1500, 1500, 1500}, 5, 6500); got != 4 {
+		t.Fatalf("shrinking dataset: %d", got)
+	}
+	if got := pinPolicy([]int64{300}, 1, 10); got != 1 {
+		t.Fatalf("warmN below the floor: %d", got)
+	}
+	if got := pinPolicy([]int64{300, 300}, 5, 0); got != 5 {
 		t.Fatalf("cap disabled: %d", got)
 	}
 }

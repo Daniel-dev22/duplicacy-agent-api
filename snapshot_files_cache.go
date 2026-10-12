@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 )
@@ -32,17 +33,27 @@ type snapshotFilesCacheStore struct {
 
 	// pendingRepos are repos a running warm sweep has not finished with: until
 	// a repo's listing succeeds its outcome is unknown, so size eviction (which
-	// every put triggers) must not touch its rows.
-	pendingMu    sync.Mutex
-	pendingRepos map[string]struct{}
+	// every put triggers) must not touch the rows it had when the sweep began
+	// (rowid <= pendingMaxRowid). Rows added during the sweep stay evictable, so
+	// a sweep cannot grow the cache past the cap by the amount it warms.
+	pendingMu       sync.Mutex
+	pendingRepos    map[string]struct{}
+	pendingMaxRowid int64 // rows at or below this existed when the sweep began
 }
 
-func (s *snapshotFilesCacheStore) sweepBegin(repoIDs []string) {
+func (s *snapshotFilesCacheStore) sweepBegin(ctx context.Context, repoIDs []string) {
 	if s == nil {
 		return
 	}
+	var maxRowid int64
+	if s.db != nil {
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) FROM snapshot_files_cache`).Scan(&maxRowid); err != nil {
+			slog.Warn("list-files sweep: max rowid query failed, no rows exempt", "error", err)
+		}
+	}
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
+	s.pendingMaxRowid = maxRowid
 	s.pendingRepos = make(map[string]struct{}, len(repoIDs))
 	for _, id := range repoIDs {
 		s.pendingRepos[id] = struct{}{}
@@ -67,21 +78,18 @@ func (s *snapshotFilesCacheStore) sweepEnd() {
 	s.pendingMu.Unlock()
 }
 
-// evictExempt is the caller's exempt set plus the sweep's pending repos.
-func (s *snapshotFilesCacheStore) evictExempt(extra map[string]struct{}) map[string]struct{} {
+// pendingSnapshot returns the sweep's pending repos and the rowid fence.
+func (s *snapshotFilesCacheStore) pendingSnapshot() (map[string]struct{}, int64) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
 	if len(s.pendingRepos) == 0 {
-		return extra
+		return nil, 0
 	}
-	out := make(map[string]struct{}, len(s.pendingRepos)+len(extra))
+	out := make(map[string]struct{}, len(s.pendingRepos))
 	for k := range s.pendingRepos {
 		out[k] = struct{}{}
 	}
-	for k := range extra {
-		out[k] = struct{}{}
-	}
-	return out
+	return out, s.pendingMaxRowid
 }
 
 func newSnapshotFilesCacheStore(db *sql.DB, maxBytes int64, warmKeepN int) *snapshotFilesCacheStore {
@@ -112,6 +120,7 @@ func (s *snapshotFilesCacheStore) ensureSchema(ctx context.Context) error {
 			reason        TEXT    NOT NULL,
 			gz_bytes      INTEGER NOT NULL,
 			marked_at     TIMESTAMP NOT NULL,
+			cap_bytes     INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (repo_id, storage_name, snapshot_id, revision)
 		)`)
 	return err
@@ -120,54 +129,125 @@ func (s *snapshotFilesCacheStore) ensureSchema(ctx context.Context) error {
 const (
 	uncacheableRowCap  = "row_cap"
 	uncacheableCeiling = "spool_ceiling"
+	// uncacheableCapEvicted: the size cap evicted this revision from the warm
+	// window; re-listing it would only be evicted again, until the cap changes.
+	uncacheableCapEvicted = "cap_evicted"
 )
 
 func (s *snapshotFilesCacheStore) markUncacheable(ctx context.Context, repoID, storage, snapshotID string, rev int, reason string, gzBytes int64) error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `
-		INSERT OR REPLACE INTO snapshot_files_uncacheable
-			(repo_id, storage_name, snapshot_id, revision, reason, gz_bytes, marked_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		repoID, storage, snapshotID, rev, reason, gzBytes, time.Now().UTC())
+	err := s.retryMissingTable(ctx, func() error {
+		_, e := s.db.ExecContext(ctx, `
+			INSERT OR REPLACE INTO snapshot_files_uncacheable
+				(repo_id, storage_name, snapshot_id, revision, reason, gz_bytes, marked_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			repoID, storage, snapshotID, rev, reason, gzBytes, time.Now().UTC())
+		return e
+	})
 	if err != nil {
 		return fmt.Errorf("mark uncacheable: %w", err)
 	}
 	return nil
 }
 
+// uncacheableMarker is a stored negative marker.
+type uncacheableMarker struct {
+	reason   string
+	gzBytes  int64
+	capBytes int64 // cache cap when a cap_evicted marker was written
+}
+
 // uncacheable reports the marker reason for a revision ("" when unmarked).
 func (s *snapshotFilesCacheStore) uncacheable(ctx context.Context, repoID, storage, snapshotID string, rev int) (string, error) {
+	m, err := s.uncacheableInfo(ctx, repoID, storage, snapshotID, rev)
+	return m.reason, err
+}
+
+func (s *snapshotFilesCacheStore) uncacheableInfo(ctx context.Context, repoID, storage, snapshotID string, rev int) (uncacheableMarker, error) {
+	var m uncacheableMarker
 	if s == nil || s.db == nil {
-		return "", nil
+		return m, nil
 	}
-	var reason string
-	err := s.db.QueryRowContext(ctx, `
-		SELECT reason FROM snapshot_files_uncacheable
-		 WHERE repo_id = ? AND storage_name = ? AND snapshot_id = ? AND revision = ?`,
-		repoID, storage, snapshotID, rev).Scan(&reason)
+	q := func() error {
+		return s.db.QueryRowContext(ctx, `
+			SELECT reason, gz_bytes, cap_bytes FROM snapshot_files_uncacheable
+			 WHERE repo_id = ? AND storage_name = ? AND snapshot_id = ? AND revision = ?`,
+			repoID, storage, snapshotID, rev).Scan(&m.reason, &m.gzBytes, &m.capBytes)
+	}
+	err := s.retryMissingTable(ctx, q)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
+		return uncacheableMarker{}, nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("uncacheable lookup: %w", err)
+		return uncacheableMarker{}, fmt.Errorf("uncacheable lookup: %w", err)
 	}
-	return reason, nil
+	return m, nil
+}
+
+// markCapEvicted records rows the size cap just evicted from the warm window.
+func (s *snapshotFilesCacheStore) markCapEvicted(ctx context.Context, items []evictedRow) {
+	for _, it := range items {
+		err := s.retryMissingTable(ctx, func() error {
+			_, e := s.db.ExecContext(ctx, `
+				INSERT OR REPLACE INTO snapshot_files_uncacheable
+					(repo_id, storage_name, snapshot_id, revision, reason, gz_bytes, marked_at, cap_bytes)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				it.repo, it.storage, it.snapshot, it.rev, uncacheableCapEvicted, it.gz, time.Now().UTC(), s.maxBytes)
+			return e
+		})
+		if err != nil {
+			slog.Warn("list-files: recording cap eviction failed", "error", err)
+			return
+		}
+	}
+}
+
+type evictedRow struct {
+	repo, storage, snapshot string
+	rev                     int
+	gz                      int64
+}
+
+// retryMissingTable runs fn; if the marker table is missing it is created on
+// demand and fn runs once more, so a lost table never silently disables the
+// warmer or the reconcile.
+func (s *snapshotFilesCacheStore) retryMissingTable(ctx context.Context, fn func() error) error {
+	err := fn()
+	if err != nil && strings.Contains(err.Error(), "no such table") {
+		slog.Warn("list-files marker table missing, recreating", "error", err)
+		if serr := s.ensureSchema(ctx); serr != nil {
+			return serr
+		}
+		return fn()
+	}
+	return err
 }
 
 // pinPolicy is the ONE rule for how many newest revisions per (snapshot,
-// storage) are warmed and protected from eviction. The warmer decides what to
-// warm with it and the evictor decides what to protect with it, so the two can
-// never disagree and re-list what the other just evicted. When keeping warmN
-// revisions of every snapshot (projected from each snapshot's newest row) would
-// exceed the cap, the policy drops to maxPinRelaxedKeep. The projection uses
-// only the newest rows, so evicting the older ones cannot flip the answer.
-func pinPolicy(newestBytes int64, warmN int, maxBytes int64) int {
-	if maxBytes > 0 && newestBytes*int64(warmN) > maxBytes {
-		return min(maxPinRelaxedKeep, warmN)
+// storage) are warmed and protected from eviction: the largest k (not below
+// maxPinRelaxedKeep, not above warmN) such that the rows of rank <= k, summed
+// over every snapshot, fit the cap. perRank[i] is the cached gz bytes of rank
+// i+1. The warmer warms ranks below k and the evictor protects ranks <= k, so
+// they never disagree; evicting deeper ranks leaves every prefix sum unchanged,
+// so the answer cannot flap.
+func pinPolicy(perRank []int64, warmN int, maxBytes int64) int {
+	if maxBytes <= 0 {
+		return warmN
 	}
-	return warmN
+	floor := min(maxPinRelaxedKeep, warmN)
+	best := floor
+	var run int64
+	for k := 1; k <= warmN; k++ {
+		if k <= len(perRank) {
+			run += perRank[k-1]
+		}
+		if k >= floor && run <= maxBytes {
+			best = k
+		}
+	}
+	return best
 }
 
 // effectivePinN applies pinPolicy to the current cache contents.
@@ -175,17 +255,30 @@ func (s *snapshotFilesCacheStore) effectivePinN(ctx context.Context) int {
 	if s == nil || s.db == nil || s.maxBytes <= 0 || s.warmKeepN <= maxPinRelaxedKeep {
 		return s.warmN()
 	}
-	var newest int64
-	err := s.db.QueryRowContext(ctx, `
-		SELECT COALESCE(SUM(gz_bytes), 0) FROM (
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT rn, COALESCE(SUM(gz_bytes), 0) FROM (
 			SELECT gz_bytes, ROW_NUMBER() OVER (
 				PARTITION BY snapshot_id, storage_name ORDER BY revision DESC) AS rn
-			FROM snapshot_files_cache) WHERE rn = 1`).Scan(&newest)
+			FROM snapshot_files_cache) WHERE rn <= ? GROUP BY rn ORDER BY rn`, s.warmKeepN)
 	if err != nil {
 		slog.Warn("list-files pin policy query failed, using configured N", "error", err)
 		return s.warmKeepN
 	}
-	return pinPolicy(newest, s.warmKeepN, s.maxBytes)
+	defer rows.Close()
+	perRank := make([]int64, s.warmKeepN)
+	for rows.Next() {
+		var rn int
+		var b int64
+		if err := rows.Scan(&rn, &b); err != nil || rn < 1 || rn > len(perRank) {
+			slog.Warn("list-files pin policy row failed, using configured N", "error", err)
+			return s.warmKeepN
+		}
+		perRank[rn-1] = b
+	}
+	if err := rows.Err(); err != nil {
+		return s.warmKeepN
+	}
+	return pinPolicy(perRank, s.warmKeepN, s.maxBytes)
 }
 
 func (s *snapshotFilesCacheStore) warmN() int {
@@ -289,9 +382,8 @@ const maxPinRelaxedKeep = 2
 
 // evictBySize deletes rows until SUM(gz_bytes) is back under maxBytes: the
 // OLDEST revision first (deepest rank per snapshot), never the newest
-// pinPolicy-many per (snapshot_id, storage_name). If those alone exceed the cap
-// the cap still wins down to the newest maxPinRelaxedKeep (logged), so it is a
-// real ceiling. Rows of exemptRepos (a repo whose listing failed this sweep) are
+// pinPolicy-many per (snapshot_id, storage_name) (that prefix fits the cap by
+// construction, or is the maxPinRelaxedKeep floor). Rows of exemptRepos (a repo whose listing failed this sweep) are
 // never evicted. A no-op when the cap is disabled or not exceeded.
 func (s *snapshotFilesCacheStore) evictBySize(ctx context.Context, exemptRepos map[string]struct{}) (err error) {
 	if s == nil || s.db == nil || s.maxBytes <= 0 {
@@ -306,44 +398,46 @@ func (s *snapshotFilesCacheStore) evictBySize(ctx context.Context, exemptRepos m
 		return nil
 	}
 	need := total - s.maxBytes
-	exemptRepos = s.evictExempt(exemptRepos)
+	pending, fence := s.pendingSnapshot()
 	pinN := s.effectivePinN(ctx)
-	hardKeep := min(maxPinRelaxedKeep, s.warmKeepN)
 
 	rows, err := s.db.QueryContext(ctx, `
 		WITH ranked AS (
-			SELECT rowid AS rid, gz_bytes, last_access, repo_id,
+			SELECT rowid AS rid, gz_bytes, last_access, repo_id, storage_name, snapshot_id, revision,
 			       ROW_NUMBER() OVER (
 			           PARTITION BY snapshot_id, storage_name
 			           ORDER BY revision DESC
 			       ) AS rn
 			FROM snapshot_files_cache
 		)
-		SELECT rid, gz_bytes, repo_id, rn FROM ranked
+		SELECT rid, gz_bytes, repo_id, storage_name, snapshot_id, revision, rn FROM ranked
 		 WHERE rn > ? ORDER BY rn DESC, last_access ASC`,
-		hardKeep)
+		pinN)
 	if err != nil {
 		return fmt.Errorf("cache evict scan: %w", err)
 	}
 	defer rows.Close()
 
 	var victims []int64
+	var evicted []evictedRow
 	var freed int64
-	relaxed := 0
 	for rows.Next() {
 		var rid, gzBytes int64
-		var repo string
-		var rn int
-		if err := rows.Scan(&rid, &gzBytes, &repo, &rn); err != nil {
+		var repo, storage, snapshot string
+		var rev, rn int
+		if err := rows.Scan(&rid, &gzBytes, &repo, &storage, &snapshot, &rev, &rn); err != nil {
 			return fmt.Errorf("cache evict row: %w", err)
 		}
 		if _, ok := exemptRepos[repo]; ok {
 			continue
 		}
-		if rn <= pinN {
-			relaxed++
+		if _, ok := pending[repo]; ok && rid <= fence {
+			continue
 		}
 		victims = append(victims, rid)
+		if rn <= s.warmKeepN { // inside the warm window: the warmer would re-list it
+			evicted = append(evicted, evictedRow{repo, storage, snapshot, rev, gzBytes})
+		}
 		freed += gzBytes
 		if freed >= need {
 			break
@@ -356,11 +450,15 @@ func (s *snapshotFilesCacheStore) evictBySize(ctx context.Context, exemptRepos m
 	if len(victims) == 0 {
 		return nil
 	}
-	if relaxed > 0 {
+	if pinN < s.warmKeepN {
 		slog.Warn("list-files cache: pinned set exceeds cap, pin relaxed",
-			"max_bytes", s.maxBytes, "total_bytes", total, "pinned_rows_evicted", relaxed, "kept_per_snapshot", hardKeep)
+			"max_bytes", s.maxBytes, "total_bytes", total, "configured_n", s.warmKeepN, "kept_per_snapshot", pinN)
 	}
-	return s.deleteByRowID(ctx, victims)
+	if err := s.deleteByRowID(ctx, victims); err != nil {
+		return err
+	}
+	s.markCapEvicted(ctx, evicted)
+	return nil
 }
 
 // repoStorage identifies one (repo, storage) listing target of a sweep.
@@ -408,6 +506,9 @@ func (s *snapshotFilesCacheStore) reconcileMarkers(ctx context.Context, st *swee
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT rowid, repo_id, storage_name, snapshot_id, revision FROM snapshot_files_uncacheable`)
 	if err != nil {
+		if strings.Contains(err.Error(), "no such table") {
+			return s.ensureSchema(ctx) // nothing to reconcile yet
+		}
 		return fmt.Errorf("marker scan: %w", err)
 	}
 	defer rows.Close()
@@ -459,8 +560,10 @@ func (s *snapshotFilesCacheStore) reconcileMarkers(ctx context.Context, st *swee
 // st.failed and also exempt. Rows of a repo no longer known to the agent are
 // judged against any successful listing of their storage. Returns rows evicted.
 func (s *snapshotFilesCacheStore) reconcileAgainstKeep(ctx context.Context, st *sweepState) (int, error) {
-	if err := s.reconcileMarkers(ctx, st); err != nil {
-		return 0, err
+	// A marker problem must never skip the row reconcile.
+	merr := s.reconcileMarkers(ctx, st)
+	if merr != nil {
+		slog.Warn("list-files marker reconcile failed", "error", merr)
 	}
 	if s == nil || s.db == nil || st == nil || len(st.sweptStorage) == 0 {
 		return 0, nil

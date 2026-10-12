@@ -329,16 +329,29 @@ func (a *app) serveSnapshotFiles(c *gin.Context, repo *Repo, rev int, vend func(
 	}
 
 	// Misses only are gated; hits above are not.
-	release, gerr := a.listGate.acquire(c.Request.Context(), true)
-	if gerr != nil {
-		a.queueRefused(c, gerr)
-		return
+	var release func()
+	for attempt := 0; ; attempt++ {
+		rel, gerr := a.listGate.acquire(c.Request.Context(), true)
+		if gerr != nil {
+			a.queueRefused(c, gerr)
+			return
+		}
+		// Another request may have cached it while we queued. A hit streams to
+		// the client, so give the listing slot back BEFORE serving it: a stalled
+		// reader of a duplicate open must not hold the only slot.
+		if attempt < 3 && a.filesCache != nil && snapID != "" {
+			if has, _ := a.filesCache.has(c.Request.Context(), snapID, rev, storageKey); has {
+				rel()
+				if serveCached() {
+					return
+				}
+				continue // evicted in between: queue again
+			}
+		}
+		release = rel
+		break
 	}
 	defer release()
-	// Another request may have cached it while we queued.
-	if serveCached() {
-		return
-	}
 	if a.filesCache != nil && snapID != "" {
 		if reason, _ := a.filesCache.uncacheable(c.Request.Context(), repo.ID, storageKey, snapID, rev); reason == uncacheableCeiling {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "listing exceeds the spool ceiling and cannot be served"})

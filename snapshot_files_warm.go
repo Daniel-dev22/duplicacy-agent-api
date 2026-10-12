@@ -118,7 +118,7 @@ func (a *app) warmListCacheSweep(ctx context.Context) {
 	for i, r := range repos {
 		ids[i] = r.ID
 	}
-	a.filesCache.sweepBegin(ids)
+	a.filesCache.sweepBegin(ctx, ids)
 	defer a.filesCache.sweepEnd()
 
 	for _, repo := range repos {
@@ -224,11 +224,23 @@ func (a *app) warmWanted(ctx context.Context, ranks map[string]int, rev Snapshot
 	if err != nil || has {
 		return false, err // immutable => already correct
 	}
-	reason, err := a.filesCache.uncacheable(ctx, repoID, storage, rev.SnapshotID, rev.Revision)
+	m, err := a.filesCache.uncacheableInfo(ctx, repoID, storage, rev.SnapshotID, rev.Revision)
 	if err != nil {
-		return false, err
+		// A marker lookup problem must not silence the warmer: list as if unmarked.
+		slog.Warn("list-cache warm: marker lookup failed, treating as unmarked", "error", err)
+		return true, nil
 	}
-	return reason == "", nil
+	switch m.reason {
+	case "":
+		return true, nil
+	case uncacheableRowCap:
+		// the cap was raised since the marker was written
+		return m.gzBytes > 0 && m.gzBytes <= a.cfg.ListCacheRowMaxBytes, nil
+	case uncacheableCapEvicted:
+		// the size cap evicted it from the window; only a changed cap re-admits it
+		return m.capBytes != a.filesCache.maxBytes, nil
+	}
+	return false, nil
 }
 
 // warmListArgs builds the discovery `duplicacy list` args that decide WHICH

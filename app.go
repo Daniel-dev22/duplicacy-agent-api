@@ -156,6 +156,9 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 	// events.sqlite handle. Disabled → nil, and every call site no-ops.
 	if cfg.ListCacheEnabled {
 		a.filesCache = newSnapshotFilesCacheStore(events.DB(), cfg.ListCacheMaxBytes, cfg.ListCacheWarmN)
+		if err := a.filesCache.ensureSchema(ctx); err != nil {
+			return nil, fmt.Errorf("list-files marker schema: %w", err)
+		}
 	}
 	// Flush per-snapshot dedup rows captured during a `check -tabular` run
 	// into snapshot_stats on terminal state. Runs in a goroutine because the

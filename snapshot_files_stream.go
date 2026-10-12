@@ -203,6 +203,9 @@ type tailRing struct {
 }
 
 func (r *tailRing) write(p []byte) {
+	if len(p) == 0 {
+		return
+	}
 	if len(p) >= len(r.buf) {
 		copy(r.buf[:], p[len(p)-len(r.buf):])
 		r.pos, r.full = 0, true
@@ -333,6 +336,24 @@ func (a *app) storeListing(ctx context.Context, snapID string, rev int, storage,
 	return a.filesCache.putGzipped(ctx, snapID, rev, storage, repoID, gz, res.raw)
 }
 
+// idleDeadlineWriter re-arms the connection's write deadline before each write.
+type idleDeadlineWriter struct {
+	w    io.Writer
+	rc   *http.ResponseController
+	idle time.Duration
+}
+
+func (d *idleDeadlineWriter) arm() {
+	if err := d.rc.SetWriteDeadline(time.Now().Add(d.idle)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		slog.Debug("list-files write deadline not set", "error", err)
+	}
+}
+
+func (d *idleDeadlineWriter) Write(p []byte) (int, error) {
+	d.arm()
+	return d.w.Write(p)
+}
+
 // writeListing inflates a gz stream to w with an exact Content-Length. started
 // reports whether headers went out (after that a failure can only be signalled
 // by the short body closing the connection).
@@ -342,14 +363,15 @@ func writeListing(w gin.ResponseWriter, gz io.Reader, rawBytes int64) (started b
 		return false, err
 	}
 	defer zr.Close()
-	// A reader that stalls must not pin a hit slot or its row forever.
-	if rerr := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(listWriteTimeout)); rerr != nil && !errors.Is(rerr, http.ErrNotSupported) {
-		slog.Debug("list-files write deadline not set", "error", rerr)
-	}
+	// A reader that stalls must not pin a hit slot or its row forever. The
+	// deadline slides: it is re-armed before every chunk, so only a client that
+	// makes no progress for listWriteTimeout is cut off.
+	dst := &idleDeadlineWriter{w: w, rc: http.NewResponseController(w), idle: listWriteTimeout}
+	dst.arm()
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.FormatInt(rawBytes, 10))
 	w.WriteHeader(http.StatusOK)
-	n, err := io.Copy(w, zr)
+	n, err := io.Copy(dst, zr)
 	if err == nil && n != rawBytes {
 		err = fmt.Errorf("inflated %d bytes, expected %d", n, rawBytes)
 	}
