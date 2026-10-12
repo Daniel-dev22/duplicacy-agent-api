@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Daniel-dev22/agent-kit-go/logging"
+	"github.com/Daniel-dev22/agent-kit-go/memlimit"
 	"github.com/gin-gonic/gin"
 )
 
@@ -19,6 +20,12 @@ func main() {
 	// alongside stderr. See logging_setup.go for the rotation policy. No-op
 	// otherwise — stderr-only path is preserved for legacy deploys.
 	attachRotatingLogFile(os.Getenv("LOG_LEVEL"))
+
+	// Derive the Go soft memory limit from the container cgroup limit so the GC
+	// tightens before the kernel OOM-killer acts. Before any DB or server starts.
+	if _, err := memlimit.Apply(slog.Default()); err != nil {
+		slog.Warn("memlimit: not applied", "error", err)
+	}
 
 	cfg := loadConfig()
 	slog.Info("duplicacy-agent-api starting",
