@@ -21,9 +21,12 @@ func main() {
 	// otherwise — stderr-only path is preserved for legacy deploys.
 	attachRotatingLogFile(os.Getenv("LOG_LEVEL"))
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Derive the Go soft memory limit from the container cgroup limit so the GC
 	// tightens before the kernel OOM-killer acts. Before any DB or server starts.
-	if _, err := memlimit.Apply(slog.Default()); err != nil {
+	if _, err := memlimit.Apply(ctx, slog.Default()); err != nil {
 		slog.Warn("memlimit: not applied", "error", err)
 	}
 
@@ -38,9 +41,6 @@ func main() {
 	// any DB so a "first boot" / "clean shutdown" / "long downtime" line
 	// is the very first record we emit for this boot.
 	reportBootGap(cfg)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	app, err := newApp(ctx, cfg)
 	if err != nil {
