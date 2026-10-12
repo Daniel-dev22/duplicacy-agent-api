@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -39,6 +40,12 @@ var (
 
 	errListQueueTimeout = errors.New("list-files queue wait exceeded")
 	errSpoolFailed      = errors.New("list-files spool failed")
+	// errSpoolCeiling is permanent for that revision (it will exceed the
+	// ceiling every time), unlike errSpoolFailed which is an I/O fault.
+	errSpoolCeiling = errors.New("list-files listing exceeds spool ceiling")
+
+	// listWriteTimeout bounds how long a client may take to read a response.
+	listWriteTimeout = 5 * time.Minute
 )
 
 // listGate bounds concurrent cache-MISSING `list -files` runs. Deliberately not
@@ -63,7 +70,8 @@ func (g *listGate) acquire(ctx context.Context, bounded bool) (func(), error) {
 	if g == nil { // unwired (tests / disabled): unbounded, like a nil maintSem
 		return func() {}, nil
 	}
-	release := func() { <-g.sem }
+	var once sync.Once
+	release := func() { once.Do(func() { <-g.sem }) }
 	select {
 	case g.sem <- struct{}{}:
 		return release, nil
@@ -111,7 +119,7 @@ func (s *listSpool) Write(p []byte) (int, error) {
 		}
 	}
 	if s.n+int64(len(p)) > s.fileMax {
-		return 0, fmt.Errorf("%w: exceeds %d bytes", errSpoolFailed, s.fileMax)
+		return 0, fmt.Errorf("%w: exceeds %d bytes", errSpoolCeiling, s.fileMax)
 	}
 	if _, err := s.bw.Write(p); err != nil {
 		return 0, fmt.Errorf("%w: %v", errSpoolFailed, err)
@@ -173,45 +181,44 @@ func (s *listSpool) close() {
 	s.mem = bytes.Buffer{}
 }
 
-// cleanStaleSpool removes spill files left by a crashed process. Only files
-// older than maxAge go, so a live spool of a concurrent request is never hit.
-func cleanStaleSpool(dir string, maxAge time.Duration) {
-	ents, err := os.ReadDir(dir)
-	if err != nil {
-		return
-	}
-	for _, e := range ents {
-		info, err := e.Info()
-		if err == nil && !e.IsDir() && time.Since(info.ModTime()) > maxAge {
-			os.Remove(filepath.Join(dir, e.Name()))
-		}
+// resetListSpool deletes the spool directory. Called once at startup, before
+// the listener opens, so no live spool can exist: whatever is there is a
+// leftover of a crash or OOM-kill.
+func resetListSpool(dir string) {
+	if err := os.RemoveAll(dir); err != nil {
+		slog.Warn("list-files spool reset failed", "dir", dir, "error", err)
 	}
 }
 
 // tailRing keeps the last listTailBytes of output.
 type tailRing struct {
-	buf   [listTailBytes]byte
-	total int64
+	buf  [listTailBytes]byte
+	pos  int // next write index
+	full bool
 }
 
 func (r *tailRing) write(p []byte) {
 	if len(p) >= len(r.buf) {
 		copy(r.buf[:], p[len(p)-len(r.buf):])
-		r.total += int64(len(p))
+		r.pos, r.full = 0, true
 		return
 	}
-	pos := int(r.total % int64(len(r.buf)))
-	n := copy(r.buf[pos:], p)
-	copy(r.buf[:], p[n:])
-	r.total += int64(len(p))
+	n := copy(r.buf[r.pos:], p)
+	if n < len(p) {
+		copy(r.buf[:], p[n:])
+		r.full = true
+	}
+	r.pos = (r.pos + len(p)) % len(r.buf)
+	if r.pos == 0 {
+		r.full = true
+	}
 }
 
 func (r *tailRing) String() string {
-	if r.total <= int64(len(r.buf)) {
-		return string(r.buf[:r.total])
+	if !r.full {
+		return string(r.buf[:r.pos])
 	}
-	pos := int(r.total % int64(len(r.buf)))
-	return string(r.buf[pos:]) + string(r.buf[:pos])
+	return string(r.buf[r.pos:]) + string(r.buf[:r.pos])
 }
 
 // listSink is the single writer behind both cmd.Stdout and cmd.Stderr. Being the
@@ -263,6 +270,7 @@ func runListFiles(ctx context.Context, binary string, inv cliInvocation, timeout
 	cmd.Stdout = sink
 	cmd.Stderr = sink
 	err := cmd.Run()
+	childRSS.record("list-files", inv.RepoRoot, cmd.ProcessState, true)
 	if sink.err != nil {
 		err = sink.err
 	}
@@ -299,9 +307,11 @@ func (a *app) listSpoolMemMax() int {
 	return listSpoolMemMax
 }
 
-// storeListing caches a COMPLETE listing unless its gz exceeds the row cap
-// (served but not cached). Detached context: the request context may already be
-// cancelled by the time the response is written.
+// storeListing caches a COMPLETE listing unless its gz exceeds the row cap,
+// which is recorded as a permanent marker (served, never cached, never re-run by
+// the warmer). The SQLite bind needs the gz as one []byte, so a put briefly holds
+// up to the row cap (default 64 MiB) twice; rows beyond it are never read back
+// from the spill file.
 func (a *app) storeListing(ctx context.Context, snapID string, rev int, storage, repoID string, res *listResult) error {
 	if a.filesCache == nil || snapID == "" {
 		return nil
@@ -309,7 +319,7 @@ func (a *app) storeListing(ctx context.Context, snapID string, rev int, storage,
 	if m := a.cfg.ListCacheRowMaxBytes; m > 0 && res.spool.n > m {
 		slog.Info("list-files listing exceeds row cap, not cached",
 			"repo", repoID, "snapshot_id", snapID, "rev", rev, "storage", storage, "gz_bytes", res.spool.n, "cap", m)
-		return nil
+		return a.filesCache.markUncacheable(ctx, repoID, storage, snapID, rev, uncacheableRowCap, res.spool.n)
 	}
 	gz, err := res.spool.bytes()
 	if err != nil {
@@ -327,6 +337,10 @@ func writeListing(w gin.ResponseWriter, gz io.Reader, rawBytes int64) (started b
 		return false, err
 	}
 	defer zr.Close()
+	// A reader that stalls must not pin a hit slot or its row forever.
+	if rerr := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(listWriteTimeout)); rerr != nil && !errors.Is(rerr, http.ErrNotSupported) {
+		slog.Debug("list-files write deadline not set", "error", rerr)
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.FormatInt(rawBytes, 10))
 	w.WriteHeader(http.StatusOK)

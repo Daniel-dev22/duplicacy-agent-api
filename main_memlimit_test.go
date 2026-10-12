@@ -1,8 +1,6 @@
 package main
 
 import (
-	"go/ast"
-	"go/parser"
 	"go/token"
 	"testing"
 )
@@ -10,39 +8,25 @@ import (
 // TestMemLimitWiredBeforeApp pins the wiring: main() must call memlimit.Apply
 // before newApp opens any database, so the soft limit is in force first.
 func TestMemLimitWiredBeforeApp(t *testing.T) {
-	f, err := parser.ParseFile(token.NewFileSet(), "main.go", nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var memPos, appPos token.Pos
-	for _, d := range f.Decls {
-		fd, ok := d.(*ast.FuncDecl)
-		if !ok || fd.Name.Name != "main" {
-			continue
+	body := funcBody(t, "main.go", "main")
+	memPos, appPos := token.NoPos, token.NoPos
+	for _, ce := range topLevelCalls(body) {
+		switch callName(ce) {
+		case "memlimit.Apply":
+			if memPos == token.NoPos {
+				memPos = ce.Pos()
+			}
+		case "newApp":
+			if appPos == token.NoPos {
+				appPos = ce.Pos()
+			}
 		}
-		ast.Inspect(fd.Body, func(n ast.Node) bool {
-			c, ok := n.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			switch fn := c.Fun.(type) {
-			case *ast.SelectorExpr:
-				if id, ok := fn.X.(*ast.Ident); ok && id.Name == "memlimit" && fn.Sel.Name == "Apply" && memPos == 0 {
-					memPos = c.Pos()
-				}
-			case *ast.Ident:
-				if fn.Name == "newApp" && appPos == 0 {
-					appPos = c.Pos()
-				}
-			}
-			return true
-		})
 	}
-	if memPos == 0 {
-		t.Fatal("main() never calls memlimit.Apply")
+	if memPos == token.NoPos {
+		t.Fatal("main() never calls memlimit.Apply as a top-level statement (a call under `if` or in a closure does not count)")
 	}
-	if appPos == 0 {
-		t.Fatal("anchor call newApp not found; update this test")
+	if appPos == token.NoPos {
+		t.Fatal("anchor call newApp not found as a top-level statement; update this test")
 	}
 	if memPos > appPos {
 		t.Fatal("memlimit.Apply must run before newApp")

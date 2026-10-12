@@ -44,9 +44,9 @@ type cliInvocation struct {
 func (i cliInvocation) command(ctx context.Context, binary string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, binary, i.Args...)
 	cmd.Dir = i.RepoRoot
-	if len(i.EnvAdds) > 0 {
-		cmd.Env = append(os.Environ(), i.EnvAdds...)
-	}
+	// The agent's own GOMEMLIMIT must not reach a (Go) duplicacy child: each
+	// child would apply the parent's whole limit to itself.
+	cmd.Env = append(childBaseEnv(), i.EnvAdds...)
 	cmd.Stdin = strings.NewReader("\n")
 	return cmd
 }
@@ -62,10 +62,25 @@ func runSync(ctx context.Context, binary string, inv cliInvocation, timeout time
 	}
 	cmd := inv.command(ctx, binary)
 	out, err := cmd.CombinedOutput()
+	if len(inv.Args) > 0 {
+		childRSS.record("sync:"+inv.Args[0], inv.RepoRoot, cmd.ProcessState, false)
+	}
 	if err != nil {
 		return out, fmt.Errorf("duplicacy %s: %w (output: %s)", strings.Join(inv.Args, " "), err, truncate(string(out), 400))
 	}
 	return out, nil
+}
+
+// childBaseEnv is the agent's environment minus GOMEMLIMIT.
+func childBaseEnv() []string {
+	env := os.Environ()
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, "GOMEMLIMIT=") {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 func truncate(s string, n int) string {
@@ -277,10 +292,22 @@ func (a *app) serveSnapshotFiles(c *gin.Context, repo *Repo, rev int, vend func(
 		snapID = repo.SnapshotID
 	}
 	logAttrs := []any{"repo", repo.ID, "snapshot_id", snapID, "rev", rev, "storage", storageKey}
+	// serveCached answers a hit and reports whether the request is finished.
+	// Hits are not behind the listing gate, but each holds one stored row in RAM
+	// while it inflates, so they have their own small bound.
 	serveCached := func() bool {
 		if a.filesCache == nil || snapID == "" {
 			return false
 		}
+		if has, herr := a.filesCache.has(c.Request.Context(), snapID, rev, storageKey); herr != nil || !has {
+			return false
+		}
+		rel, aerr := a.hitGate.acquire(c.Request.Context(), true)
+		if aerr != nil {
+			a.queueRefused(c, aerr)
+			return true
+		}
+		defer rel()
 		l, hit, cerr := a.filesCache.open(c.Request.Context(), snapID, rev, storageKey)
 		if cerr != nil {
 			slog.Warn("list-files cache get failed", append([]any{"error", cerr}, logAttrs...)...)
@@ -304,16 +331,19 @@ func (a *app) serveSnapshotFiles(c *gin.Context, repo *Repo, rev int, vend func(
 	// Misses only are gated; hits above are not.
 	release, gerr := a.listGate.acquire(c.Request.Context(), true)
 	if gerr != nil {
-		if errors.Is(gerr, errListQueueTimeout) {
-			c.Header("Retry-After", strconv.Itoa(max(1, int(a.cfg.ListQueueWait/time.Second))))
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "listing queue is full, retry shortly"})
-		}
-		return // client gone
+		a.queueRefused(c, gerr)
+		return
 	}
 	defer release()
 	// Another request may have cached it while we queued.
 	if serveCached() {
 		return
+	}
+	if a.filesCache != nil && snapID != "" {
+		if reason, _ := a.filesCache.uncacheable(c.Request.Context(), repo.ID, storageKey, snapID, rev); reason == uncacheableCeiling {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "listing exceeds the spool ceiling and cannot be served"})
+			return
+		}
 	}
 
 	env, rsaPriv, cleanup, err := vend()
@@ -351,13 +381,23 @@ func (a *app) serveSnapshotFiles(c *gin.Context, repo *Repo, rev int, vend func(
 		Args:     args,
 		EnvAdds:  env,
 	}, listFilesTimeout, a.listSpoolDir(), a.listSpoolMemMax())
+	// The child is gone and the spool is complete: free the slot BEFORE talking
+	// to the client, so a reader that stalls cannot block other misses, the
+	// warmer, or (through the warmer) maintenance.
+	release()
 	if err != nil {
-		if errors.Is(err, errSpoolFailed) {
+		switch {
+		case errors.Is(err, errSpoolCeiling):
+			if a.filesCache != nil && snapID != "" {
+				_ = a.filesCache.markUncacheable(c.Request.Context(), repo.ID, storageKey, snapID, rev, uncacheableCeiling, 0)
+			}
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
+		case errors.Is(err, errSpoolFailed):
 			c.Header("Retry-After", "30")
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
-			return
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "output": tail})
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "output": tail})
 		return
 	}
 	defer res.close()
@@ -370,6 +410,15 @@ func (a *app) serveSnapshotFiles(c *gin.Context, repo *Repo, rev int, vend func(
 	defer cancel()
 	if err := a.storeListing(putCtx, snapID, rev, storageKey, repo.ID, res); err != nil {
 		slog.Warn("list-files cache put failed", append([]any{"error", err}, logAttrs...)...)
+	}
+}
+
+// queueRefused answers a gate that did not admit the request: 503 + Retry-After
+// on a queue timeout; nothing when the client already left.
+func (a *app) queueRefused(c *gin.Context, err error) {
+	if errors.Is(err, errListQueueTimeout) {
+		c.Header("Retry-After", strconv.Itoa(max(1, int(a.cfg.ListQueueWait/time.Second))))
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "listing queue is full, retry shortly"})
 	}
 }
 

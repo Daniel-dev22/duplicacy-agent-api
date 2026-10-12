@@ -104,6 +104,7 @@ type Config struct {
 	// waits for a slot before answering 503.
 	ListMaxConcurrent int
 	ListQueueWait     time.Duration
+	ListMaxHits       int // concurrent cache-hit inflations
 
 	// --- Directory-size gatherer (tree_sizes.go) ---
 	// The gatherer is a self-paced background loop, fully decoupled from the
@@ -176,9 +177,10 @@ func loadConfig() Config {
 		ListCacheWarmN:        getEnvInt("LIST_FILES_CACHE_WARM_N", 5),
 		ListCacheMaxBytes:     int64(getEnvInt("LIST_FILES_CACHE_MAX_BYTES", 1<<30)), // 1 GiB
 		ListCacheWarmInterval: getEnvDuration("LIST_FILES_CACHE_WARM_INTERVAL", 30*time.Minute),
-		ListCacheRowMaxBytes:  int64(getEnvInt("LIST_FILES_CACHE_ROW_MAX_BYTES", 256<<20)), // 256 MiB gz
+		ListCacheRowMaxBytes:  int64(getEnvInt("LIST_FILES_CACHE_ROW_MAX_BYTES", 64<<20)), // 64 MiB gz
 		ListMaxConcurrent:     getEnvInt("LIST_FILES_MAX_CONCURRENT", 1),
 		ListQueueWait:         getEnvDuration("LIST_FILES_QUEUE_WAIT", 30*time.Second),
+		ListMaxHits:           getEnvInt("LIST_FILES_MAX_CONCURRENT_HITS", 4),
 
 		TreeSizeEnabled:            getEnvBool("TREE_SIZE_ENABLED", true),
 		TreeSizeLargeFileThreshold: int64(getEnvInt("TREE_SIZE_LARGE_FILE_THRESHOLD", 50000)),

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -38,7 +39,6 @@ const (
 // slot (see runListGated) so warming queues behind/beside check+prune rather
 // than piling onto the wave.
 func (a *app) runListCacheWarmer(ctx context.Context) {
-	cleanStaleSpool(a.listSpoolDir(), 15*time.Minute)
 	startup := time.NewTimer(listWarmStartupDelay)
 	defer startup.Stop()
 
@@ -155,18 +155,19 @@ func (a *app) warmListCacheSweep(ctx context.Context) {
 			}
 
 			// 2. Warm the newest-N revisions per snapshot id that aren't cached.
+			ranks := map[string]int{}
 			for _, rev := range newestRevisionsPerSnapshot(live, keepN) {
 				if warmed >= maxWarmListsPerSweep {
 					capped = true
 					break
 				}
-				has, herr := a.filesCache.has(ctx, rev.SnapshotID, rev.Revision, storage)
-				if herr != nil {
-					slog.Warn("list-cache warm: has check failed", "error", herr)
+				want, werr := a.warmWanted(ctx, ranks, rev, repo.ID, storage)
+				if werr != nil {
+					slog.Warn("list-cache warm: check failed", "error", werr)
 					continue
 				}
-				if has {
-					continue // immutable ⇒ already correct
+				if !want {
+					continue
 				}
 				if werr := a.warmOneListing(ctx, repo, storage, keyPath, rev.SnapshotID, rev.Revision, env); werr != nil {
 					slog.Warn("list-cache warm: pre-list failed",
@@ -194,6 +195,28 @@ func (a *app) warmListCacheSweep(ctx context.Context) {
 	slog.Info("list-files cache warm sweep done",
 		"warmed", warmed, "reconciled", reconciled, "capped", capped,
 		"rows", rows, "gz_bytes", gzBytes)
+}
+
+// warmWanted decides whether to list one candidate (candidates arrive newest
+// first per snapshot; ranks counts them). It applies the SAME pinPolicy the
+// evictor protects with, re-read each time because every warmed listing can move
+// it, skips immutable revisions already cached, and skips revisions marked
+// permanently uncacheable.
+func (a *app) warmWanted(ctx context.Context, ranks map[string]int, rev Snapshot, repoID, storage string) (bool, error) {
+	rank := ranks[rev.SnapshotID]
+	ranks[rev.SnapshotID] = rank + 1
+	if rank >= a.filesCache.effectivePinN(ctx) {
+		return false, nil
+	}
+	has, err := a.filesCache.has(ctx, rev.SnapshotID, rev.Revision, storage)
+	if err != nil || has {
+		return false, err // immutable => already correct
+	}
+	reason, err := a.filesCache.uncacheable(ctx, repoID, storage, rev.SnapshotID, rev.Revision)
+	if err != nil {
+		return false, err
+	}
+	return reason == "", nil
 }
 
 // warmListArgs builds the discovery `duplicacy list` args that decide WHICH
@@ -255,26 +278,50 @@ func (a *app) warmOneListing(ctx context.Context, repo *Repo, storage, keyPath, 
 	if storage != "" && storage != "default" {
 		args = append(args, "-storage", storage)
 	}
-	// Takes the listing gate IN ADDITION to the maintenance slot: the warmer and
-	// interactive misses together never exceed the listing budget.
-	release, ok := a.jobs.acquireMaint(ctx)
-	if !ok {
-		return ctx.Err()
-	}
-	defer release()
-	relGate, err := a.listGate.acquire(ctx, false)
+	res, err := a.runWarmListing(ctx, repo, storage, snapshotID, rev, args, env)
 	if err != nil {
-		return err
-	}
-	defer relGate()
-	res, _, err := runListFiles(ctx, a.cfg.DuplicacyBinary, cliInvocation{
-		RepoRoot: repo.Path, Args: args, EnvAdds: env,
-	}, listFilesTimeout, a.listSpoolDir(), a.listSpoolMemMax())
-	if err != nil {
+		if errors.Is(err, errSpoolCeiling) {
+			// Permanent for this revision: stop re-running it every sweep.
+			if merr := a.filesCache.markUncacheable(ctx, repo.ID, storage, snapshotID, rev, uncacheableCeiling, 0); merr != nil {
+				slog.Warn("list-cache warm: marking uncacheable failed", "error", merr)
+			}
+		}
 		return err
 	}
 	defer res.close()
 	return a.storeListing(ctx, snapshotID, rev, storage, repo.ID, res)
+}
+
+// runWarmListing runs one `list -files` while holding a maintenance slot AND a
+// listing slot. It never waits for the listing gate while holding the
+// maintenance slot (that would park check/prune behind an interactive miss):
+// the gate wait is bounded, and on timeout the maintenance slot is given back
+// before retrying. Both are released as soon as the child has exited.
+func (a *app) runWarmListing(ctx context.Context, repo *Repo, storage, snapshotID string, rev int, args, env []string) (*listResult, error) {
+	for {
+		relMaint, ok := a.jobs.acquireMaint(ctx)
+		if !ok {
+			return nil, ctx.Err()
+		}
+		relGate, err := a.listGate.acquire(ctx, true)
+		if err == nil {
+			defer relMaint()
+			defer relGate()
+			res, _, rerr := runListFiles(ctx, a.cfg.DuplicacyBinary, cliInvocation{
+				RepoRoot: repo.Path, Args: args, EnvAdds: env,
+			}, listFilesTimeout, a.listSpoolDir(), a.listSpoolMemMax())
+			return res, rerr
+		}
+		relMaint()
+		if !errors.Is(err, errListQueueTimeout) {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 // newestRevisionsPerSnapshot returns the newest keepN revisions for each

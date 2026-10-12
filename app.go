@@ -74,6 +74,7 @@ type app struct {
 	filesCache          *snapshotFilesCacheStore // persistent `list -files` cache (nil when disabled)
 	warmDirty           chan struct{}            // buffered(1) nudge → debounced list-cache warm sweep
 	listGate            *listGate                // bounds concurrent cache-missing `list -files` runs
+	hitGate             *listGate                // bounds concurrent cache-hit inflations (each holds one stored row in RAM)
 	mapping             *repoMappingStore        // controller-managed repo↔credential mapping
 	secrets             *secretCache             // 60s TTL cache of vended bundles
 	compose             *composeIndex            // bounded scan of mounted COMPOSE_SCAN_ROOTS for compose project dirs
@@ -85,6 +86,10 @@ type app struct {
 }
 
 func newApp(ctx context.Context, cfg Config) (*app, error) {
+	// No listing can be in flight before the listener opens, so any spool file
+	// is a leftover of a crash. Independent of whether the cache is enabled.
+	resetListSpool(filepath.Join(cfg.ConfigDir, listSpoolSubdir))
+
 	cc, err := buildControlCenterClient(cfg)
 	if err != nil {
 		return nil, err
@@ -144,6 +149,7 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 		compose:             newComposeIndex(cfg.ComposeScanRoots),
 		warmDirty:           make(chan struct{}, 1),
 		listGate:            newListGate(cfg.ListMaxConcurrent, cfg.ListQueueWait),
+		hitGate:             newListGate(cfg.ListMaxHits, cfg.ListQueueWait),
 		stop:                make(chan struct{}),
 	}
 	// Persistent `list -files` cache (snapshot_files_cache.go). Shares the
@@ -310,8 +316,10 @@ func (a *app) startJobStateReconcile(ctx context.Context) {
 
 // --- placeholder handlers; real implementations replace these in subsequent tasks ---
 
-func (a *app) handleLiveness(c *gin.Context)  { c.JSON(http.StatusOK, gin.H{"status": "alive"}) }
-func (a *app) handleReadiness(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ready"}) }
+func (a *app) handleLiveness(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "alive"}) }
+func (a *app) handleReadiness(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "ready", "child_peak_rss_kb": childRSS.snapshot()})
+}
 
 func notImplemented(c *gin.Context) {
 	c.JSON(http.StatusNotImplemented, gin.H{"error": "not implemented yet"})

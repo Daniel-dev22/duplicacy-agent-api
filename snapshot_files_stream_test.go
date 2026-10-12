@@ -114,6 +114,7 @@ func newListTestApp(t *testing.T, bin string, slots int, wait time.Duration) (*a
 		},
 		jobs:       newJobRegistry(1, 1),
 		listGate:   newListGate(slots, wait),
+		hitGate:    newListGate(4, wait),
 		filesCache: newTestFilesCache(t, 0, 5),
 	}
 	return a, &Repo{ID: "repoA", Path: t.TempDir(), SnapshotID: "snapA"}
@@ -403,6 +404,23 @@ func TestTailRingKeepsLastBytes(t *testing.T) {
 	if r.String() != strings.Repeat("q", listTailBytes) {
 		t.Fatal("oversized write must keep only the last window")
 	}
+
+	// A single write >= the window after earlier bytes must still be in order.
+	var r2 tailRing
+	r2.write([]byte("abc"))
+	big2 := make([]byte, listTailBytes+10)
+	for i := range big2 {
+		big2[i] = byte('a' + i%26)
+	}
+	r2.write(big2)
+	if r2.String() != string(big2[10:]) {
+		t.Fatal("large write after small garbled the tail")
+	}
+	r2.write([]byte("XY"))
+	want := string(big2[12:]) + "XY"
+	if r2.String() != want {
+		t.Fatal("write after a large write garbled the tail")
+	}
 }
 
 // --- D3 / D6 ---
@@ -508,32 +526,389 @@ func TestEvictBySizeExemptsFailedRepoAndRelaxesPin(t *testing.T) {
 	}
 }
 
-// --- wiring (AST, like the route-level guards elsewhere in this repo) ---
+// blockRW stalls the first body write until unblock is closed (a client that
+// stopped reading). started closes once the response write begins.
+type blockRW struct {
+	*hashRW
+	started chan struct{}
+	unblock chan struct{}
+	once    sync.Once
+}
 
-func funcBody(t *testing.T, file, name string) *ast.BlockStmt {
-	t.Helper()
-	f, err := parser.ParseFile(token.NewFileSet(), file, nil, 0)
+func newBlockRW() *blockRW {
+	return &blockRW{hashRW: newHashRW(), started: make(chan struct{}), unblock: make(chan struct{})}
+}
+
+func (w *blockRW) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.started) })
+	<-w.unblock
+	return w.hashRW.Write(p)
+}
+
+func serveTo(a *app, repo *Repo, rev int, w http.ResponseWriter, env []string) {
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/files", nil)
+	a.serveSnapshotFiles(c, repo, rev, func() ([]string, map[string]string, func(), error) {
+		return env, map[string]string{}, func() {}, nil
+	})
+}
+
+func TestStalledClientDoesNotHoldListingGateOrWarmer(t *testing.T) {
+	bin := writeFakeList(t)
+	a, repo := newListTestApp(t, bin, 1, 300*time.Millisecond)
+	env := []string{"LISTSZ=100000"}
+
+	stalled := newBlockRW()
+	done := make(chan struct{})
+	go func() { serveTo(a, repo, 1, stalled, env); close(done) }()
+	select {
+	case <-stalled.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("listing never reached the response write")
+	}
+
+	// The only listing slot must be free while the client is stalled.
+	if w := serve(a, repo, 2, "", env, nil); w.status != 200 {
+		t.Fatalf("second miss blocked by a stalled reader: status %d", w.status)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := a.warmOneListing(ctx, repo, "default", "", "snapW", 20, env); err != nil {
+		t.Fatalf("warmer blocked by a stalled reader: %v", err)
+	}
+	// ...and so must the maintenance slot the warmer took.
+	rel, ok := a.jobs.acquireMaint(ctx)
+	if !ok {
+		t.Fatal("maintenance slot still held")
+	}
+	rel()
+	close(stalled.unblock)
+	<-done
+	if stalled.status != 200 {
+		t.Fatalf("stalled request finally got %d", stalled.status)
+	}
+}
+
+func TestWarmerNeverHoldsMaintWhileWaitingOnGate(t *testing.T) {
+	bin := writeFakeList(t)
+	a, repo := newListTestApp(t, bin, 1, 100*time.Millisecond)
+	relGate, err := a.listGate.acquire(context.Background(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, d := range f.Decls {
-		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == name {
-			return fd.Body
+	ctx, cancel := context.WithCancel(context.Background())
+	res := make(chan error, 1)
+	go func() {
+		_, e := a.runWarmListing(ctx, repo, "default", "snapW", 1, []string{"list", "-files"}, []string{"LISTSZ=10"})
+		res <- e
+	}()
+	time.Sleep(450 * time.Millisecond) // several bounded gate waits
+	// check/prune must be able to take the maintenance slot meanwhile.
+	got := make(chan bool, 1)
+	go func() {
+		rel, ok := a.jobs.acquireMaint(context.Background())
+		if ok {
+			rel()
 		}
+		got <- ok
+	}()
+	select {
+	case ok := <-got:
+		if !ok {
+			t.Fatal("acquireMaint failed")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("maintenance slot held while the warmer waits for the listing gate")
 	}
-	t.Fatalf("%s not found in %s", name, file)
-	return nil
+	relGate()
+	if e := <-res; e != nil {
+		t.Fatalf("warm listing after gate freed: %v", e)
+	}
+	cancel()
 }
 
-func callsIn(body *ast.BlockStmt) map[string]bool {
+func TestHitsAreBoundedByHitGate(t *testing.T) {
+	bin := writeFakeList(t)
+	a, repo := newListTestApp(t, bin, 1, 150*time.Millisecond)
+	a.hitGate = newListGate(1, 150*time.Millisecond)
+	if w := serve(a, repo, 1, "", []string{"LISTSZ=4096"}, nil); w.status != 200 {
+		t.Fatalf("prime %d", w.status)
+	}
+	stalled := newBlockRW()
+	done := make(chan struct{})
+	go func() { serveTo(a, repo, 1, stalled, nil); close(done) }()
+	<-stalled.started
+	w := serve(a, repo, 1, "", nil, nil)
+	if w.status != http.StatusServiceUnavailable || w.hdr.Get("Retry-After") == "" {
+		t.Fatalf("second concurrent hit status %d, want bounded 503", w.status)
+	}
+	close(stalled.unblock)
+	<-done
+}
+
+func TestSpoolCeilingIs413MarkedAndWarmerSkips(t *testing.T) {
+	bin := writeFakeList(t)
+	oldMax := listSpoolFileMax
+	listSpoolFileMax = 2 << 10
+	t.Cleanup(func() { listSpoolFileMax = oldMax })
+	a, repo := newListTestApp(t, bin, 1, time.Second)
+	a.cfg.ListCacheRowMaxBytes = 1 << 10
+	ctx := context.Background()
+
+	w := serve(a, repo, 8, "", []string{"LISTSEQ=300000"}, nil)
+	if w.status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("ceiling status %d, want 413", w.status)
+	}
+	if r, _ := a.filesCache.uncacheable(ctx, "repoA", "default", "snapA", 8); r != uncacheableCeiling {
+		t.Fatalf("ceiling marker = %q", r)
+	}
+	// Second request is refused immediately, without running the child.
+	t0 := time.Now()
+	w = serve(a, repo, 8, "", []string{"LISTEXIT=9"}, nil)
+	if w.status != http.StatusRequestEntityTooLarge || time.Since(t0) > time.Second {
+		t.Fatalf("marked ceiling not short-circuited: %d", w.status)
+	}
+	ranks := map[string]int{}
+	if want, _ := a.warmWanted(ctx, ranks, Snapshot{SnapshotID: "snapA", Revision: 8}, "repoA", "default"); want {
+		t.Fatal("warmer would re-run a marked revision")
+	}
+}
+
+func TestRowCapMarkerSurvivesAndReconcileDropsIt(t *testing.T) {
+	bin := writeFakeList(t)
+	a, repo := newListTestApp(t, bin, 1, time.Second)
+	a.cfg.ListCacheRowMaxBytes = 64 << 10
+	ctx := context.Background()
+	if w := serve(a, repo, 4, "", []string{"LISTSEQ=1500000"}, nil); w.status != 200 {
+		t.Fatalf("status %d", w.status)
+	}
+	if r, _ := a.filesCache.uncacheable(ctx, "repoA", "default", "snapA", 4); r != uncacheableRowCap {
+		t.Fatalf("row-cap marker = %q", r)
+	}
+	if want, _ := a.warmWanted(ctx, map[string]int{}, Snapshot{SnapshotID: "snapA", Revision: 4}, "repoA", "default"); want {
+		t.Fatal("warmer would re-list an over-cap revision")
+	}
+
+	// Revision still live: marker stays. Pruned: marker goes.
+	st := newSweepState()
+	st.known["repoA"] = struct{}{}
+	st.swept[repoStorage{"repoA", "default"}] = struct{}{}
+	st.sweptStorage["default"] = struct{}{}
+	st.keep[storageSnapRevKey("default", "snapA", 4)] = struct{}{}
+	if _, err := a.filesCache.reconcileAgainstKeep(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := a.filesCache.uncacheable(ctx, "repoA", "default", "snapA", 4); r == "" {
+		t.Fatal("marker dropped while its revision is live")
+	}
+	delete(st.keep, storageSnapRevKey("default", "snapA", 4))
+	if _, err := a.filesCache.reconcileAgainstKeep(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := a.filesCache.uncacheable(ctx, "repoA", "default", "snapA", 4); r != "" {
+		t.Fatal("marker survived its revision being pruned")
+	}
+	// A failed repo's markers are exempt, like its rows.
+	a.filesCache.markUncacheable(ctx, "repoA", "default", "snapA", 5, uncacheableRowCap, 1)
+	st.failed["repoA"] = struct{}{}
+	a.filesCache.reconcileAgainstKeep(ctx, st)
+	if r, _ := a.filesCache.uncacheable(ctx, "repoA", "default", "snapA", 5); r == "" {
+		t.Fatal("failed repo's marker was reconciled away")
+	}
+}
+
+// Probe-P3 style: N=5 pinned, cap fits fewer. Warmer and evictor share one
+// policy, so after the first sweep nothing is re-listed or re-evicted.
+func TestWarmerAndEvictorSettle(t *testing.T) {
+	ctx := context.Background()
+	c := newTestFilesCache(t, 6500, 5)
+	a := &app{filesCache: c}
+	row := bytes.Repeat([]byte{7}, 1000)
+	snaps := []string{"snapA", "snapB", "snapC"}
+	var live []Snapshot
+	for _, sn := range snaps {
+		for rev := 1; rev <= 8; rev++ {
+			live = append(live, Snapshot{SnapshotID: sn, Revision: rev})
+		}
+	}
+	var relisted []int
+	for sweep := 0; sweep < 5; sweep++ {
+		n := 0
+		ranks := map[string]int{}
+		for _, rev := range newestRevisionsPerSnapshot(live, 5) {
+			want, err := a.warmWanted(ctx, ranks, rev, "repoA", "default")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !want {
+				continue
+			}
+			n++
+			if err := c.putGzipped(ctx, rev.SnapshotID, rev.Revision, "default", "repoA", row, 1); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := c.evictBySize(ctx, nil); err != nil {
+			t.Fatal(err)
+		}
+		relisted = append(relisted, n)
+	}
+	for i := 2; i < len(relisted); i++ {
+		if relisted[i] != 0 {
+			t.Fatalf("sweeps never settle, listings per sweep: %v", relisted)
+		}
+	}
+	// What remains is the NEWEST revisions (oldest-first eviction), within the cap.
+	_, gz, _ := c.stats(ctx)
+	if gz > 6500 {
+		t.Fatalf("cache %d bytes over the cap", gz)
+	}
+	for _, sn := range snaps {
+		for _, rev := range []int{7, 8} {
+			if ok, _ := c.has(ctx, sn, rev, "default"); !ok {
+				t.Fatalf("%s rev%d (newest) was evicted", sn, rev)
+			}
+		}
+	}
+}
+
+func TestPinPolicy(t *testing.T) {
+	if got := pinPolicy(100, 5, 1000); got != 5 {
+		t.Fatalf("fits: %d", got)
+	}
+	if got := pinPolicy(300, 5, 1000); got != maxPinRelaxedKeep {
+		t.Fatalf("over cap: %d", got)
+	}
+	if got := pinPolicy(300, 1, 10); got != 1 {
+		t.Fatalf("warmN below relaxed keep: %d", got)
+	}
+	if got := pinPolicy(300, 5, 0); got != 5 {
+		t.Fatalf("cap disabled: %d", got)
+	}
+}
+
+func TestResetListSpoolRemovesLeftovers(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), listSpoolSubdir)
+	os.MkdirAll(dir, 0o700)
+	os.WriteFile(filepath.Join(dir, "list-1.gz"), []byte("x"), 0o600) // brand new: no age guard
+	resetListSpool(dir)
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("spool dir survived reset")
+	}
+}
+
+func TestChildRSSRecordedAndExposed(t *testing.T) {
+	bin := writeFakeList(t)
+	a, repo := newListTestApp(t, bin, 1, time.Second)
+	if w := serve(a, repo, 1, "", []string{"LISTSZ=4096"}, nil); w.status != 200 {
+		t.Fatalf("status %d", w.status)
+	}
+	if childRSS.snapshot()["list-files"] <= 0 {
+		t.Fatalf("no list-files RSS recorded: %v", childRSS.snapshot())
+	}
+	t.Setenv("LISTSZ", "10")
+	if _, err := runSync(context.Background(), bin, cliInvocation{RepoRoot: t.TempDir(), Args: []string{"list"}}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if childRSS.snapshot()["sync:list"] <= 0 {
+		t.Fatalf("no sync RSS recorded: %v", childRSS.snapshot())
+	}
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/health/ready", nil)
+	a.handleReadiness(c)
+	if !strings.Contains(rec.Body.String(), `"child_peak_rss_kb"`) || !strings.Contains(rec.Body.String(), "list-files") {
+		t.Fatalf("readiness lacks child RSS: %s", rec.Body.String())
+	}
+}
+
+func TestChildEnvDropsGOMEMLIMIT(t *testing.T) {
+	t.Setenv("GOMEMLIMIT", "1GiB")
+	t.Setenv("KEEP_ME", "1")
+	cmd := cliInvocation{EnvAdds: []string{"ADDED=1"}}.command(context.Background(), "x")
+	var keep, added bool
+	for _, kv := range cmd.Env {
+		if strings.HasPrefix(kv, "GOMEMLIMIT=") {
+			t.Fatal("GOMEMLIMIT leaked into a duplicacy child")
+		}
+		keep = keep || kv == "KEEP_ME=1"
+		added = added || kv == "ADDED=1"
+	}
+	if !keep || !added {
+		t.Fatal("child env lost entries")
+	}
+}
+
+// --- wiring (AST) ---
+//
+// A bare "call appears in the body" check is satisfied by `if false { f() }`.
+// These helpers only count calls that actually run: statements of the function
+// body itself (topLevelCalls), or anywhere except under a literal `if false`
+// (liveCalls).
+
+func callName(ce *ast.CallExpr) string {
+	switch fn := ce.Fun.(type) {
+	case *ast.SelectorExpr:
+		if id, ok := fn.X.(*ast.Ident); ok {
+			return id.Name + "." + fn.Sel.Name
+		}
+		return fn.Sel.Name
+	case *ast.Ident:
+		return fn.Name
+	}
+	return ""
+}
+
+// topLevelCalls returns calls made by the body's own statements, in order,
+// without descending into any nested block or closure.
+func topLevelCalls(body *ast.BlockStmt) []*ast.CallExpr {
+	var out []*ast.CallExpr
+	collect := func(n ast.Node) {
+		ast.Inspect(n, func(n ast.Node) bool {
+			if _, ok := n.(*ast.FuncLit); ok {
+				return false
+			}
+			if ce, ok := n.(*ast.CallExpr); ok {
+				out = append(out, ce)
+			}
+			return true
+		})
+	}
+	for _, st := range body.List {
+		// `if x := f(); ...` runs f unconditionally; only its branches are guarded.
+		if is, ok := st.(*ast.IfStmt); ok && is.Init != nil {
+			collect(is.Init)
+			continue
+		}
+		switch st.(type) {
+		case *ast.IfStmt, *ast.ForStmt, *ast.RangeStmt, *ast.SwitchStmt, *ast.TypeSwitchStmt,
+			*ast.SelectStmt, *ast.BlockStmt, *ast.GoStmt, *ast.DeferStmt, *ast.LabeledStmt:
+			continue
+		}
+		collect(st)
+	}
+	return out
+}
+
+// liveCalls returns every call name in body except those under `if false`.
+func liveCalls(body *ast.BlockStmt) map[string]bool {
 	out := map[string]bool{}
 	ast.Inspect(body, func(n ast.Node) bool {
+		if is, ok := n.(*ast.IfStmt); ok {
+			if id, ok := is.Cond.(*ast.Ident); ok && id.Name == "false" {
+				if is.Else != nil {
+					for k := range liveCalls(&ast.BlockStmt{List: []ast.Stmt{is.Else}}) {
+						out[k] = true
+					}
+				}
+				return false
+			}
+		}
 		if ce, ok := n.(*ast.CallExpr); ok {
+			out[callName(ce)] = true
 			switch fn := ce.Fun.(type) {
 			case *ast.SelectorExpr:
 				out[fn.Sel.Name] = true
-			case *ast.Ident:
-				out[fn.Name] = true
 			}
 		}
 		return true
@@ -541,13 +916,73 @@ func callsIn(body *ast.BlockStmt) map[string]bool {
 	return out
 }
 
+func parseBody(t *testing.T, src, fn string) *ast.BlockStmt {
+	t.Helper()
+	f, err := parser.ParseFile(token.NewFileSet(), "x.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == fn {
+			return fd.Body
+		}
+	}
+	t.Fatalf("%s not found", fn)
+	return nil
+}
+
+func funcBody(t *testing.T, file, name string) *ast.BlockStmt {
+	t.Helper()
+	b, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parseBody(t, string(b), name)
+}
+
+func hasTopLevelCall(body *ast.BlockStmt, name string) bool {
+	for _, ce := range topLevelCalls(body) {
+		if callName(ce) == name {
+			return true
+		}
+	}
+	return false
+}
+
+func TestWiringHelpersRejectDeadBranches(t *testing.T) {
+	src := `package main
+func main() {
+	if false { memlimit.Apply(); resetListSpool(d) }
+	if cond { other() }
+	func() { closure() }()
+	x := newApp()
+	_ = x
+}`
+	body := parseBody(t, src, "main")
+	for _, dead := range []string{"memlimit.Apply", "resetListSpool", "other", "closure"} {
+		if hasTopLevelCall(body, dead) {
+			t.Fatalf("negative control: %s is not a top-level statement call", dead)
+		}
+	}
+	if !hasTopLevelCall(body, "newApp") {
+		t.Fatal("positive control: newApp is top level")
+	}
+	live := liveCalls(body)
+	if live["memlimit.Apply"] || live["resetListSpool"] {
+		t.Fatal("negative control: calls under `if false` must not count")
+	}
+	if !live["other"] || !live["newApp"] {
+		t.Fatal("positive control: live calls missing")
+	}
+}
+
 func TestListingWiring(t *testing.T) {
-	h := callsIn(funcBody(t, "duplicacy.go", "handleSnapshotFiles"))
+	h := liveCalls(funcBody(t, "duplicacy.go", "handleSnapshotFiles"))
 	if !h["serveSnapshotFiles"] {
 		t.Fatal("route handler must go through serveSnapshotFiles")
 	}
-	s := callsIn(funcBody(t, "duplicacy.go", "serveSnapshotFiles"))
-	for _, want := range []string{"acquire", "runListFiles", "writeListing", "storeListing", "open"} {
+	s := liveCalls(funcBody(t, "duplicacy.go", "serveSnapshotFiles"))
+	for _, want := range []string{"acquire", "runListFiles", "writeListing", "storeListing", "open", "release", "markUncacheable"} {
 		if !s[want] {
 			t.Fatalf("serveSnapshotFiles must call %s", want)
 		}
@@ -557,9 +992,26 @@ func TestListingWiring(t *testing.T) {
 			t.Fatalf("serveSnapshotFiles must not call %s", banned)
 		}
 	}
-	w := callsIn(funcBody(t, "snapshot_files_warm.go", "warmOneListing"))
-	if !w["acquireMaint"] || !w["acquire"] || !w["runListFiles"] || w["runSync"] {
-		t.Fatalf("warm path must hold maint slot AND listing gate and stream: %v", w)
+	w := liveCalls(funcBody(t, "snapshot_files_warm.go", "warmOneListing"))
+	if !w["runWarmListing"] || !w["markUncacheable"] || !w["storeListing"] || w["runSync"] {
+		t.Fatalf("warm path wiring: %v", w)
+	}
+	rw := liveCalls(funcBody(t, "snapshot_files_warm.go", "runWarmListing"))
+	if !rw["acquireMaint"] || !rw["acquire"] || !rw["runListFiles"] {
+		t.Fatalf("runWarmListing must hold maint slot AND listing gate: %v", rw)
+	}
+	sweep := liveCalls(funcBody(t, "snapshot_files_warm.go", "warmListCacheSweep"))
+	if !sweep["newSweepState"] || !sweep["warmWanted"] {
+		t.Fatal("sweep must use the sweep state and the shared pin policy via warmWanted")
+	}
+	if !liveCalls(funcBody(t, "snapshot_files_warm.go", "warmWanted"))["effectivePinN"] {
+		t.Fatal("warmWanted must use effectivePinN")
+	}
+	if !liveCalls(funcBody(t, "snapshot_files_cache.go", "evictBySize"))["effectivePinN"] {
+		t.Fatal("evictBySize must use effectivePinN")
+	}
+	if !hasTopLevelCall(funcBody(t, "app.go", "newApp"), "resetListSpool") {
+		t.Fatal("newApp must reset the spool as a top-level statement, before anything serves")
 	}
 	r, err := os.ReadFile("snapshot_files_stream.go")
 	if err != nil {
@@ -568,7 +1020,7 @@ func TestListingWiring(t *testing.T) {
 	if !strings.Contains(string(r), "cmd.Stdout = sink") || !strings.Contains(string(r), "cmd.Stderr = sink") {
 		t.Fatal("stdout and stderr must be the same writer value")
 	}
-	if !callsIn(funcBody(t, "snapshot_files_warm.go", "warmListCacheSweep"))["newSweepState"] {
-		t.Fatal("sweep must use the (repo, storage) sweep state")
+	if !liveCalls(funcBody(t, "jobs.go", "spawn"))["record"] {
+		t.Fatal("job runner must record child RSS")
 	}
 }

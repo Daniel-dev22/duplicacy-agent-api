@@ -34,7 +34,111 @@ func newSnapshotFilesCacheStore(db *sql.DB, maxBytes int64, warmKeepN int) *snap
 	if warmKeepN < 0 {
 		warmKeepN = 0
 	}
-	return &snapshotFilesCacheStore{db: db, maxBytes: maxBytes, warmKeepN: warmKeepN}
+	s := &snapshotFilesCacheStore{db: db, maxBytes: maxBytes, warmKeepN: warmKeepN}
+	if err := s.ensureSchema(context.Background()); err != nil {
+		slog.Error("list-files uncacheable-marker schema failed", "error", err)
+	}
+	return s
+}
+
+// ensureSchema creates the additive negative-marker table. A marker records that
+// an immutable revision's listing can never be cached (its gz exceeds the row
+// cap or the spool ceiling), so the warmer stops re-running it every sweep. It
+// lives beside the cache in events.sqlite and so survives restarts.
+func (s *snapshotFilesCacheStore) ensureSchema(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS snapshot_files_uncacheable (
+			repo_id       TEXT    NOT NULL,
+			storage_name  TEXT    NOT NULL,
+			snapshot_id   TEXT    NOT NULL,
+			revision      INTEGER NOT NULL,
+			reason        TEXT    NOT NULL,
+			gz_bytes      INTEGER NOT NULL,
+			marked_at     TIMESTAMP NOT NULL,
+			PRIMARY KEY (repo_id, storage_name, snapshot_id, revision)
+		)`)
+	return err
+}
+
+const (
+	uncacheableRowCap  = "row_cap"
+	uncacheableCeiling = "spool_ceiling"
+)
+
+func (s *snapshotFilesCacheStore) markUncacheable(ctx context.Context, repoID, storage, snapshotID string, rev int, reason string, gzBytes int64) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT OR REPLACE INTO snapshot_files_uncacheable
+			(repo_id, storage_name, snapshot_id, revision, reason, gz_bytes, marked_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		repoID, storage, snapshotID, rev, reason, gzBytes, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("mark uncacheable: %w", err)
+	}
+	return nil
+}
+
+// uncacheable reports the marker reason for a revision ("" when unmarked).
+func (s *snapshotFilesCacheStore) uncacheable(ctx context.Context, repoID, storage, snapshotID string, rev int) (string, error) {
+	if s == nil || s.db == nil {
+		return "", nil
+	}
+	var reason string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT reason FROM snapshot_files_uncacheable
+		 WHERE repo_id = ? AND storage_name = ? AND snapshot_id = ? AND revision = ?`,
+		repoID, storage, snapshotID, rev).Scan(&reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("uncacheable lookup: %w", err)
+	}
+	return reason, nil
+}
+
+// pinPolicy is the ONE rule for how many newest revisions per (snapshot,
+// storage) are warmed and protected from eviction. The warmer decides what to
+// warm with it and the evictor decides what to protect with it, so the two can
+// never disagree and re-list what the other just evicted. When keeping warmN
+// revisions of every snapshot (projected from each snapshot's newest row) would
+// exceed the cap, the policy drops to maxPinRelaxedKeep. The projection uses
+// only the newest rows, so evicting the older ones cannot flip the answer.
+func pinPolicy(newestBytes int64, warmN int, maxBytes int64) int {
+	if maxBytes > 0 && newestBytes*int64(warmN) > maxBytes {
+		return min(maxPinRelaxedKeep, warmN)
+	}
+	return warmN
+}
+
+// effectivePinN applies pinPolicy to the current cache contents.
+func (s *snapshotFilesCacheStore) effectivePinN(ctx context.Context) int {
+	if s == nil || s.db == nil || s.maxBytes <= 0 || s.warmKeepN <= maxPinRelaxedKeep {
+		return s.warmN()
+	}
+	var newest int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(gz_bytes), 0) FROM (
+			SELECT gz_bytes, ROW_NUMBER() OVER (
+				PARTITION BY snapshot_id, storage_name ORDER BY revision DESC) AS rn
+			FROM snapshot_files_cache) WHERE rn = 1`).Scan(&newest)
+	if err != nil {
+		slog.Warn("list-files pin policy query failed, using configured N", "error", err)
+		return s.warmKeepN
+	}
+	return pinPolicy(newest, s.warmKeepN, s.maxBytes)
+}
+
+func (s *snapshotFilesCacheStore) warmN() int {
+	if s == nil {
+		return 0
+	}
+	return s.warmKeepN
 }
 
 // cachedListing is a stored row: the gzip stream plus the exact uncompressed
@@ -129,13 +233,12 @@ func (s *snapshotFilesCacheStore) putGzipped(ctx context.Context, snapshotID str
 // survive even when the pinned set alone exceeds the cap.
 const maxPinRelaxedKeep = 2
 
-// evictBySize deletes least-recently-accessed rows until SUM(gz_bytes) is back
-// under maxBytes. Rows outside the newest-warmKeepN revisions per
-// (snapshot_id, storage_name) go first; if the pinned warm set alone still
-// exceeds the cap the pin is relaxed down to the newest maxPinRelaxedKeep (and
-// logged) so the cap is a real ceiling. Rows of exemptRepos (a repo whose
-// listing failed this sweep) are never evicted. A no-op when the cap is
-// disabled or not exceeded.
+// evictBySize deletes rows until SUM(gz_bytes) is back under maxBytes: the
+// OLDEST revision first (deepest rank per snapshot), never the newest
+// pinPolicy-many per (snapshot_id, storage_name). If those alone exceed the cap
+// the cap still wins down to the newest maxPinRelaxedKeep (logged), so it is a
+// real ceiling. Rows of exemptRepos (a repo whose listing failed this sweep) are
+// never evicted. A no-op when the cap is disabled or not exceeded.
 func (s *snapshotFilesCacheStore) evictBySize(ctx context.Context, exemptRepos map[string]struct{}) (err error) {
 	if s == nil || s.db == nil || s.maxBytes <= 0 {
 		return nil
@@ -149,10 +252,9 @@ func (s *snapshotFilesCacheStore) evictBySize(ctx context.Context, exemptRepos m
 		return nil
 	}
 	need := total - s.maxBytes
+	pinN := s.effectivePinN(ctx)
 	hardKeep := min(maxPinRelaxedKeep, s.warmKeepN)
 
-	// rn ranks revisions newest-first per (snapshot_id, storage_name). Eligible =
-	// rn > hardKeep; unpinned (rn > warmKeepN) ordered before relaxed-pinned.
 	rows, err := s.db.QueryContext(ctx, `
 		WITH ranked AS (
 			SELECT rowid AS rid, gz_bytes, last_access, repo_id,
@@ -163,8 +265,8 @@ func (s *snapshotFilesCacheStore) evictBySize(ctx context.Context, exemptRepos m
 			FROM snapshot_files_cache
 		)
 		SELECT rid, gz_bytes, repo_id, rn <= ? AS pinned FROM ranked
-		 WHERE rn > ? ORDER BY pinned ASC, last_access ASC`,
-		s.warmKeepN, hardKeep)
+		 WHERE rn > ? ORDER BY pinned ASC, rn DESC, last_access ASC`,
+		pinN, hardKeep)
 	if err != nil {
 		return fmt.Errorf("cache evict scan: %w", err)
 	}
@@ -228,6 +330,69 @@ func newSweepState() *sweepState {
 	}
 }
 
+// judges reports whether this sweep can say a repo's row on a storage is gone:
+// only if that repo's listing of it succeeded (or the repo is no longer known and
+// some repo listed the storage). A failed repo is never judged.
+func (st *sweepState) judges(repo, storage string) bool {
+	if _, bad := st.failed[repo]; bad {
+		return false
+	}
+	if _, known := st.known[repo]; known {
+		_, ok := st.swept[repoStorage{repo, storage}]
+		return ok
+	}
+	_, ok := st.sweptStorage[storage]
+	return ok
+}
+
+// reconcileMarkers drops uncacheable markers of revisions that were pruned.
+func (s *snapshotFilesCacheStore) reconcileMarkers(ctx context.Context, st *sweepState) error {
+	if s == nil || s.db == nil || st == nil || len(st.sweptStorage) == 0 {
+		return nil
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT rowid, repo_id, storage_name, snapshot_id, revision FROM snapshot_files_uncacheable`)
+	if err != nil {
+		return fmt.Errorf("marker scan: %w", err)
+	}
+	defer rows.Close()
+	var victims []int64
+	for rows.Next() {
+		var rid int64
+		var repo, storage, sid string
+		var rev int
+		if err := rows.Scan(&rid, &repo, &storage, &sid, &rev); err != nil {
+			return fmt.Errorf("marker row: %w", err)
+		}
+		if !st.judges(repo, storage) {
+			continue
+		}
+		if _, ok := st.keep[storageSnapRevKey(storage, sid, rev)]; !ok {
+			victims = append(victims, rid)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+	if len(victims) == 0 {
+		return nil
+	}
+	var b bytes.Buffer
+	b.WriteString("DELETE FROM snapshot_files_uncacheable WHERE rowid IN (")
+	for i, id := range victims {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "%d", id)
+	}
+	b.WriteByte(')')
+	if _, err := s.db.ExecContext(ctx, b.String()); err != nil {
+		return fmt.Errorf("marker delete: %w", err)
+	}
+	return nil
+}
+
 // reconcileAgainstKeep deletes cache rows the warm sweep found no longer live,
 // run ONCE at the end of a sweep against the union keep-set (a per-repo
 // reconcile on a shared storage would delete the other repos' fresh rows).
@@ -239,6 +404,9 @@ func newSweepState() *sweepState {
 // st.failed and also exempt. Rows of a repo no longer known to the agent are
 // judged against any successful listing of their storage. Returns rows evicted.
 func (s *snapshotFilesCacheStore) reconcileAgainstKeep(ctx context.Context, st *sweepState) (int, error) {
+	if err := s.reconcileMarkers(ctx, st); err != nil {
+		return 0, err
+	}
 	if s == nil || s.db == nil || st == nil || len(st.sweptStorage) == 0 {
 		return 0, nil
 	}
@@ -257,14 +425,7 @@ func (s *snapshotFilesCacheStore) reconcileAgainstKeep(ctx context.Context, st *
 		if err := rows.Scan(&rid, &repo, &storage, &sid, &rev); err != nil {
 			return 0, fmt.Errorf("reconcile row: %w", err)
 		}
-		if _, bad := st.failed[repo]; bad {
-			continue
-		}
-		if _, known := st.known[repo]; known {
-			if _, ok := st.swept[repoStorage{repo, storage}]; !ok {
-				continue // this repo did not list this storage — leave it alone
-			}
-		} else if _, ok := st.sweptStorage[storage]; !ok {
+		if !st.judges(repo, storage) {
 			continue
 		}
 		if _, ok := st.keep[storageSnapRevKey(storage, sid, rev)]; !ok {
