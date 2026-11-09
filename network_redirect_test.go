@@ -4,15 +4,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
-// The controller client must not carry the node bearer to a redirect target
-// on another host (kit transport behaviour, pinned here at the call site).
-func TestControlCenterClientDoesNotLeakBearerOnRedirect(t *testing.T) {
-	var got string
+// The controller client must refuse a redirect to another origin: neither the
+// node bearer (kit transport) nor the replayed 307 body may reach the target.
+func TestControlCenterClientRefusesCrossOriginRedirect(t *testing.T) {
+	var targetHits int32
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = r.Header.Get("Authorization")
+		atomic.AddInt32(&targetHits, 1)
 	}))
 	defer target.Close()
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -24,12 +25,12 @@ func TestControlCenterClientDoesNotLeakBearerOnRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := c.Post(origin.URL, "text/plain", strings.NewReader("x"))
-	if err != nil {
-		t.Fatal(err)
+	resp, err := c.Post(origin.URL, "text/plain", strings.NewReader("SECRET-BODY"))
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("cross-origin redirect was followed")
 	}
-	resp.Body.Close()
-	if got != "" {
-		t.Fatalf("bearer leaked to redirect target: %q", got)
+	if n := atomic.LoadInt32(&targetHits); n != 0 {
+		t.Fatalf("redirect target received %d request(s)", n)
 	}
 }
