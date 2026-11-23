@@ -61,6 +61,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Daniel-dev22/agent-kit-go/dirsize"
 )
 
 // -----------------------------------------------------------------------------
@@ -272,7 +274,7 @@ func (w *treeWalker) walkDir(containerDir string, mtime time.Time, depth int) []
 		// Skip the Duplicacy Web cache tree and operator-excluded prefixes —
 		// the same rules the repo scanner applies (repos.go), so the tree push
 		// never surfaces duplicacy-web app machinery either.
-		if isDuplicacyWebCache(childPath) || pathUnderAny(childPath, w.cfg.BackupExcludePaths) {
+		if isDuplicacyWebCache(childPath) || dirsize.PathUnderAny(childPath, w.cfg.BackupExcludePaths) {
 			continue
 		}
 

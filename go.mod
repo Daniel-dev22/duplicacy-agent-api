@@ -3,13 +3,12 @@ module github.com/Daniel-dev22/duplicacy-agent-api
 go 1.26
 
 require (
-	github.com/Daniel-dev22/agent-kit-go v0.5.1
+	github.com/Daniel-dev22/agent-kit-go v0.10.0
 	github.com/gin-gonic/gin v1.10.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/pkg/sftp v1.13.10
 	golang.org/x/crypto v0.50.0
-	golang.org/x/sys v0.43.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	modernc.org/sqlite v1.50.0
 )
@@ -40,6 +39,7 @@ require (
 	github.com/ugorji/go/codec v1.2.12 // indirect
 	golang.org/x/arch v0.8.0 // indirect
 	golang.org/x/net v0.52.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/text v0.36.0 // indirect
 	google.golang.org/protobuf v1.34.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
