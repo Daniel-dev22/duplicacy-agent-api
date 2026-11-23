@@ -30,6 +30,10 @@ func newSizeCache(cfg Config) *dirsize.Cache {
 // the live filter cache and repo index, so a pushed filter or a newly registered repo
 // takes effect without a restart.
 func sizeOptions(cfg Config, a *app) dirsize.Options {
+	var stop <-chan struct{}
+	if a != nil {
+		stop = a.stop
+	}
 	return dirsize.Options{
 		Enabled:            cfg.TreeSizeEnabled,
 		SmallRefresh:       cfg.TreeSizeSmallRefresh,
@@ -48,7 +52,7 @@ func sizeOptions(cfg Config, a *app) dirsize.Options {
 		ExcludeBasenames: excludeBasenames,
 		SkipPath:         isDuplicacyWebCache,
 		Anchors:          func() []string { return sizeAnchors(a) },
-		Stop:             a.stop,
+		Stop:             stop,
 	}
 }
 

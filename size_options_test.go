@@ -86,6 +86,19 @@ func TestSizeExcludePathsMergesEnvAndPushed(t *testing.T) {
 	}
 }
 
+func TestSizeOptionsNilAppDoesNotPanic(t *testing.T) {
+	o := sizeOptions(Config{BackupRoots: []string{"/r"}}, nil)
+	if o.Stop != nil {
+		t.Errorf("nil app must yield a nil Stop channel")
+	}
+	if got := o.ExcludePaths(); len(got) != 0 {
+		t.Errorf("ExcludePaths = %v, want none", got)
+	}
+	if got := o.Anchors(); got != nil {
+		t.Errorf("Anchors = %v, want nil", got)
+	}
+}
+
 func TestSizeAnchorsNilSafe(t *testing.T) {
 	if got := sizeAnchors(nil); got != nil {
 		t.Errorf("nil app = %v", got)
