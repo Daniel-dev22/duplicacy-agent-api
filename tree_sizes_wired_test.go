@@ -1,11 +1,12 @@
 package main
 
-// Wiring harness for the directory-size gatherer: the same assertions run before and
-// after the gatherer moves into agent-kit-go, so the duplicacy-specific mapping
+// Wiring harness for the directory-size gatherer. The gatherer itself lives in
+// agent-kit-go (dirsize); these tests pin the duplicacy-specific side of the seam
 // (config fields, excludeBasenames, web-cache skip, env + pushed excludes, repo anchors,
-// the stop channel) cannot change unnoticed once the code that used to read it is gone.
+// the stop channel) so it cannot change unnoticed. The goldens below were taken on the
+// pre-hoist code and must not move.
 //
-//   - TestWiredPassMatchesPinnedDigest drives one REAL pass (runPass) over a tree that
+//   - TestWiredPassMatchesPinnedDigest drives one REAL pass (RunPass) over a tree that
 //     contains every duplicacy-specific rule and pins the digest of the resulting cache.
 //   - BenchmarkWiredPass is the Pi-class gate: a full pass with production-like excludes
 //     (the kit-shaped walk benchmark has none, so it cannot see the per-child cost of
@@ -21,7 +22,45 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/Daniel-dev22/agent-kit-go/dirsize"
+	"github.com/Daniel-dev22/agent-kit-go/dirsize/dirsizetest"
 )
+
+func testSizeConfig(dir string) Config {
+	return Config{
+		ConfigDir:                  dir,
+		TreeSizeEnabled:            true,
+		TreeSizeLargeFileThreshold: 50000,
+		TreeSizeSlowWalk:           30 * time.Second,
+		TreeSizeLargeRefresh:       24 * time.Hour,
+		TreeSizeSmallRefresh:       6 * time.Hour,
+		TreeSizeWalkTimeout:        30 * time.Minute,
+		TreeSizeStepSleep:          0,
+	}
+}
+
+// baselineConfig keeps every directory so the whole tally is observable.
+func baselineConfig(dir string) Config {
+	c := testSizeConfig(dir)
+	c.TreeSizeKeepDepth = 1 << 20
+	return c
+}
+
+func writeFileN(t testing.TB, path string, n int) {
+	t.Helper()
+	if err := os.WriteFile(path, make([]byte, n), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func cacheRows(t testing.TB, cache *dirsize.Cache, root string) []dirsizetest.Row {
+	t.Helper()
+	return dirsizetest.RowsFrom(t, root, func(add func(string, int64, int64)) {
+		cache.Range(func(p string, e dirsize.Entry) { add(p, e.Bytes, e.FileCount) })
+	})
+}
 
 // wiredApp is the minimal app the gatherer reads: a stop channel, the pushed filter
 // sets and the repo index.
@@ -40,6 +79,14 @@ func wiredApp(t testing.TB, pushed []string, repos ...*Repo) *app {
 		repos:   ri,
 		filters: &filterCache{sets: []FilterSet{{ID: "org", Scope: "org", Rules: rules}}},
 	}
+}
+
+// runWiredPass is the production wiring (newSizeCache + sizeOptions + NewGatherer)
+// followed by exactly one pass.
+func runWiredPass(cfg Config, a *app) *dirsize.Cache {
+	cache := newSizeCache(cfg)
+	dirsize.NewGatherer(sizeOptions(cfg, a), cache).RunPass(context.Background())
+	return cache
 }
 
 // quietLogs discards slog output for the test: a real pass prints one line per mount
@@ -98,15 +145,13 @@ func TestWiredPassMatchesPinnedDigest(t *testing.T) {
 	cfg.TreeSizeSlowWalk = 1 << 60
 
 	a := wiredApp(t, []string{pushedX}, &Repo{Path: repoA}, &Repo{Path: filepath.Join(dir, "elsewhere"), SourcePath: srcB})
-	cache := newDirSizeCache(dir)
-	g := newSizeGatherer(cfg, cache, a)
-	g.runPass(context.Background())
+	cache := runWiredPass(cfg, a)
 
 	rows := cacheRows(t, cache, root)
 	for _, rel := range []string{"deep/l1/l2/l3/repoA/c1", "deep/l1/l2/l3/repoA/c1/c2", "deep/l1/l2/l3/srcB/d1", "deep/l1/l2/l3/srcB/d1/d2"} {
 		found := false
 		for _, r := range rows {
-			if r.rel == rel {
+			if r.Rel == rel {
 				found = true
 			}
 		}
@@ -114,10 +159,10 @@ func TestWiredPassMatchesPinnedDigest(t *testing.T) {
 			t.Errorf("%s not cached: a repo Path or SourcePath anchor is not wired", rel)
 		}
 	}
-	if e, ok := cache.get(root); !ok || e.Bytes != 10+20+3+5+7 || e.FileCount != 5 {
+	if e, ok := cache.Get(root); !ok || e.Bytes != 10+20+3+5+7 || e.FileCount != 5 {
 		t.Fatalf("root = %+v ok=%v, want 45 bytes in 5 files: a basename, web-cache, env, backup or pushed exclude is not wired", e, ok)
 	}
-	if d := digestRows(rows); d != wiredGolden {
+	if d := dirsizetest.DigestRows(rows); d != wiredGolden {
 		t.Fatalf("wired digest changed: %s (golden %s)", d, wiredGolden)
 	}
 }
@@ -142,25 +187,21 @@ func productionLikeAppAndConfig(t testing.TB, dir, root string) (Config, *app) {
 
 func BenchmarkWiredPass(b *testing.B) {
 	quietLogs(b)
-	root := ensureBenchTree(b)
+	root, want := dirsizetest.EnsureBenchTree(b, excludeBasenames)
 	b.ReportAllocs()
 	b.ResetTimer()
 	var dirs int
 	for i := 0; i < b.N; i++ {
 		cfgDir := b.TempDir()
 		cfg, a := productionLikeAppAndConfig(b, cfgDir, root)
-		cache := newDirSizeCache(cfgDir)
-		g := newSizeGatherer(cfg, cache, a)
-		g.runPass(context.Background())
-		dirs = cache.len()
+		dirs = runWiredPass(cfg, a).Len()
 	}
 	b.StopTimer()
 	cfgDir := b.TempDir()
 	cfg, a := productionLikeAppAndConfig(b, cfgDir, root)
-	cache := newDirSizeCache(cfgDir)
-	newSizeGatherer(cfg, cache, a).runPass(context.Background())
-	if d := digestRows(cacheRows(b, cache, root)); d != benchWant {
-		b.Fatalf("wired pass digest %s != oracle digest %s", d, benchWant)
+	cache := runWiredPass(cfg, a)
+	if d := dirsizetest.DigestRows(cacheRows(b, cache, root)); d != want {
+		b.Fatalf("wired pass digest %s != oracle digest %s", d, want)
 	}
 	b.ReportMetric(float64(dirs), "dirs")
 }
@@ -176,8 +217,7 @@ func TestWiredHostDigest(t *testing.T) {
 	dir := t.TempDir()
 	cfg := baselineConfig(dir)
 	cfg.BackupRoots = []string{root}
-	cache := newDirSizeCache(dir)
-	newSizeGatherer(cfg, cache, wiredApp(t, nil)).runPass(context.Background())
+	cache := runWiredPass(cfg, wiredApp(t, nil))
 	rows := cacheRows(t, cache, root)
-	fmt.Printf("HOST_DIGEST root=%s dirs=%d digest=%s\n", root, len(rows), digestRows(rows))
+	fmt.Printf("HOST_DIGEST root=%s dirs=%d digest=%s\n", root, len(rows), dirsizetest.DigestRows(rows))
 }

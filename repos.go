@@ -233,17 +233,6 @@ func isDuplicacyWebCache(path string) bool {
 	return strings.HasSuffix(path, marker) || strings.Contains(path, marker+sep)
 }
 
-// pathUnderAny reports whether path equals or is nested under any prefix.
-func pathUnderAny(path string, prefixes []string) bool {
-	for _, p := range prefixes {
-		pc := filepath.Clean(p)
-		if path == pc || strings.HasPrefix(path, pc+string(filepath.Separator)) {
-			return true
-		}
-	}
-	return false
-}
-
 func walkDepth(root, path string) int {
 	rel, err := filepath.Rel(root, path)
 	if err != nil || rel == "." {
