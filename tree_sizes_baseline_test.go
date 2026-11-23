@@ -209,7 +209,10 @@ func benchShape() baselineShape {
 	}
 }
 
-func BenchmarkDirSizeWalk(b *testing.B) {
+// ensureBenchTree builds the synthetic tree once per process (under BASELINE_TREE_DIR
+// when set, so a Pi run can reuse one on disk) and the oracle digest every benchmark
+// checks its result against. It returns the tree root.
+func ensureBenchTree(b *testing.B) string {
 	benchOnce.Do(func() {
 		base := os.Getenv("BASELINE_TREE_DIR")
 		if base == "" {
@@ -221,6 +224,11 @@ func BenchmarkDirSizeWalk(b *testing.B) {
 		}
 		benchWant = digestRows(rowsFromOracle(oracleTally(b, benchRoot)))
 	})
+	return benchRoot
+}
+
+func BenchmarkDirSizeWalk(b *testing.B) {
+	ensureBenchTree(b)
 	cfgDir := b.TempDir()
 	b.ReportAllocs()
 	b.ResetTimer()
